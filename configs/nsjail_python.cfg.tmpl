@@ -1,0 +1,207 @@
+# nsjail configuration template rendered per run by sandboxd.
+# Rendered by internal/executor/nsjail.go. Do not edit in place; edit the Go
+# template data if you need different fields.
+
+name: "sandboxd-run"
+mode: ONCE
+
+# Never chroot; we bind-mount read-only system paths and the workspace instead.
+chroot: ""
+
+hostname: "sandbox"
+
+# Per-run user namespace with a shared sandbox UID/GID on the host.
+clone_newnet: {{ if .AllowNet }}false{{ else }}true{{ end }}
+clone_newuser: true
+clone_newns: true
+clone_newpid: true
+clone_newipc: true
+clone_newuts: true
+clone_newcgroup: true
+
+# Disable /proc (it leaks host process information). Python still runs fine
+# without it for the common cases.
+disable_proc: true
+
+# Mount the Python runtime and system libraries read-only, then the workspace
+# writable at /workspace.
+mount {
+  src: "/usr"
+  dst: "/usr"
+  is_bind: true
+  rw: false
+}
+
+mount {
+  src: "/lib"
+  dst: "/lib"
+  is_bind: true
+  rw: false
+}
+
+mount {
+  src: "/lib64"
+  dst: "/lib64"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/bin"
+  dst: "/bin"
+  is_bind: true
+  rw: false
+}
+
+mount {
+  src: "/sbin"
+  dst: "/sbin"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/etc/alternatives"
+  dst: "/etc/alternatives"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/etc/ssl/certs"
+  dst: "/etc/ssl/certs"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/etc/ld.so.cache"
+  dst: "/etc/ld.so.cache"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/etc/nsswitch.conf"
+  dst: "/etc/nsswitch.conf"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/etc/passwd"
+  dst: "/etc/passwd"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/etc/group"
+  dst: "/etc/group"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/dev/urandom"
+  dst: "/dev/urandom"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/dev/null"
+  dst: "/dev/null"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/dev/zero"
+  dst: "/dev/zero"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+# The workspace, writable, at /workspace.
+mount {
+  src: "{{ .WorkspaceRoot }}"
+  dst: "/workspace"
+  is_bind: true
+  rw: true
+}
+
+# A writable /tmp for the sandbox.
+mount {
+  src: "/tmp"
+  dst: "/tmp"
+  is_bind: true
+  rw: true
+  mandatory: false
+}
+
+cwd: "/workspace"
+
+# Run as the shared sandbox user inside the namespace.
+uidmap {
+  inside_id: {{ .User }}
+  outside_id: {{ .User }}
+  count: 1
+}
+gidmap {
+  inside_id: {{ .Group }}
+  outside_id: {{ .Group }}
+  count: 1
+}
+
+# Resource limits.
+time_limit: {{ .TimeLimitSec }}
+rlimit_as: {{ .AsBytes }}
+rlimit_fsize: {{ .FsizeBytes }}
+rlimit_nofile: 256
+rlimit_nproc: {{ .PidsMax }}
+rlimit_core: 0
+
+cgroup_mem_max: {{ .MemoryMB }}
+cgroup_pids_max: {{ .PidsMax }}
+cgroup_cpu_ms_per_sec: {{ .CPUMilli }}
+
+# Baseline seccomp deny list.
+seccomp_string: >-
+  POLICY sandboxd {
+  {{- range .SeccompPolicy }}
+    KILL {
+      {{ . }}
+    }
+  {{- end }}
+  }
+  USE sandboxd DEFAULT
+
+# Environment: a minimal, non-sensitive base plus user-provided variables.
+envar: "PATH=/usr/local/bin:/usr/bin:/bin"
+envar: "HOME=/tmp"
+envar: "LANG=C.UTF-8"
+envar: "PYTHONUNBUFFERED=1"
+{{- range .Env }}
+envar: "{{ . }}"
+{{- end }}
+
+exec_bin {
+  path: "{{ index .Argv 0 }}"
+{{- range $i, $a := .Argv }}
+{{- if ne $i 0 }}
+  arg: {{ printf "%q" $a }}
+{{- end }}
+{{- end }}
+}
