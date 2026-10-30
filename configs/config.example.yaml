@@ -1,0 +1,44 @@
+# sandboxd example configuration.
+# Copy to config.yaml and edit. `config.yaml` is gitignored.
+
+server:
+  # Address the HTTP server listens on.
+  addr: "127.0.0.1:8080"
+
+storage:
+  # Root directory for workspace data, run logs and JSON metadata.
+  data_dir: "./data"
+
+# Runtime isolation.
+sandbox:
+  # Path to the nsjail binary. If missing, /readyz reports 503.
+  nsjail_path: "nsjail"
+  # Host user/group the sandboxed process runs as.
+  user: "sandbox"
+  group: "sandbox"
+  # Grace period between SIGTERM and SIGKILL when stopping a process tree.
+  kill_grace_sec: 3
+
+# Default per-workspace resource limits (overridable per workspace).
+limits:
+  cpu_cores: 1
+  memory_mb: 512
+  disk_mb: 1024
+  max_wall_time_sec: 300
+  max_runs: 3
+
+# Output and body caps (bytes / sizes). These are hard ceilings.
+caps:
+  exec_stdout_kb: 256
+  exec_stderr_kb: 256
+  run_log_mb: 10
+  json_body_mb: 1
+  upload_mb: 50
+  file_read_mb: 5
+  file_write_mb: 10
+
+# Static API keys. Each entry maps a key to a principal_id.
+# Multiple keys may share a principal_id.
+keys:
+  - key: "dev-key-please-rotate"
+    principal_id: "user_dev"
