@@ -75,9 +75,23 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 	s.runs[run.ID] = rr
 	s.mu.Unlock()
 
-	go s.executeRun(ctx, w, run, req, rr)
+	// The goroutine owns its own copy of the run so the caller's snapshot
+	// (returned below for immediate rendering) is never mutated concurrently.
+	asyncRun := cloneRun(run)
+	go s.executeRun(ctx, w, asyncRun, req, rr)
 
 	return run, nil
+}
+
+// cloneRun returns a deep copy of a run, including its argv slice.
+func cloneRun(r *model.Run) *model.Run {
+	cp := *r
+	cp.Argv = append([]string(nil), r.Argv...)
+	if r.ExitCode != nil {
+		code := *r.ExitCode
+		cp.ExitCode = &code
+	}
+	return &cp
 }
 
 func (s *Service) executeRun(ctx context.Context, w *model.Workspace, run *model.Run, req executor.Request, rr *runningRun) {

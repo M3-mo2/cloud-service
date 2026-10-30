@@ -167,7 +167,7 @@ func (f *Fs) List(userPath string) ([]Entry, error) {
 	return out, nil
 }
 
-var errNotFound = &pathError{"file not found"}
+var errNotFound = &plainError{"file not found"}
 
 // IsNotFound reports whether err is a not-found error.
 func IsNotFound(err error) bool { return errors.Is(err, os.ErrNotExist) || err == errNotFound }
@@ -444,7 +444,7 @@ func isTextContentType(ct string) bool {
 		strings.Contains(ct, "python")
 }
 
-var errTooLarge = &pathError{"file exceeds maximum allowed size"}
+var errTooLarge = &plainError{"file exceeds maximum allowed size"}
 
 // IsTooLarge reports whether err indicates an oversized write.
 func IsTooLarge(err error) bool { return err == errTooLarge }

@@ -6,21 +6,25 @@ import (
 	"strings"
 )
 
-// ErrUnsafePath is returned when a user-supplied path escapes the workspace
-// root or resolves through a symlink that leaves the workspace.
-type pathError struct{ msg string }
+// unsafeError signals a path traversal or symlink escape.
+type unsafeError struct{ msg string }
 
-func (e *pathError) Error() string { return e.msg }
+func (e *unsafeError) Error() string { return e.msg }
+
+// plainError signals an ordinary filesystem condition (not-found, etc.).
+type plainError struct{ msg string }
+
+func (e *plainError) Error() string { return e.msg }
 
 var (
-	errTraversal    = &pathError{"path escapes workspace root"}
-	errSymlinkEsc   = &pathError{"symlink points outside workspace root"}
-	errNotDirectory = &pathError{"path is not a directory"}
+	errTraversal    = &unsafeError{"path escapes workspace root"}
+	errSymlinkEsc   = &unsafeError{"symlink points outside workspace root"}
+	errNotDirectory = &plainError{"path is not a directory"}
 )
 
-// IsUnsafe reports whether err indicates an unsafe path.
+// IsUnsafe reports whether err indicates a path traversal / symlink escape.
 func IsUnsafe(err error) bool {
-	_, ok := err.(*pathError)
+	_, ok := err.(*unsafeError)
 	return ok
 }
 
