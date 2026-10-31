@@ -67,6 +67,11 @@ func (a *Authenticator) Bearer(next http.Handler) http.Handler {
 			writeUnauthorized(w)
 			return
 		}
+		// Publish the principal to any outer middleware (e.g. audit logging)
+		// that registered a sink, then inject it for downstream handlers.
+		if dst := principalSinkFrom(r.Context()); dst != nil {
+			*dst = pid
+		}
 		ctx := context.WithValue(r.Context(), principalKey, pid)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -76,6 +81,22 @@ func (a *Authenticator) Bearer(next http.Handler) http.Handler {
 func PrincipalFrom(ctx context.Context) (string, bool) {
 	pid, ok := ctx.Value(principalKey).(string)
 	return pid, ok
+}
+
+type sinkKey struct{}
+
+// WithPrincipalSink registers a destination that the Bearer middleware fills
+// with the authenticated principal. Outer middleware (e.g. audit logging) uses
+// this because context values only flow inward.
+func WithPrincipalSink(ctx context.Context, dst *string) context.Context {
+	return context.WithValue(ctx, sinkKey{}, dst)
+}
+
+func principalSinkFrom(ctx context.Context) *string {
+	if dst, ok := ctx.Value(sinkKey{}).(*string); ok {
+		return dst
+	}
+	return nil
 }
 
 func extractBearer(header string) (string, bool) {

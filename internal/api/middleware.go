@@ -42,7 +42,9 @@ func auditMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			rw := &respWriter{ResponseWriter: w, status: 200}
-			next.ServeHTTP(rw, r)
+			var principalID string
+			ctx := auth.WithPrincipalSink(r.Context(), &principalID)
+			next.ServeHTTP(rw, r.WithContext(ctx))
 
 			attrs := []slog.Attr{
 				slog.Time("ts", start.UTC()),
@@ -51,8 +53,8 @@ func auditMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 				slog.Int("status", rw.status),
 				slog.Int64("duration_ms", time.Since(start).Milliseconds()),
 			}
-			if pid, ok := auth.PrincipalFrom(r.Context()); ok {
-				attrs = append(attrs, slog.String("principal_id", pid))
+			if principalID != "" {
+				attrs = append(attrs, slog.String("principal_id", principalID))
 			}
 			if wsID := chi.URLParam(r, "workspaceID"); wsID != "" {
 				attrs = append(attrs, slog.String("workspace_id", wsID))
