@@ -94,13 +94,14 @@ func (s *Service) Rename(w *model.Workspace, from, to string) error {
 	return fs.Rename(from, to)
 }
 
-// UploadFile writes uploaded bytes as a file, enforcing write cap and quota.
+// UploadFile writes uploaded bytes as a file, enforcing the upload cap and
+// the workspace disk quota.
 func (s *Service) UploadFile(w *model.Workspace, path string, data []byte) error {
 	fs, err := s.WorkspaceFs(w)
 	if err != nil {
 		return err
 	}
-	return fs.Write(path, data, false, workspace.WriteOptions{MaxBytes: s.cfg.Caps.FileWriteBytes()})
+	return fs.Write(path, data, false, workspace.WriteOptions{MaxBytes: s.cfg.Caps.UploadBytes()})
 }
 
 // ContentDisposition builds a safe attachment header for a path.
