@@ -59,6 +59,8 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 	stderrPath := s.store.RunLogPath(w.ID, run.ID, model.StreamStderr)
 	caps := s.cfg.Caps
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	req := executor.Request{
 		Workspace:     w,
 		WorkspaceRoot: s.store.WorkspaceRoot(w.ID),
@@ -66,6 +68,7 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		Cwd:           "/",
 		Env:           spec.Env,
 		Timeout:       time.Duration(timeout) * time.Second,
+		Context:       ctx,
 		RunID:         run.ID,
 		StdoutPath:    stdoutPath,
 		StderrPath:    stderrPath,
@@ -73,7 +76,6 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		StderrCap:     caps.RunLogBytes(),
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
 	rr := &runningRun{runID: run.ID, wsID: w.ID, cancel: cancel, done: make(chan struct{})}
 	s.mu.Lock()
 	s.runs[run.ID] = rr

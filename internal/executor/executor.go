@@ -3,6 +3,7 @@
 package executor
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -21,6 +22,10 @@ type Request struct {
 	Env           map[string]string
 	Stdin         string
 	Timeout       time.Duration
+
+	// Context, when non-nil, dictates cancellation of the process tree. A
+	// cancelled context is classified as a kill (e.g. explicit stop).
+	Context context.Context
 
 	// RunID, when non-empty, indicates an async run whose logs must be streamed
 	// to StdoutPath/StderrPath with the given caps.

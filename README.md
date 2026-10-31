@@ -63,6 +63,25 @@ sudo useradd --system --gid sandbox --no-create-home --shell /usr/sbin/nologin s
 
 The sandbox user needs no home directory; the workspace is bind-mounted at `/workspace`.
 
+### Host requirements for nsjail
+
+nsjail needs to create user/mount/pid namespaces, mount cgroup v2, and chown the
+workspace. Run the service either as **root**, with nsjail setuid, or inside a
+privileged container. On hosts that restrict unprivileged user namespaces
+(`kernel.apparmor_restrict_unprivileged_userns=1`, common on Ubuntu 24.04) and
+without `CAP_SYS_ADMIN`, nsjail fails at `uid_map`. A working local/e2e setup:
+
+```sh
+docker run --rm --privileged --cgroupns=host -p 8080:8080 \
+  -v "$PWD":/src -w /src ubuntu:24.04 \
+  ./bin/sandboxd --config config.yaml
+```
+
+The executor maps the sandbox identity by privilege level: as root it maps
+`inside sandbox <-> outside sandbox` and chowns the workspace tree; as a
+non-root orchestrator it maps `inside sandbox <-> outside orchestrator` and
+leaves ownership alone.
+
 ## Architecture
 
 ```

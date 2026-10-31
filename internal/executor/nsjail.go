@@ -16,6 +16,7 @@ import (
 	"text/template"
 	"time"
 
+	"sandboxd/configs"
 	"sandboxd/internal/config"
 )
 
@@ -85,6 +86,18 @@ func (r *NsjailRunner) Run(req Request) (Result, error) {
 		return Result{}, err
 	}
 
+	// nsjail's exec_bin.path is passed straight to execve and is never looked
+	// up on PATH, so resolve argv[0] to an absolute path first. The sandbox
+	// bind-mounts the host's /usr, /bin, /lib and /lib64 at identical paths, so
+	// a host-resolved absolute path is valid inside the jail.
+	if len(req.Argv) > 0 {
+		resolved, rerr := resolveCommand(req.Argv[0])
+		if rerr != nil {
+			return Result{}, rerr
+		}
+		req.Argv = append([]string{resolved}, req.Argv[1:]...)
+	}
+
 	// Create a private, per-run temporary directory for the sandbox's /tmp.
 	runTmp, err := os.MkdirTemp(r.tmpDir, "run-*")
 	if err != nil {
@@ -130,10 +143,16 @@ func (r *NsjailRunner) Run(req Request) (Result, error) {
 		}
 	}
 
-	ctx := context.Background()
+	// Base the run on the caller's context so an explicit stop cancels the
+	// process tree, then layer the wall-clock timeout on top.
+	base := context.Background()
+	if req.Context != nil {
+		base = req.Context
+	}
+	ctx := base
 	var cancel context.CancelFunc
 	if req.Timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, req.Timeout)
+		ctx, cancel = context.WithTimeout(base, req.Timeout)
 		defer cancel()
 	}
 
@@ -370,7 +389,12 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 	}
 	tmplBytes, err := os.ReadFile(r.tmplPath)
 	if err != nil {
-		return "", fmt.Errorf("read nsjail template: %w", err)
+		// Fall back to the template compiled into the binary so a deployment
+		// that ships only the executable still works.
+		tmplBytes = configs.NSJailPythonTemplate
+		if len(tmplBytes) == 0 {
+			return "", fmt.Errorf("read nsjail template: %w", err)
+		}
 	}
 	tmpl, err := template.New("nsjail").Parse(string(tmplBytes))
 	if err != nil {

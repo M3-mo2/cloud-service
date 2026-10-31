@@ -1,13 +1,39 @@
 package executor
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"sandboxd/internal/config"
 )
+
+// ErrCommandNotFound is returned when argv[0] cannot be resolved to a binary.
+var ErrCommandNotFound = errors.New("command not found")
+
+// resolveCommand resolves argv[0] to an absolute path using the host PATH.
+// nsjail does not perform PATH lookup, and the sandbox bind-mounts the host's
+// /usr, /bin, /lib and /lib64, so the resolved path is valid inside the jail.
+func resolveCommand(name string) (string, error) {
+	if name == "" {
+		return "", ErrCommandNotFound
+	}
+	if strings.ContainsRune(name, '/') {
+		if filepath.IsAbs(name) {
+			return name, nil
+		}
+		return filepath.Abs(name)
+	}
+	p, err := exec.LookPath(name)
+	if err != nil {
+		return "", ErrCommandNotFound
+	}
+	return p, nil
+}
 
 // fallback IDs used when neither config nor /etc/passwd/group resolve a sandbox
 // identity. 65534 is the conventional "nobody" account and is always

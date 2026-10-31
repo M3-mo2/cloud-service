@@ -1,16 +1,18 @@
 # Verification
 
 Results for sandboxd v0.0.5 against the acceptance criteria in the spec.
-Environment: Ubuntu Noble x86_64, Go toolchain (see `go version`), no real
-`nsjail` binary installed on the host.
+Environment: Ubuntu Noble x86_64, kernel 7.0.0-38-generic, Go 1.26.8, real
+`nsjail` binary at `/usr/local/bin/nsjail`.
 
-Because real nsjail could not be installed here (no root access, and the host
-root filesystem was full), the HTTP lifecycle transcript below was produced with
-the test-only stub at [`scripts/nsjail-stub.py`](../scripts/nsjail-stub.py).
-The stub parses the exact nsjail config file that `internal/executor` renders
-and then `exec`s the requested binary without isolation. The service itself has
-no knowledge of the stub: it only runs whatever `sandbox.nsjail_path` points at.
-Real-nsjail behavior is covered by tests behind the `integration` build tag.
+The transcript below was produced against **real nsjail** (not the test stub).
+The host restricts unprivileged user namespaces
+(`kernel.apparmor_restrict_unprivileged_userns = 1`) and the orchestrator runs
+without `CAP_SYS_ADMIN`, so nsjail cannot create its namespaces on the bare
+host. The server is therefore run inside a `docker run --privileged
+--cgroupns=host` container; `scripts/acceptance.sh` refuses to run unless
+`NSJAIL` points at the real binary (it rejects the stub script). The isolation
+steps (20–24) below are only meaningful under real nsjail and are what prove the
+sandbox actually contains the process.
 
 ## 1. Build and tests
 
@@ -29,10 +31,28 @@ ok  	sandboxd/internal/storage
 ok  	sandboxd/internal/workspace
 ```
 
+The `integration`-tagged tests invoke real nsjail and are run inside the same
+privileged container against a compiled test binary:
+
+```
+$ docker run --rm --privileged --cgroupns=host \
+    -v /usr:/usr:ro -v /lib:/lib:ro -v /lib64:/lib64:ro -v /bin:/bin:ro \
+    -v /sbin:/sbin:ro -v /usr/local/bin/nsjail:/usr/local/bin/nsjail:ro \
+    -v <repo>:/src:ro -v executor.test:/executor.test:ro \
+    -w /src/internal/executor ubuntu:24.04 bash -c \
+    'groupadd -g 971 sandbox; useradd -u 993 -g 971 -M sandbox; \
+     /executor.test -test.v -test.run TestIntegration'
+=== RUN   TestIntegrationPythonHello
+--- PASS: TestIntegrationPythonHello (0.04s)
+=== RUN   TestIntegrationTimeout
+--- PASS: TestIntegrationTimeout (2.00s)
+PASS
+```
+
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: 110 (108 unit + 2 `integration`-tagged).
+Test functions: 111 (109 unit + 2 `integration`-tagged).
 
 ## 2. Probes
 
@@ -44,9 +64,19 @@ Test functions: 110 (108 unit + 2 `integration`-tagged).
 
 ## 3. Full lifecycle transcript
 
-Reproduce with `bash scripts/acceptance.sh` against a running server.
+Reproduce against a real-nsjail server:
+
+```sh
+BASE=http://localhost:8080 CONTAINER=sandboxd-e2e \
+  NSJAIL=/usr/local/bin/nsjail bash scripts/acceptance.sh
+```
 
 ```
+### 0. environment
+base=http://localhost:8080 data_dir=<unset>
+server readyz:
+{"data_dir":true,"nsjail":true,"status":"ready"}
+
 ### 1. healthz
 {"status":"ok"}
 
@@ -57,33 +87,33 @@ Reproduce with `bash scripts/acceptance.sh` against a running server.
 {"api_version":"v1","limits_defaults":{"allow_net":false,"cpu_cores":1,"disk_mb":1024,"max_runs":3,"max_wall_time_sec":300,"memory_mb":512},"runtimes":["python3"],"version":"0.0.5"}
 
 ### 4. create workspace
-workspace id: ws_01M67M3GS6DZB3TE23KJ7XN7TX
+workspace id: ws_01M68XWAP48NHSSX4FCRBNGJVK
 ### 5. mkdir /src
 {"path":"/src"}
 
 ### 6. PUT /main.py
 status=204
 ### 7. upload /uploaded.py (multipart)
-{"name":"uploaded.py","path":"/uploaded.py","size":18}
+{"name":"tmp.SObRuGNr8w","path":"/uploaded.py","size":18}
 
 ### 8. list /
 {
     "entries": [
-        {"name": "main.py", "path": "/main.py", "type": "file", "size": 12, "mod_time": "2026-10-31T00:00:14Z"},
-        {"name": "src", "path": "/src", "type": "dir", "size": 40, "mod_time": "2026-10-31T00:00:14Z"},
-        {"name": "uploaded.py", "path": "/uploaded.py", "type": "file", "size": 18, "mod_time": "2026-10-31T00:00:14Z"}
+        {"name": "main.py", "path": "/main.py", "type": "file", "size": 12, "mod_time": "2026-10-31T12:10:18Z"},
+        {"name": "src", "path": "/src", "type": "dir", "size": 40, "mod_time": "2026-10-31T12:10:18Z"},
+        {"name": "uploaded.py", "path": "/uploaded.py", "type": "file", "size": 18, "mod_time": "2026-10-31T12:10:18Z"}
     ]
 }
 ### 9. read /main.py (meta)
 {"content":"print(\"hi\")\n","content_type":"text/x-python; charset=utf-8","encoding":"text","path":"/main.py","sha256":"0ca9091eb4e31fb1ab24c8c5de92a08e4e5f402919f82ea3ca784f38534f03f3","size":12,"truncated":false}
 
 ### 10. exec (sync)
-{"duration_ms":57,"exit_code":0,"stderr":"","stdout":"hi\n","truncated":false}
+{"duration_ms":36,"exit_code":0,"stderr":"","stdout":"hi\n","truncated":false}
 
 ### 11. start run (file)
-run id: run_01M67M3H0H1J32C4X7N52QAR88
+run id: run_01M68XWAXE5H4JKA4T3ZP56H8M
 ### 12. run status
-{"run":{"id":"run_01M67M3H0H1J32C4X7N52QAR88","workspace_id":"ws_01M67M3GS6DZB3TE23KJ7XN7TX","kind":"file","argv":["python3","main.py"],"status":"exited","exit_code":0,"started_at":"2026-10-31T00:00:14Z","ended_at":"2026-10-31T00:00:14Z","logs":{"stdout_bytes":3,"stderr_bytes":0,"truncated":false}}}
+{"run":{"id":"run_01M68XWAXE5H4JKA4T3ZP56H8M","workspace_id":"ws_01M68XWAP48NHSSX4FCRBNGJVK","kind":"file","argv":["python3","main.py"],"status":"exited","exit_code":0,"started_at":"2026-10-31T12:10:18Z","ended_at":"2026-10-31T12:10:18Z","logs":{"stdout_bytes":3,"stderr_bytes":0,"truncated":false}}}
 
 ### 13. run logs stdout
 {"data":"hi\n","eof":true,"next":3,"offset":0,"truncated":false}
@@ -102,22 +132,37 @@ status=403
 status=413
 ### 19b. security: symlink escape (expect 422)
 status=422
-### 20. stop long run kills process group
+### 20. real isolation: network egress blocked (allow_net=false)
+{"duration_ms":47,"exit_code":0,"stderr":"","stdout":"NET_BLOCKED: OSError\n","truncated":false}
+
+### 21. real isolation: /etc/shadow denied
+{"duration_ms":33,"exit_code":0,"stderr":"","stdout":"SHADOW_DENIED: FileNotFoundError\n","truncated":false}
+
+### 22. real isolation: mount(2) / ptrace denied
+{"duration_ms":203,"exit_code":159,"stderr":"","stdout":"","truncated":false}
+
+### 23. real isolation: fork bomb limited by cgroup pids.max
+{"duration_ms":76,"exit_code":0,"stderr":"","stdout":"FORK_LIMITED: BlockingIOError\nFORKED 191\n","truncated":false}
+
+### 24. stop long run kills process group
 processes before stop:
-103284 python3 long.py
+486 /usr/bin/python3 long.py
 run status after stop:
 killed
 processes after stop (expect none):
 (none)
-### 21. delete workspace (expect 204)
+### 25. delete workspace (expect 204)
 status=204
-### 22. get after delete (expect 404)
+### 26. get after delete (expect 404)
 status=404
 ```
 
 The run's stdout contained `hi`, the status reached `exited` with exit code 0,
-polling the logs returned `hi\n`, a second (long) run was stopped and reached
-`killed`, and deleting the workspace removed its directory tree.
+polling the logs returned `hi\n`, a long run was stopped and reached `killed`,
+and deleting the workspace removed its directory tree. Steps 20–24 are the
+real-isolation evidence: network egress fails, `/etc/shadow` is unreachable,
+`mount(2)`/`ptrace` are killed by seccomp, the fork bomb is stopped by the
+cgroup pids limit, and the process group is reaped on stop.
 
 ## 4. Security rejections
 
@@ -140,22 +185,23 @@ above:
 `exec.Cmd` starts with `SysProcAttr{Setpgid: true}`. `stop` and timeout send
 `SIGTERM` to `-pgid`, wait the configured grace (3 s), then `SIGKILL` to
 `-pgid`. `TestKillProcessGroupReal` starts a real `sleep` in its own group,
-kills it, and asserts a signalled exit. The transcript (step 20) shows
+kills it, and asserts a signalled exit. The transcript (step 24) shows
 `python3 long.py` present before stop and absent after:
 
 ```
 processes before stop:
-103284 python3 long.py
+486 /usr/bin/python3 long.py
 run status after stop:
 killed
 processes after stop (expect none):
 (none)
 ```
 
-Reproduce the process check manually:
+Reproduce the process check manually (inside the nsjail container the process
+runs in):
 
 ```sh
-pgrep -af 'long.py|sandboxd/.*nsjail|nsjail'
+docker exec sandboxd-e2e pgrep -af 'long.py|nsjail'
 ```
 
 ## 6. Decisions
@@ -188,3 +234,9 @@ All paths, methods, request/response schemas, and error codes are described.
   `sandbox` UID/GID with per-run user namespaces and cgroups).
 - Disk quota is advisory to the sandboxed process (enforced on the file API
   path and via rlimit/`du` rechecks), not by the kernel per process tree.
+- Real nsjail needs namespace/cgroup privileges. On this host
+  (`kernel.apparmor_restrict_unprivileged_userns=1` with no `CAP_SYS_ADMIN`)
+  the bare-host run fails writing `uid_map`; this is a host restriction, not a
+  bug in sandboxd. Verification therefore runs the service in a privileged
+  container. On a normal deployment run as root / setuid nsjail / privileged
+  container.

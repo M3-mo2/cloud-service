@@ -64,6 +64,9 @@ func mapError(err error) *model.Error {
 	if errors.Is(err, executor.ErrNsjailUnavailable) {
 		return model.New(503, model.CodeUnavailable, "nsjail is not available")
 	}
+	if errors.Is(err, executor.ErrCommandNotFound) {
+		return model.New(422, model.CodeUnprocessable, "command not found")
+	}
 	if workspace.IsUnsafe(err) {
 		return model.New(422, model.CodeUnprocessable, "unsafe path: escapes workspace root")
 	}

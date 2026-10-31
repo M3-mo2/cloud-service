@@ -169,8 +169,10 @@ func (f *Fs) List(userPath string) ([]Entry, error) {
 
 var errNotFound = &plainError{"file not found"}
 
-// IsNotFound reports whether err is a not-found error.
-func IsNotFound(err error) bool { return errors.Is(err, os.ErrNotExist) || err == errNotFound }
+// IsNotFound reports whether err is the workspace not-found error. The fs layer
+// normalizes os.ErrNotExist into errNotFound, so unrelated os.ErrNotExist
+// errors (e.g. a missing nsjail template) are intentionally not matched.
+func IsNotFound(err error) bool { return err == errNotFound }
 
 // Stat returns metadata for a file without reading its contents.
 func (f *Fs) Stat(userPath string) (FileInfo, error) {
