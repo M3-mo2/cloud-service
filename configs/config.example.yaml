@@ -26,6 +26,17 @@ limits:
   disk_mb: 1024
   max_wall_time_sec: 300
   max_runs: 3
+  allow_net: false
+
+# Server-level maxima. No workspace may exceed these at creation or via PATCH;
+# a request above a maximum is rejected with 422 (never silently clamped).
+max_limits:
+  cpu_cores: 8
+  memory_mb: 8192
+  disk_mb: 51200
+  max_wall_time_sec: 3600
+  max_runs: 64
+  allow_net: true
 
 # Output and body caps (bytes / sizes). These are hard ceilings.
 caps:

@@ -370,6 +370,48 @@ func (f *Fs) DiskUsage() (int64, error) {
 	return subtreeSize(f.root)
 }
 
+// errWalkLimit is an internal sentinel used to stop a bounded walk early.
+var errWalkLimit = &plainError{"walk entry limit reached"}
+
+// DiskUsageBounded returns the bytes used by the workspace tree, walking at
+// most maxEntries directory entries. When the tree is larger, it stops early
+// and reports complete=false; the returned size is then a lower bound. A
+// maxEntries <= 0 imposes no bound. This keeps the usage endpoint cheap on a
+// large workspace (see docs/DECISIONS.md).
+func (f *Fs) DiskUsageBounded(maxEntries int) (size int64, complete bool, err error) {
+	count := 0
+	walkErr := filepath.WalkDir(f.root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		count++
+		if maxEntries > 0 && count > maxEntries {
+			return errWalkLimit
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	if errors.Is(walkErr, errWalkLimit) {
+		return size, false, nil
+	}
+	if walkErr != nil {
+		return size, false, walkErr
+	}
+	return size, true, nil
+}
+
 func subtreeSize(root string) (int64, error) {
 	var total int64
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {

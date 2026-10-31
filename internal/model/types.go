@@ -42,18 +42,20 @@ type Limits struct {
 
 // Workspace statuses.
 const (
-	WorkspaceActive  = "active"
-	WorkspaceDeleted = "deleted"
+	WorkspaceActive    = "active"
+	WorkspaceSuspended = "suspended"
+	WorkspaceDeleted   = "deleted"
 )
 
 // Workspace is a named, owned container of files and runs.
 type Workspace struct {
-	ID        string    `json:"id"`
-	OwnerID   string    `json:"owner_id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	Status    string    `json:"status"`
-	Limits    Limits    `json:"limits"`
+	ID             string    `json:"id"`
+	OwnerID        string    `json:"owner_id"`
+	Name           string    `json:"name"`
+	CreatedAt      time.Time `json:"created_at"`
+	Status         string    `json:"status"`
+	Limits         Limits    `json:"limits"`
+	LastActivityAt time.Time `json:"last_activity_at"`
 }
 
 // RunKind describes how a run's command was specified.

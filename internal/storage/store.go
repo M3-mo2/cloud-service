@@ -148,6 +148,23 @@ func (s *Store) SaveWorkspace(w *model.Workspace) error {
 	return writeJSONAtomic(s.WorkspaceMetaPath(w.ID), w)
 }
 
+// UpdateWorkspace loads a workspace, applies mutate to it, and atomically
+// rewrites the metadata. It returns the updated workspace. mutate is given the
+// live record so a partial update can preserve untouched fields.
+func (s *Store) UpdateWorkspace(id string, mutate func(*model.Workspace) error) (*model.Workspace, error) {
+	w, err := s.GetWorkspace(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := mutate(w); err != nil {
+		return nil, err
+	}
+	if err := s.SaveWorkspace(w); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
 // ListAllWorkspaces returns every workspace whose metadata is present.
 func (s *Store) ListAllWorkspaces() ([]*model.Workspace, error) {
 	entries, err := os.ReadDir(s.WorkspacesDir())

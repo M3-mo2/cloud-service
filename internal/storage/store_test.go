@@ -63,6 +63,37 @@ func TestDeleteWorkspaceRejectsBadID(t *testing.T) {
 	}
 }
 
+func TestUpdateWorkspace(t *testing.T) {
+	s := newTestStore(t)
+	w := sampleWorkspace("u")
+	if err := s.CreateWorkspace(w); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.UpdateWorkspace(w.ID, func(ws *model.Workspace) error {
+		ws.Name = "renamed"
+		ws.Limits.MemoryMB = 128
+		ws.Status = model.WorkspaceSuspended
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "renamed" || updated.Limits.MemoryMB != 128 || updated.Status != model.WorkspaceSuspended {
+		t.Fatalf("updated = %+v", updated)
+	}
+	// The change is persisted.
+	got, err := s.GetWorkspace(w.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "renamed" || got.Limits.MemoryMB != 128 {
+		t.Fatalf("reloaded = %+v", got)
+	}
+	if _, err := s.UpdateWorkspace("ws_missing", func(*model.Workspace) error { return nil }); err == nil {
+		t.Fatal("expected not found")
+	}
+}
+
 func TestListWorkspacesOwnership(t *testing.T) {
 	s := newTestStore(t)
 	mine := sampleWorkspace("user_a")

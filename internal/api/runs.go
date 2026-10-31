@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -115,7 +116,12 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	runs, err := s.svc.ListRuns(ws)
+	filter, err := parseRunFilter(r)
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	runs, total, err := s.svc.ListRuns(ws, filter)
 	if err != nil {
 		writeErrorWithCode(w, err)
 		return
@@ -124,7 +130,56 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	for _, run := range runs {
 		out = append(out, toRunJSON(run))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"runs": out})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"runs":   out,
+		"total":  total,
+		"limit":  filter.Limit,
+		"offset": filter.Offset,
+	})
+}
+
+// parseRunFilter reads the runs list query parameters. Statuses accepts either
+// repeated `status=` parameters or a single comma-separated value.
+func parseRunFilter(r *http.Request) (service.RunFilter, error) {
+	q := r.URL.Query()
+	f := service.RunFilter{}
+	raw := q["status"]
+	for _, v := range raw {
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if !validRunStatus(part) {
+				return f, model.Wrap(400, model.CodeValidation, "unknown run status filter",
+					map[string]string{"status": part})
+			}
+			f.Statuses = append(f.Statuses, model.RunStatus(part))
+		}
+	}
+	kind := q.Get("kind")
+	if kind != "" {
+		if kind != string(model.RunKindFile) && kind != string(model.RunKindCommand) {
+			return f, model.Wrap(400, model.CodeValidation, "kind must be file or command",
+				map[string]string{"kind": kind})
+		}
+		f.Kind = model.RunKind(kind)
+	}
+	f.Limit = int(parseInt64(q.Get("limit"), 0))
+	f.Offset = int(parseInt64(q.Get("offset"), 0))
+	if f.Limit < 0 || f.Offset < 0 {
+		return f, model.Wrap(400, model.CodeValidation, "limit and offset must be >= 0", nil)
+	}
+	return f, nil
+}
+
+func validRunStatus(s string) bool {
+	switch model.RunStatus(s) {
+	case model.RunQueued, model.RunRunning, model.RunExited, model.RunKilled,
+		model.RunTimeout, model.RunFailed, model.RunInterrupted:
+		return true
+	}
+	return false
 }
 
 func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
@@ -201,6 +256,32 @@ func (s *Server) handleGetRunLogs(w http.ResponseWriter, r *http.Request) {
 
 func chiURLParam(r *http.Request, key string) string {
 	return chi.URLParam(r, key)
+}
+
+func (s *Server) handlePurgeRuns(w http.ResponseWriter, r *http.Request) {
+	ws, ok := s.ownedWorkspace(w, r)
+	if !ok {
+		return
+	}
+	deleted, err := s.svc.PurgeRuns(ws)
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
+}
+
+func (s *Server) handlePurgeRun(w http.ResponseWriter, r *http.Request) {
+	ws, ok := s.ownedWorkspace(w, r)
+	if !ok {
+		return
+	}
+	runID := chiURLParam(r, "runID")
+	if err := s.svc.PurgeRun(ws, runID); err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func parseInt64(s string, def int64) int64 {

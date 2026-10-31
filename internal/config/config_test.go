@@ -24,11 +24,33 @@ func TestDefaultValues(t *testing.T) {
 	if d.Limits.MaxWallTimeSec != 300 || d.Limits.MaxRuns != 3 {
 		t.Fatalf("unexpected default limits: %+v", d.Limits)
 	}
+	if d.MaxLimits.MemoryMB != 8192 || d.MaxLimits.DiskMB != 51200 || d.MaxLimits.MaxRuns != 64 {
+		t.Fatalf("unexpected default maxima: %+v", d.MaxLimits)
+	}
 	if d.Caps.ExecStdoutKB != 256 || d.Caps.RunLogMB != 10 || d.Caps.UploadMB != 50 {
 		t.Fatalf("unexpected default caps: %+v", d.Caps)
 	}
 	if d.Server.Addr != "127.0.0.1:8080" {
 		t.Fatalf("unexpected default addr: %q", d.Server.Addr)
+	}
+}
+
+func TestLoadMaxLimits(t *testing.T) {
+	p := writeTemp(t, `
+max_limits:
+  cpu_cores: 16
+  memory_mb: 4096
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.MaxLimits.CPUCores != 16 || cfg.MaxLimits.MemoryMB != 4096 {
+		t.Fatalf("max_limits = %+v", cfg.MaxLimits)
+	}
+	// Unset maxima fall back to defaults.
+	if cfg.MaxLimits.DiskMB != 51200 {
+		t.Fatalf("disk max default lost: %d", cfg.MaxLimits.DiskMB)
 	}
 }
 

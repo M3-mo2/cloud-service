@@ -215,7 +215,7 @@ to the run's stderr log.
 
 ## 7. Decisions
 
-`docs/DECISIONS.md` contains all 24 resolved decisions, each with a one-line
+`docs/DECISIONS.md` contains all 34 resolved decisions, each with a one-line
 rationale, plus implementation defaults.
 
 ## 8. OpenAPI

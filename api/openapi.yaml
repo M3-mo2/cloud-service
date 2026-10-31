@@ -133,12 +133,101 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      operationId: patchv1_workspaces_workspaceId
+      tags: [Workspaces]
+      summary: Update a workspace's name and/or limits without recreating it
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PatchWorkspaceRequest" }
+      responses:
+        "200":
+          description: Updated workspace
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [workspace]
+                properties:
+                  workspace: { $ref: "#/components/schemas/Workspace" }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
     delete:
       operationId: deletev1_workspaces_workspaceId
       tags: [Workspaces]
       summary: Delete a workspace and all its runs/files
       responses:
         "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/workspaces/{workspaceId}/suspend:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: postv1_workspaces_workspaceId_suspend
+      tags: [Workspaces]
+      summary: Suspend a workspace (refuse new work, stop running runs)
+      responses:
+        "200":
+          description: Suspended
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceAction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/workspaces/{workspaceId}/resume:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: postv1_workspaces_workspaceId_resume
+      tags: [Workspaces]
+      summary: Resume a suspended workspace
+      responses:
+        "200":
+          description: Resumed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceAction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/workspaces/{workspaceId}/stop:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: postv1_workspaces_workspaceId_stop
+      tags: [Workspaces]
+      summary: Stop every running/queued run, leaving the workspace active
+      responses:
+        "200":
+          description: Stopped
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceAction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/workspaces/{workspaceId}/usage:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getv1_workspaces_workspaceId_usage
+      tags: [Workspaces]
+      summary: Disk usage, run counters and effective limits
+      responses:
+        "200":
+          description: Usage
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceUsage" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -330,6 +419,7 @@ paths:
         "400": { $ref: "#/components/responses/Validation" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/WorkspaceSuspended" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
   /v1/workspaces/{workspaceId}/runs:
@@ -357,10 +447,27 @@ paths:
         "400": { $ref: "#/components/responses/Validation" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/WorkspaceSuspended" }
     get:
       operationId: getv1_workspaces_workspaceId_runs
       tags: [Runs]
-      summary: List runs
+      summary: List runs (filter and paginate)
+      parameters:
+        - name: status
+          in: query
+          description: Repeatable or comma-separated run statuses to keep.
+          schema: { type: string }
+        - name: kind
+          in: query
+          schema: { type: string, enum: [file, command] }
+        - name: limit
+          in: query
+          description: Maximum runs to return; 0 means all remaining.
+          schema: { type: integer, default: 0 }
+        - name: offset
+          in: query
+          description: Number of matching runs to skip.
+          schema: { type: integer, default: 0 }
       responses:
         "200":
           description: List
@@ -368,13 +475,35 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [runs]
+                required: [runs, total]
                 properties:
                   runs:
                     type: array
                     items: { $ref: "#/components/schemas/Run" }
+                  total: { type: integer, description: matches before pagination }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        "400": { $ref: "#/components/responses/Validation" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+    delete:
+      operationId: deletev1_workspaces_workspaceId_runs
+      tags: [Runs]
+      summary: Purge finished run history (refuses while a run is running)
+      responses:
+        "200":
+          description: Purged
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
   /v1/workspaces/{workspaceId}/runs/{runId}:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -396,6 +525,16 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: deletev1_workspaces_workspaceId_runs_runId
+      tags: [Runs]
+      summary: Delete one finished run record
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
   /v1/workspaces/{workspaceId}/runs/{runId}/stop:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -503,6 +642,16 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Conflict:
+      description: Operation conflicts with current state (e.g. purging while a run is running)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    WorkspaceSuspended:
+      description: Work refused because the workspace is suspended
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
   schemas:
     ErrorCode:
       type: string
@@ -511,6 +660,7 @@ components:
         - forbidden
         - not_found
         - conflict
+        - workspace_suspended
         - validation
         - unprocessable
         - payload_too_large
@@ -555,6 +705,9 @@ components:
           items: { type: string }
           examples: [[python3]]
         limits_defaults: { $ref: "#/components/schemas/Limits" }
+        limits_maxima:
+          allOf: [{ $ref: "#/components/schemas/Limits" }]
+          description: Server-enforced maxima for per-workspace limits.
     Limits:
       type: object
       properties:
@@ -572,13 +725,63 @@ components:
         owner_id: { type: string }
         name: { type: string }
         created_at: { type: string, format: date-time }
-        status: { type: string, enum: [active, deleted] }
+        status: { type: string, enum: [active, suspended, deleted] }
         limits: { $ref: "#/components/schemas/Limits" }
+        last_activity_at: { type: string, format: date-time }
     CreateWorkspaceRequest:
       type: object
       required: [name]
       properties:
         name: { type: string, minLength: 1, maxLength: 128 }
+        limits: { $ref: "#/components/schemas/Limits" }
+    PatchLimits:
+      type: object
+      description: "Partial limits update. An absent field or explicit null keeps the current value."
+      properties:
+        cpu_cores: { type: [number, "null"], format: float }
+        memory_mb: { type: [integer, "null"] }
+        disk_mb: { type: [integer, "null"] }
+        max_wall_time_sec: { type: [integer, "null"] }
+        max_runs: { type: [integer, "null"] }
+        allow_net: { type: [boolean, "null"] }
+    PatchWorkspaceRequest:
+      type: object
+      description: "Partial workspace update; absent fields keep their current value."
+      properties:
+        name: { type: [string, "null"], minLength: 1, maxLength: 128 }
+        limits: { $ref: "#/components/schemas/PatchLimits" }
+    WorkspaceAction:
+      type: object
+      required: [workspace]
+      properties:
+        workspace: { $ref: "#/components/schemas/Workspace" }
+        changed:
+          type: boolean
+          description: Whether the status actually changed (idempotency signal).
+        stopped_run_ids:
+          type: array
+          items: { type: string }
+        stopped_run_count: { type: integer }
+    WorkspaceUsage:
+      type: object
+      required: [workspace_id, status, disk_bytes, disk_mb, runs_total, active_runs, max_runs, limits]
+      properties:
+        workspace_id: { type: string }
+        status: { type: string, enum: [active, suspended] }
+        created_at: { type: string, format: date-time }
+        last_activity_at: { type: string, format: date-time }
+        disk_bytes: { type: integer, format: int64 }
+        disk_bytes_complete:
+          type: boolean
+          description: "false when the bounded walk stopped early, making disk_bytes a lower bound."
+        disk_mb: { type: integer }
+        disk_percent: { type: number, format: float }
+        runs_total: { type: integer }
+        runs_by_status:
+          type: object
+          additionalProperties: { type: integer }
+        active_runs: { type: integer }
+        max_runs: { type: integer }
         limits: { $ref: "#/components/schemas/Limits" }
     Entry:
       type: object

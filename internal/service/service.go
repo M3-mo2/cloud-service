@@ -72,19 +72,41 @@ func (s *Service) CreateWorkspace(principalID, name string, limits *model.Limits
 	lim := s.defaultLimits()
 	if limits != nil {
 		lim = applyLimits(lim, *limits)
+		if err := checkMaxima(lim, s.maxLimits()); err != nil {
+			return nil, err
+		}
 	}
+	now := time.Now().UTC()
 	w := &model.Workspace{
-		ID:        model.NewWorkspaceID(),
-		OwnerID:   principalID,
-		Name:      name,
-		CreatedAt: time.Now().UTC(),
-		Status:    model.WorkspaceActive,
-		Limits:    lim,
+		ID:             model.NewWorkspaceID(),
+		OwnerID:        principalID,
+		Name:           name,
+		CreatedAt:      now,
+		Status:         model.WorkspaceActive,
+		Limits:         lim,
+		LastActivityAt: now,
 	}
 	if err := s.store.CreateWorkspace(w); err != nil {
 		return nil, err
 	}
 	return w, nil
+}
+
+// checkMaxima rejects a limits value that exceeds any server-level maximum.
+func checkMaxima(l, max model.Limits) error {
+	switch {
+	case l.CPUCores > max.CPUCores:
+		return maxExceeded("cpu_cores", l.CPUCores, max.CPUCores)
+	case l.MemoryMB > max.MemoryMB:
+		return maxExceeded("memory_mb", l.MemoryMB, max.MemoryMB)
+	case l.DiskMB > max.DiskMB:
+		return maxExceeded("disk_mb", l.DiskMB, max.DiskMB)
+	case l.MaxWallTimeSec > max.MaxWallTimeSec:
+		return maxExceeded("max_wall_time_sec", l.MaxWallTimeSec, max.MaxWallTimeSec)
+	case l.MaxRuns > max.MaxRuns:
+		return maxExceeded("max_runs", l.MaxRuns, max.MaxRuns)
+	}
+	return nil
 }
 
 func (s *Service) defaultLimits() model.Limits {

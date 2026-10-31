@@ -239,6 +239,31 @@ func TestSymlinkNotFollowedInDiskUsage(t *testing.T) {
 	}
 }
 
+func TestDiskUsageBoundedStops(t *testing.T) {
+	fs := newFs(t)
+	fs.Write("/a", []byte("12345"), false, WriteOptions{})
+	fs.Write("/b", []byte("678"), false, WriteOptions{})
+
+	size, complete, err := fs.DiskUsageBounded(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !complete || size != 8 {
+		t.Fatalf("size = %d complete = %v, want 8/true", size, complete)
+	}
+
+	size, complete, err = fs.DiskUsageBounded(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("bounded walk should be incomplete with maxEntries=1")
+	}
+	if size > 8 {
+		t.Fatalf("bounded size = %d, want a lower bound", size)
+	}
+}
+
 func asQuota(err error, target **QuotaError) bool {
 	qe, ok := err.(*QuotaError)
 	if ok {

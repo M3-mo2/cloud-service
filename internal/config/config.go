@@ -11,12 +11,13 @@ import (
 
 // Config is the top-level service configuration loaded from YAML.
 type Config struct {
-	Server  ServerConfig  `koanf:"server"`
-	Storage StorageConfig `koanf:"storage"`
-	Sandbox SandboxConfig `koanf:"sandbox"`
-	Limits  LimitsConfig  `koanf:"limits"`
-	Caps    CapsConfig    `koanf:"caps"`
-	Keys    []KeyConfig   `koanf:"keys"`
+	Server    ServerConfig  `koanf:"server"`
+	Storage   StorageConfig `koanf:"storage"`
+	Sandbox   SandboxConfig `koanf:"sandbox"`
+	Limits    LimitsConfig  `koanf:"limits"`
+	MaxLimits LimitsConfig  `koanf:"max_limits"`
+	Caps      CapsConfig    `koanf:"caps"`
+	Keys      []KeyConfig   `koanf:"keys"`
 }
 
 // ServerConfig controls the HTTP listener.
@@ -116,6 +117,14 @@ func Default() Config {
 			MaxRuns:        3,
 			AllowNet:       false,
 		},
+		MaxLimits: LimitsConfig{
+			CPUCores:       8,
+			MemoryMB:       8192,
+			DiskMB:         51200,
+			MaxWallTimeSec: 3600,
+			MaxRuns:        64,
+			AllowNet:       true,
+		},
 		Caps: CapsConfig{
 			ExecStdoutKB: 256,
 			ExecStderrKB: 256,
@@ -186,6 +195,24 @@ func (c *Config) applyDefaults() {
 	if c.Limits.MaxRuns <= 0 {
 		c.Limits.MaxRuns = d.Limits.MaxRuns
 	}
+	// Server-level maxima must always be present and at least the defaults, or
+	// every run/exec would be clamped to nonsense.
+	m := &c.MaxLimits
+	if m.CPUCores < d.Limits.CPUCores {
+		m.CPUCores = d.MaxLimits.CPUCores
+	}
+	if m.MemoryMB < d.Limits.MemoryMB {
+		m.MemoryMB = d.MaxLimits.MemoryMB
+	}
+	if m.DiskMB < d.Limits.DiskMB {
+		m.DiskMB = d.MaxLimits.DiskMB
+	}
+	if m.MaxWallTimeSec < d.Limits.MaxWallTimeSec {
+		m.MaxWallTimeSec = d.MaxLimits.MaxWallTimeSec
+	}
+	if m.MaxRuns < d.Limits.MaxRuns {
+		m.MaxRuns = d.MaxLimits.MaxRuns
+	}
 	caps := &c.Caps
 	if caps.ExecStdoutKB <= 0 {
 		caps.ExecStdoutKB = d.Caps.ExecStdoutKB
@@ -228,6 +255,13 @@ limits:
   max_wall_time_sec: 300
   max_runs: 3
   allow_net: false
+max_limits:
+  cpu_cores: 8
+  memory_mb: 8192
+  disk_mb: 51200
+  max_wall_time_sec: 3600
+  max_runs: 64
+  allow_net: true
 caps:
   exec_stdout_kb: 256
   exec_stderr_kb: 256

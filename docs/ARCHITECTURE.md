@@ -441,7 +441,8 @@ erDiagram
         string owner_id "principal_id"
         string name
         time created_at
-        string status "active or deleted"
+        string status "active/suspended/deleted"
+        time last_activity_at
         object limits
     }
     RUN {
@@ -491,10 +492,12 @@ flowchart LR
     subgraph v1["/v1 (Bearer auth)"]
         META["GET /meta"]
         WC["POST/GET /workspaces"]
-        W["GET/DELETE /workspaces/{id}"]
+        W["GET/PATCH/DELETE /workspaces/{id}"]
+        LIFECYCLE["POST .../{suspend,resume,stop}"]
+        USAGE["GET /workspaces/{id}/usage"]
         F["GET/DELETE /files · /files/content\nPOST /files/{mkdir,rename,upload}"]
         EX["POST /exec (sync, ≤60s)"]
-        RN["POST/GET /runs · /runs/{id}\nPOST /runs/{id}/stop\nGET /runs/{id}/logs"]
+        RN["POST/GET/DELETE /runs · /runs/{id}\nPOST /runs/{id}/stop\nDELETE /runs/{id}\nGET /runs/{id}/logs"]
     end
 ```
 
@@ -504,20 +507,26 @@ flowchart LR
 | `GET /readyz` | data dir + nsjail present | 200 / 503 | 503 `{nsjail:false}` |
 | `GET /metrics` | Prometheus text | 200 | — |
 | `GET /v1/meta` | version, runtimes, default limits | 200 | 401 |
-| `POST /v1/workspaces` | create | 201 | 400, 413 |
+| `POST /v1/workspaces` | create | 201 | 400, 413, 422 |
 | `GET /v1/workspaces` | list owned | 200 | 401 |
 | `GET /v1/workspaces/{id}` | get | 200 | 403, 404 |
+| `PATCH /v1/workspaces/{id}` | update name/limits at runtime | 200 | 400, 422 |
 | `DELETE /v1/workspaces/{id}` | stop runs + rm tree | 204 | 403, 404 |
-| `GET /v1/workspaces/{id}/files?path=` | list dir | 200 | 422 unsafe |
+| `POST .../{id}/suspend` | refuse new work + stop runs | 200 | 404 |
+| `POST .../{id}/resume` | accept work again | 200 | 404 |
+| `POST .../{id}/stop` | stop all runs, stay active | 200 | 404 |
+| `GET .../{id}/usage` | disk bytes, run counters, limits | 200 | 404 |
+| `GET .../files?path=` | list dir | 200 | 422 unsafe |
 | `GET .../files/content?path=` | read (raw / `?meta=true`) | 200 | 404, 422, 413 |
 | `PUT .../files/content?path=` | write text/base64 | 204 | 507 quota |
 | `DELETE .../files?path=` | delete | 204 | 404, 422 |
 | `POST .../files/mkdir` | mkdir -p | 201 | 400, 422 |
 | `POST .../files/rename` | rename | 204 | 404, 422 |
 | `POST .../files/upload` | multipart upload | 201 | 413, 507 |
-| `POST .../exec` | sync run | 200 | 422 bad cmd, 503 no nsjail |
-| `POST .../runs` | async run | 202 | 400 |
-| `GET .../runs` / `.../runs/{id}` | list / get | 200 | 404 |
+| `POST .../exec` | sync run | 200 | 422 bad cmd, 409 suspended, 503 no nsjail |
+| `POST .../runs` | async run | 202 | 400, 409 suspended |
+| `GET .../runs` / `.../runs/{id}` | list (filter/page) / get | 200 | 400, 404 |
+| `DELETE .../runs` / `.../runs/{id}` | purge finished runs / one run | 200 / 204 | 409 running |
 | `POST .../runs/{id}/stop` | kill process group | 202 | 404 |
 | `GET .../runs/{id}/logs` | poll logs | 200 | 404 |
 
@@ -547,6 +556,12 @@ limits:                      # default per-workspace limits (overridable)
   disk_mb: 1024
   max_wall_time_sec: 300
   max_runs: 3
+max_limits:                  # hard server maxima (create + PATCH enforced)
+  cpu_cores: 8
+  memory_mb: 8192
+  disk_mb: 51200
+  max_wall_time_sec: 3600
+  max_runs: 64
 caps:                        # hard ceilings, never overridable per request
   exec_stdout_kb: 256
   exec_stderr_kb: 256
@@ -659,7 +674,7 @@ Deferred to v0.1 (documented, not bugs):
 
 ## 13. Decision index
 
-The 24 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
+The 34 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
 including the isolation model, network default-off, retention (100 runs),
 exec-vs-runs split, disk-quota strategy, caps, path safety, process kill, error
 envelope, ULID IDs, health-probe semantics, the cgroup/rlimit/env/lifecycle

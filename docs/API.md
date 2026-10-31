@@ -73,9 +73,10 @@ additional code the router emits:
 | `unauthorized` | 401 | Missing or invalid credentials | No/invalid `Authorization` header on a `/v1` route. |
 | `forbidden` | 403 | Resource belongs to another principal | Valid key, `owner_id` mismatch. |
 | `not_found` | 404 | Resource missing | Unknown workspace/run/file, unknown route. |
-| `conflict` | — | Conflict | **Defined but never emitted**; no status is assigned (see discrepancies). |
-| `validation` | 400 | Malformed or invalid request | Bad JSON, unknown JSON field, failing `validate` tag, missing query/body field, bad `stream`, unknown route body. Also carries the **405** status for method-not-allowed. |
-| `unprocessable` | 422 | Unsafe path or invalid target | Path traversal / symlink escape, `cwd` escape, command not found, deleting the workspace root, file-run target that is a directory. |
+| `conflict` | 409 | Operation conflicts with current state | Purging run history (or deleting one run) while a run is still queued/running. |
+| `workspace_suspended` | 409 | Work refused because the workspace is suspended | `POST .../exec` or `POST .../runs` on a `suspended` workspace. |
+| `validation` | 400 | Malformed or invalid request | Bad JSON, unknown JSON field, failing `validate` tag, missing query/body field, bad `stream`/`status`/`kind` filter, unknown route body. Also carries the **405** status for method-not-allowed. |
+| `unprocessable` | 422 | Unsafe path or invalid limit/target | Path traversal / symlink escape, `cwd` escape, command not found, deleting the workspace root, file-run target that is a directory, a limit `<= 0` or **above the server maximum**. |
 | `payload_too_large` | 413 | Body or file over a hard cap | JSON body > `json_body_mb`, upload > `upload_mb`, file write > `file_write_mb`. |
 | `insufficient_storage` | 507 | Workspace disk quota exceeded | Write/upload/rename past `limits.disk_mb`. |
 | `timeout` | 504 | Timeout | **Defined but never emitted** (see discrepancies). |
@@ -172,12 +173,18 @@ default per-workspace limits.
     "limits_defaults": {
       "cpu_cores": 1, "memory_mb": 512, "disk_mb": 1024,
       "max_wall_time_sec": 300, "max_runs": 3, "allow_net": false
+    },
+    "limits_maxima": {
+      "cpu_cores": 8, "memory_mb": 8192, "disk_mb": 51200,
+      "max_wall_time_sec": 3600, "max_runs": 64, "allow_net": true
     }
   }
   ```
 - **Errors:** 401 `unauthorized`.
 - **Semantics:** `limits_defaults` is the value a workspace gets when `limits`
   is omitted at creation; it comes from the `limits:` config block.
+  `limits_maxima` is the server ceiling (`max_limits:` config) enforced on
+  creation and `PATCH`.
 
 ```sh
 KEY=dev-key-please-rotate
@@ -217,13 +224,15 @@ Create a workspace owned by the authenticated principal.
               "max_wall_time_sec":300,"max_runs":3,"allow_net":false}}}
   ```
 - **Errors:** 400 `validation` (bad JSON / failed tag), 401 `unauthorized`,
-  413 `payload_too_large` (body > `json_body_mb`).
-- **Semantics:** the limits are copied into the workspace and are immutable
-  afterwards — there is no update endpoint. `allow_net` is always taken from the
-  request when a `limits` object is present (so `{"limits":{}}` sets `allow_net`
-  to `false`), and only from the server default when `limits` is omitted
-  entirely. There is **no server-side ceiling on override values** (see
-  discrepancies).
+  413 `payload_too_large` (body > `json_body_mb`), 422 `unprocessable` (a limit
+  above the server maximum).
+- **Semantics:** `allow_net` is always taken from the request when a `limits`
+  object is present (so `{"limits":{}}` sets `allow_net` to `false`), and only
+  from the server default when `limits` is omitted entirely. Numeric limits are
+  bounded by the server-level maxima (`max_limits:` in config; defaults
+  `cpu_cores` 8, `memory_mb` 8192, `disk_mb` 51200, `max_wall_time_sec` 3600,
+  `max_runs` 64); a request above a maximum is `422 unprocessable`. Limits can
+  be changed later with `PATCH`.
 
 ```sh
 curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
@@ -258,6 +267,49 @@ WS=ws_REPLACE_ME
 curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/workspaces/$WS
 ```
 
+### PATCH /v1/workspaces/{workspaceID}
+
+Update a subset of a workspace's fields **without recreating it**. This is the
+runtime-mutable settings endpoint.
+
+- **Path parameter:** `workspaceID`.
+- **Request body (`patchWorkspaceRequest`):** all fields optional; an absent
+  field **or an explicit `null`** keeps the current value (a `null` never resets
+  a field to zero):
+
+  | Field | Go type | JSON | Notes |
+  |-------|---------|------|-------|
+  | `name` | `*string` | `name` | non-empty after trimming, `<= 128` chars; `400` otherwise |
+  | `limits.cpu_cores` | `*float64` | `limits.cpu_cores` | must be `> 0` and `<= max_limits.cpu_cores` |
+  | `limits.memory_mb` | `*int` | `limits.memory_mb` | must be `> 0` and `<= max_limits.memory_mb` |
+  | `limits.disk_mb` | `*int` | `limits.disk_mb` | must be `> 0` and `<= max_limits.disk_mb` |
+  | `limits.max_wall_time_sec` | `*int` | `limits.max_wall_time_sec` | must be `> 0` and `<= max_limits.max_wall_time_sec` |
+  | `limits.max_runs` | `*int` | `limits.max_runs` | must be `> 0` and `<= max_limits.max_runs` |
+  | `limits.allow_net` | `*bool` | `limits.allow_net` | `true`/`false` |
+
+  `suspended` is **not** patchable; use the lifecycle endpoints below.
+
+- **Response 200:** `{"workspace": <workspace>}`, the same shape as
+  `GET /v1/workspaces/{workspaceID}`.
+- **Errors:** 400 `validation` (bad JSON, empty/too-long name, unknown field),
+  401, 403, 404, 422 `unprocessable` (a limit `<= 0`, or above the server
+  maximum; `details` carries `field`, `value`, `max`).
+- **Semantics:**
+  - The update is a merge: only provided, non-null fields change. A numeric
+    value that is positive but above the server maximum is **rejected with
+    422**, never silently clamped (the maxima are documented in
+    [Resource limits](#resource-limits)).
+  - Lowering a limit applies to the **next** run/exec. A run already in flight
+    is **not** retroactively killed — it finishes under its existing limits
+    (see [DECISIONS.md](DECISIONS.md)).
+  - The updated limits are persisted atomically and survive a service restart.
+
+```sh
+curl -s -X PATCH -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"limits":{"memory_mb":256}}' \
+  localhost:8080/v1/workspaces/$WS
+```
+
 ### DELETE /v1/workspaces/{workspaceID}
 
 Delete a workspace.
@@ -273,6 +325,111 @@ Delete a workspace.
 curl -s -o /dev/null -w '%{http_code}\n' -X DELETE \
   -H "Authorization: Bearer $KEY" localhost:8080/v1/workspaces/$WS
 # 204
+```
+
+### POST /v1/workspaces/{workspaceID}/suspend
+
+Suspend the workspace: new work is refused and running runs are stopped.
+
+- **Path parameter:** `workspaceID`.
+- **Response 200:**
+
+  ```json
+  {"workspace": <workspace with status "suspended">,
+   "changed": true, "stopped_run_ids": ["run_..."], "stopped_run_count": 1}
+  ```
+
+- **Errors:** 401, 403, 404.
+- **Semantics:**
+  - Sets `status` to `suspended` and **stops every running/queued run** of the
+    workspace (same kill path as `stop`). `stopped_run_ids` lists the runs that
+    were signalled.
+  - While suspended, **every operation that starts work is refused**:
+    `POST .../exec` and `POST .../runs` return **409 `workspace_suspended`**.
+    Reads keep working — file listing/reading, run listing, run lookup and log
+    reads are unaffected.
+  - **Idempotent:** suspending an already-suspended workspace returns
+    `changed: false` (it still stops anything running).
+  - The suspended status is persisted and survives a restart; work stays
+    refused afterwards.
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $KEY" \
+  localhost:8080/v1/workspaces/$WS/suspend
+```
+
+### POST /v1/workspaces/{workspaceID}/resume
+
+Resume a suspended workspace; work is accepted again.
+
+- **Path parameter:** `workspaceID`.
+- **Response 200:** `{"workspace": <workspace with status "active">, "changed": true}`.
+- **Errors:** 401, 403, 404.
+- **Semantics:** sets `status` to `active`. Idempotent: resuming an
+  already-active workspace returns `changed: false`. Does not restart anything
+  that was stopped.
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $KEY" \
+  localhost:8080/v1/workspaces/$WS/resume
+```
+
+### POST /v1/workspaces/{workspaceID}/stop
+
+Stop every running/queued run of the workspace and leave it `active`.
+
+- **Path parameter:** `workspaceID`.
+- **Response 200:**
+
+  ```json
+  {"workspace": <workspace with status "active">,
+   "stopped_run_ids": ["run_..."], "stopped_run_count": 1}
+  ```
+
+- **Errors:** 401, 403, 404.
+- **Semantics:** this is the "stop its operations" control. It kills every
+  tracked run (SIGTERM→SIGKILL process group) and reports what was stopped. The
+  workspace keeps `status: active`, so new work is still accepted. **Idempotent
+  and a no-op success** (`stopped_run_count: 0`) when nothing is running. It
+  differs from `suspend` only in that it does **not** block future work.
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $KEY" \
+  localhost:8080/v1/workspaces/$WS/stop
+```
+
+### GET /v1/workspaces/{workspaceID}/usage
+
+Report the workspace's actual disk use, run counters and effective limits.
+
+- **Path parameter:** `workspaceID`.
+- **Response 200:**
+
+  ```json
+  {"workspace_id":"ws_...","status":"active",
+   "created_at":"2026-01-02T15:04:05Z","last_activity_at":"2026-01-02T15:10:00Z",
+   "disk_bytes":11,"disk_bytes_complete":true,"disk_mb":1024,"disk_percent":0.001,
+   "runs_total":3,"runs_by_status":{"exited":2,"killed":1},
+   "active_runs":0,"max_runs":3,
+   "limits":{"cpu_cores":1,"memory_mb":512,"disk_mb":1024,
+             "max_wall_time_sec":300,"max_runs":3,"allow_net":false}}
+  ```
+
+- **Errors:** 401, 403, 404.
+- **Semantics:**
+  - `disk_bytes` is the size of the workspace's `files/` tree, measured with a
+    **bounded walk** (at most 100 000 directory entries). If the tree is larger,
+    the walk stops early, `disk_bytes_complete` is `false`, and `disk_bytes` is a
+    **lower bound**. This keeps the endpoint cheap (no unbounded recursive scan,
+    no cache to go stale).
+  - `disk_percent` is `disk_bytes / (disk_mb * 1024 * 1024) * 100`.
+  - `runs_by_status` counts all retained runs; `runs_total` is their sum.
+    `active_runs` counts `queued` + `running`; compare it with `max_runs`.
+  - `last_activity_at` is the most recent run/mutation (run start/stop, file
+    purge, PATCH, suspend/resume/stop); `created_at` is the creation time.
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/workspaces/$WS/usage
 ```
 
 ### GET /v1/workspaces/{workspaceID}/files
@@ -475,10 +632,10 @@ Run one command **synchronously** and return its output inline.
   ```json
   {"exit_code":0,"stdout":"hi\n","stderr":"","duration_ms":37,"truncated":false}
   ```
-- **Errors:** 400 `validation` (missing `cmd`, bad JSON), 401, 403, 422
-  `unprocessable` (`cwd` escapes the root, or `cmd[0]` not found), 503
-  `unavailable` (nsjail missing or sandbox launch failure, with
-  `details.nsjail`).
+- **Errors:** 400 `validation` (missing `cmd`, bad JSON), 401, 403, 409
+  `workspace_suspended` (the workspace is suspended), 422 `unprocessable`
+  (`cwd` escapes the root, or `cmd[0]` not found), 503 `unavailable` (nsjail
+  missing or sandbox launch failure, with `details.nsjail`).
 - **Semantics:**
   - **Wall-clock cap:** synchronous exec has a hard cap of **60 s**, the
     constant `execHardCapSec` in
@@ -544,8 +701,8 @@ Start an asynchronous run. Returns immediately; poll it via the run endpoints.
   ```
 - **Errors:** 400 `validation` (bad `kind`, missing `file`/`argv`, bad JSON),
   401, 403, 404 `not_found` (`kind=file` target missing — or the workspace
-  missing), 422 `unprocessable` (`kind=file` target is a directory, or the path
-  escapes the root).
+  missing), 409 `workspace_suspended`, 422 `unprocessable` (`kind=file` target
+  is a directory, or the path escapes the root).
 - **Semantics:**
   - `kind=file` validates the target at request time and builds the argv
     `["python3", <file without leading slash>, ...args]`; the interpreter is
@@ -569,15 +726,47 @@ curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 
 ### GET /v1/workspaces/{workspaceID}/runs
 
-List the workspace's runs, newest first.
+List the workspace's runs, newest first, with filtering and pagination.
 
 - **Path parameter:** `workspaceID`.
-- **Response 200:** `{"runs":[ <run>, ... ]}`.
-- **Errors:** 401, 403.
-- **Semantics:** empty is `{"runs":[]}`.
+- **Query parameters:**
+  - `status` (string, repeatable or comma-separated) — keep only runs in any of
+    the given statuses (`queued,running,exited,killed,timeout,failed,interrupted`).
+    An unknown status is `400`. Both `?status=exited,killed` and
+    `?status=exited&status=killed` are accepted.
+  - `kind` (`file` or `command`) — keep only runs of that kind.
+  - `limit` (int) — maximum runs to return; `0`/absent means "all remaining".
+  - `offset` (int) — number of matching runs to skip before returning (default 0).
+- **Response 200:** `{"runs":[ <run>, ... ], "total": N, "limit": L, "offset": O}`.
+  `total` is the number of runs matching the filter **before** pagination, so a
+  client can page deterministically. `runs` is ordered newest first.
+- **Errors:** 400 `validation` (unknown `status`/`kind`), 401, 403.
+- **Semantics:** empty is `{"runs":[],"total":0}`. Pagination is applied after
+  filtering; the ordering is stable (by start time, newest first).
 
 ```sh
-curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/workspaces/$WS/runs
+curl -s -H "Authorization: Bearer $KEY" \
+  "localhost:8080/v1/workspaces/$WS/runs?status=exited,killed&limit=20&offset=0"
+```
+
+### DELETE /v1/workspaces/{workspaceID}/runs
+
+Purge the workspace's finished run history (killed/timed-out/failed/exited/
+interrupted runs).
+
+- **Path parameter:** `workspaceID`.
+- **Response 200:** `{"deleted": N}` — the number of run records removed.
+- **Errors:** 401, 403, **409 `conflict`** while any run is still
+  `queued`/`running` (`details.run_id` names one such run), 404 (unknown
+  workspace).
+- **Semantics:** only finished runs are removed, and the whole purge **refuses**
+  (nothing is deleted) if any run is still queued/running, so an in-flight run
+  is never lost. Logs and metadata for the removed runs are deleted with them.
+
+```sh
+curl -s -X DELETE -H "Authorization: Bearer $KEY" \
+  localhost:8080/v1/workspaces/$WS/runs
+# {"deleted":3}
 ```
 
 ### GET /v1/workspaces/{workspaceID}/runs/{runID}
@@ -596,6 +785,23 @@ Fetch one run.
 RUN=run_REPLACE_ME
 curl -s -H "Authorization: Bearer $KEY" \
   localhost:8080/v1/workspaces/$WS/runs/$RUN
+```
+
+### DELETE /v1/workspaces/{workspaceID}/runs/{runID}
+
+Delete one finished run record (and its logs).
+
+- **Path parameters:** `workspaceID`, `runID`.
+- **Response 204:** empty body.
+- **Errors:** 401, 403, 404 `not_found`, **409 `conflict`** if the run is still
+  `queued`/`running`.
+- **Semantics:** removes the run directory (`meta.json`, `stdout.log`,
+  `stderr.log`). Refuses to delete a run that is still running.
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE \
+  -H "Authorization: Bearer $KEY" localhost:8080/v1/workspaces/$WS/runs/$RUN
+# 204
 ```
 
 ### POST /v1/workspaces/{workspaceID}/runs/{runID}/stop
@@ -643,6 +849,36 @@ Poll a run log stream by byte offset.
   calling with `offset=<next>` until `eof` is true. A live run may append more
   after `eof` was true, so a poller that wants the whole log should re-poll until
   the run reaches a terminal state and a final `eof:true` is observed.
+- **Exact tailing recipe (poll with the returned offset):**
+  1. Poll the run until `status` is terminal (`exited`, `killed`, `timeout`,
+     `failed`, `interrupted`).
+  2. Read `offset=0`; print `data`, set `offset = next`.
+  3. While `eof` is `false`, repeat step 2.
+  4. If the run is still not terminal, sleep briefly and repeat from step 2
+     (a live run may append between polls, flipping `eof` back to `false`).
+
+  Worked example against a running `long.py` that prints a line per second:
+
+  ```sh
+  RUN=run_REPLACE_ME
+  OFFSET=0
+  while :; do
+    CHUNK=$(curl -s -H "Authorization: Bearer $KEY" \
+      "localhost:8080/v1/workspaces/$WS/runs/$RUN/logs?stream=stdout&offset=$OFFSET&limit=65536")
+    # {"data":"tick 0\ntick 1\n","offset":0,"next":14,"eof":false,"truncated":false}
+    printf '%s' "$CHUNK" | python3 -c 'import json,sys; d=json.load(sys.stdin); import sys as s; s.stdout.write(d["data"])'
+    OFFSET=$(printf '%s' "$CHUNK" | python3 -c 'import json,sys;print(json.load(sys.stdin)["next"])')
+    EOF=$(printf '%s' "$CHUNK" | python3 -c 'import json,sys;print(json.load(sys.stdin)["eof"])')
+    STATUS=$(curl -s -H "Authorization: Bearer $KEY" \
+      "localhost:8080/v1/workspaces/$WS/runs/$RUN" | python3 -c 'import json,sys;print(json.load(sys.stdin)["run"]["status"])')
+    [ "$EOF" = "True" ] && case "$STATUS" in exited|killed|timeout|failed|interrupted) break;; esac
+    sleep 1
+  done
+  ```
+
+  The first chunk above shows `offset:0` → `next:14`, so the next poll passes
+  `offset=14`; once the run has ended and a final poll returns `eof:true` with
+  `next` equal to the file size, the log is complete.
 
 ```sh
 curl -s -H "Authorization: Bearer $KEY" \
@@ -653,16 +889,34 @@ curl -s -H "Authorization: Bearer $KEY" \
 
 ### Workspace lifecycle
 
-- **Create** — `POST /v1/workspaces`. The caller may override, at creation time
-  only: `limits.cpu_cores`, `memory_mb`, `disk_mb`, `max_wall_time_sec`,
-  `max_runs` (positive values only) and `allow_net`. Everything else — the id
-  (`ws_<ULID>`), `owner_id` (from the key), `created_at`, `status` — is fixed by
-  the server. Limits come from the `limits:` config block when omitted.
+A workspace has a `status` of `active` or `suspended`:
+
+```
+create ──► active ──suspend──► suspended
+              ▲                   │
+              └──── resume ───────┘
+                (stop leaves active)
+```
+
+- **Create** — `POST /v1/workspaces`. The caller may override, at creation time,
+  `limits.cpu_cores`, `memory_mb`, `disk_mb`, `max_wall_time_sec`, `max_runs`
+  (positive values only, each `<=` its server maximum) and `allow_net`.
+  Everything else — the id (`ws_<ULID>`), `owner_id` (from the key),
+  `created_at`, `status` — is fixed by the server. Limits come from the
+  `limits:` config block when omitted.
 - **Inspect** — `GET /v1/workspaces/{workspaceID}`.
 - **List** — `GET /v1/workspaces` (caller's own, newest first).
+- **Update** — `PATCH /v1/workspaces/{workspaceID}` changes `name` and/or a
+  subset of `limits` at runtime; other fields are preserved.
+- **Suspend / resume / stop** — `POST .../suspend`, `.../resume`, `.../stop`. All
+  idempotent. `suspend` refuses new work (409 `workspace_suspended`) and stops
+  running runs; `resume` accepts work again; `stop` kills running runs but leaves
+  the workspace `active`.
+- **Usage** — `GET /v1/workspaces/{workspaceID}/usage`.
 - **Delete** — `DELETE /v1/workspaces/{workspaceID}`: stops and kills all runs,
-  then removes the whole `{data_dir}/workspaces/{id}/` tree. Fields cannot be
-  updated after creation; the only mutation is deletion.
+  then removes the whole `{data_dir}/workspaces/{id}/` tree.
+
+Both the status and the limits are persisted and survive a restart.
 
 ### Run lifecycle
 
@@ -694,16 +948,21 @@ queued | running ────────► interrupted  (recovered after a res
 
 ### Resource limits
 
-Per-workspace limits (`limits:` config; overridable at creation):
+Per-workspace limits (`limits:` config; overridable at creation and via
+`PATCH`):
 
-| Limit | Config key | Default | Effect |
-|-------|------------|---------|--------|
-| CPU cores | `limits.cpu_cores` | 1 | cgroup CPU throttling (`cgroup_cpu_ms_per_sec`) |
-| Memory | `limits.memory_mb` | 512 | `RLIMIT_AS` and `cgroup_mem_max` (MB / bytes respectively) |
-| Disk | `limits.disk_mb` | 1024 | file-API quota; `RLIMIT_FSIZE` per file |
-| Wall time | `limits.max_wall_time_sec` | 300 | async run timeout (`--time_limit`) |
-| Runs / procs | `limits.max_runs` | 3 | cgroup pids max = `max_runs * 64`; also `RLIMIT_NPROC` |
-| Network | `limits.allow_net` | false | clones the network namespace unless true |
+| Limit | Config key | Default | Server maximum (`max_limits:`) | Effect |
+|-------|------------|---------|-------------------------------|--------|
+| CPU cores | `limits.cpu_cores` | 1 | 8 | cgroup CPU throttling (`cgroup_cpu_ms_per_sec`) |
+| Memory | `limits.memory_mb` | 512 | 8192 | `RLIMIT_AS` and `cgroup_mem_max` (MB / bytes respectively) |
+| Disk | `limits.disk_mb` | 1024 | 51200 | file-API quota; `RLIMIT_FSIZE` per file |
+| Wall time | `limits.max_wall_time_sec` | 300 | 3600 | async run timeout (`--time_limit`) |
+| Runs / procs | `limits.max_runs` | 3 | 64 | cgroup pids max = `max_runs * 64`; also `RLIMIT_NPROC` |
+| Network | `limits.allow_net` | false | true | clones the network namespace unless true |
+
+The server maximum is a hard ceiling: a create or `PATCH` value above it is
+rejected with `422 unprocessable` (never silently clamped). `max_limits:` is
+loaded from config and always at least the defaults.
 
 Process-level hard caps (`caps:` config; **not** overridable per request):
 `exec_stdout_kb` 256, `exec_stderr_kb` 256, `run_log_mb` 10, `json_body_mb` 1,
@@ -845,9 +1104,10 @@ should be updated.
 1. **Path-parameter name.** The router uses `{workspaceID}` and `{runID}`;
    `openapi.yaml` names them `workspaceId` and `runId`. No client-visible effect
    (the value is positional), but the spec is inaccurate.
-2. **`conflict` (409) and `timeout` are defined but never emitted.** Both are
-   constants in `internal/model/errors.go` and appear in the OpenAPI `ErrorCode`
-   enum, but no handler produces them.
+2. **`timeout` is still defined but never emitted.** It is a constant in
+   `internal/model/errors.go` and appears in the OpenAPI `ErrorCode` enum, but no
+   handler produces it. (`conflict` is now emitted on run purge; see the run
+   endpoints.)
 3. **`insufficient_storage` (507) is emitted but is not a Go constant.** The
    quota mapping in `internal/api/errors.go` uses the string literal
    `"insufficient_storage"`; the OpenAPI enum lists it, `errors.go` does not
@@ -877,11 +1137,10 @@ should be updated.
 11. **`failed` runs have `exit_code:null`.** No exit code is recorded when the
     executor errors; `openapi.yaml` permits `exit_code` null but the semantic
     (null on failure) is undocumented.
-12. **Workspace limit overrides are not bounded by any server ceiling.**
-    `CreateWorkspaceRequest` lets a client set `memory_mb`, `disk_mb`,
-    `max_runs`, etc. to arbitrary positive values; there is no server-side
-    maximum. `openapi.yaml` implies limits are constrained but defines no
-    maxima.
+12. **Path parameters are named `{workspaceID}`/`{runID}`** in the router while
+    `openapi.yaml` uses `workspaceId`/`runId`; no client-visible effect (the value
+    is positional). Covered by discrepancy 1 above; listed here for the new
+    endpoints too.
 13. **`/readyz` shape is richer than SPEC.md.** SPEC.md §2.1 lists
     `{"status","nsjail","data_dir"}`; the implementation adds `cgroups` and uses
     `status` values `ready`/`not_ready`. `openapi.yaml` matches the

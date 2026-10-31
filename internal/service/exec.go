@@ -30,6 +30,9 @@ const execHardCapSec = 60
 
 // Exec runs a command synchronously with a hard timeout cap.
 func (s *Service) Exec(w *model.Workspace, spec ExecSpec) (ExecOutcome, error) {
+	if err := s.ensureActive(w); err != nil {
+		return ExecOutcome{}, err
+	}
 	timeout := spec.Timeout
 	if timeout <= 0 {
 		timeout = execHardCapSec

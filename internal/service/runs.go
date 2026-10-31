@@ -24,6 +24,9 @@ type StartRunSpec struct {
 
 // StartRun creates and launches an asynchronous run.
 func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, error) {
+	if err := s.ensureActive(w); err != nil {
+		return nil, err
+	}
 	timeout := spec.Timeout
 	if timeout <= 0 || timeout > w.Limits.MaxWallTimeSec {
 		timeout = w.Limits.MaxWallTimeSec
@@ -73,6 +76,7 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 	if err := s.store.CreateRun(w.ID, run); err != nil {
 		return nil, err
 	}
+	s.touchActivity(w.ID)
 
 	stdoutPath := s.store.RunLogPath(w.ID, run.ID, model.StreamStdout)
 	stderrPath := s.store.RunLogPath(w.ID, run.ID, model.StreamStderr)
@@ -307,9 +311,98 @@ func (s *Service) GetRun(w *model.Workspace, runID string) (*model.Run, error) {
 	return s.store.GetRun(w.ID, runID)
 }
 
-// ListRuns lists runs for a workspace.
-func (s *Service) ListRuns(w *model.Workspace) ([]*model.Run, error) {
-	return s.store.ListRuns(w.ID)
+// RunFilter selects a subset of a workspace's runs. A zero-valued filter
+// matches every run. Limit <= 0 means "all remaining".
+type RunFilter struct {
+	Statuses []model.RunStatus
+	Kind     model.RunKind
+	Limit    int
+	Offset   int
+}
+
+// ListRuns returns runs matching filter, newest first, plus the total number of
+// runs matching the filter before pagination.
+func (s *Service) ListRuns(w *model.Workspace, f RunFilter) ([]*model.Run, int, error) {
+	all, err := s.store.ListRuns(w.ID)
+	if err != nil {
+		return nil, 0, err
+	}
+	matched := make([]*model.Run, 0, len(all))
+	for _, r := range all {
+		if len(f.Statuses) > 0 && !containsStatus(f.Statuses, r.Status) {
+			continue
+		}
+		if f.Kind != "" && r.Kind != f.Kind {
+			continue
+		}
+		matched = append(matched, r)
+	}
+	total := len(matched)
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	matched = matched[offset:]
+	if f.Limit > 0 && len(matched) > f.Limit {
+		matched = matched[:f.Limit]
+	}
+	return matched, total, nil
+}
+
+func containsStatus(statuses []model.RunStatus, s model.RunStatus) bool {
+	for _, st := range statuses {
+		if st == s {
+			return true
+		}
+	}
+	return false
+}
+
+// PurgeRuns deletes the finished run history for a workspace and returns the
+// number deleted. A queued/running run makes the whole purge refuse with 409
+// and nothing is deleted.
+func (s *Service) PurgeRuns(w *model.Workspace) (int, error) {
+	runs, err := s.store.ListRuns(w.ID)
+	if err != nil {
+		return 0, err
+	}
+	for _, r := range runs {
+		if r.Status == model.RunQueued || r.Status == model.RunRunning {
+			return 0, model.Wrap(409, model.CodeConflict,
+				"cannot purge run history while a run is running",
+				map[string]string{"run_id": r.ID})
+		}
+	}
+	deleted := 0
+	for _, r := range runs {
+		if err := s.store.DeleteRun(w.ID, r.ID); err != nil {
+			return deleted, err
+		}
+		deleted++
+	}
+	s.touchActivity(w.ID)
+	return deleted, nil
+}
+
+// PurgeRun deletes a single finished run. It refuses with 409 while the run is
+// queued or running.
+func (s *Service) PurgeRun(w *model.Workspace, runID string) error {
+	run, err := s.store.GetRun(w.ID, runID)
+	if err != nil {
+		return err
+	}
+	if run.Status == model.RunQueued || run.Status == model.RunRunning {
+		return model.Wrap(409, model.CodeConflict, "cannot delete a running run",
+			map[string]string{"run_id": run.ID})
+	}
+	if err := s.store.DeleteRun(w.ID, runID); err != nil {
+		return err
+	}
+	s.touchActivity(w.ID)
+	return nil
 }
 
 // LogChunk is a polled slice of a run log.

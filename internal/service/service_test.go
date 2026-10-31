@@ -103,7 +103,7 @@ func TestStartRunPrunesOldRuns(t *testing.T) {
 	}
 	// Allow background goroutines to finish.
 	time.Sleep(200 * time.Millisecond)
-	runs, err := svc.ListRuns(ws)
+	runs, _, err := svc.ListRuns(ws, RunFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}

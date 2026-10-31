@@ -36,8 +36,15 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newHarnessAt(t, t.TempDir())
+}
+
+// newHarnessAt builds a harness over an existing data directory, so a test can
+// simulate a service restart sharing persisted state.
+func newHarnessAt(t *testing.T, dataDir string) *harness {
+	t.Helper()
 	cfg := config.Default()
-	cfg.Storage.DataDir = t.TempDir()
+	cfg.Storage.DataDir = dataDir
 	cfg.Sandbox.NsjailPath = "/nonexistent/nsjail"
 	cfg.Caps.JSONBodyMB = 1
 	cfg.Caps.FileWriteMB = 1

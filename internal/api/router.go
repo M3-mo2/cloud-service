@@ -58,7 +58,13 @@ func (s *Server) Router() http.Handler {
 
 			r.Route("/{workspaceID}", func(r chi.Router) {
 				r.Get("/", s.handleGetWorkspace)
+				r.Patch("/", s.handlePatchWorkspace)
 				r.Delete("/", s.handleDeleteWorkspace)
+
+				r.Post("/suspend", s.handleSuspendWorkspace)
+				r.Post("/resume", s.handleResumeWorkspace)
+				r.Post("/stop", s.handleStopWorkspace)
+				r.Get("/usage", s.handleUsage)
 
 				r.Get("/files", s.handleListFiles)
 				r.Delete("/files", s.handleDeleteFile)
@@ -72,9 +78,11 @@ func (s *Server) Router() http.Handler {
 
 				r.Post("/runs", s.handleCreateRun)
 				r.Get("/runs", s.handleListRuns)
+				r.Delete("/runs", s.handlePurgeRuns)
 				r.Route("/runs/{runID}", func(r chi.Router) {
 					r.Get("/", s.handleGetRun)
 					r.Post("/stop", s.handleStopRun)
+					r.Delete("/", s.handlePurgeRun)
 					r.Get("/logs", s.handleGetRunLogs)
 				})
 			})
@@ -113,6 +121,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	l := s.cfg.Limits
+	m := s.cfg.MaxLimits
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":     model.Version,
 		"api_version": model.APIVersion,
@@ -124,6 +133,14 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 			"max_wall_time_sec": l.MaxWallTimeSec,
 			"max_runs":          l.MaxRuns,
 			"allow_net":         l.AllowNet,
+		},
+		"limits_maxima": map[string]any{
+			"cpu_cores":         m.CPUCores,
+			"memory_mb":         m.MemoryMB,
+			"disk_mb":           m.DiskMB,
+			"max_wall_time_sec": m.MaxWallTimeSec,
+			"max_runs":          m.MaxRuns,
+			"allow_net":         m.AllowNet,
 		},
 	})
 }

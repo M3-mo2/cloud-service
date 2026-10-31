@@ -30,7 +30,7 @@ execution backend exposed over HTTP/JSON.
 
 ## 1. RESOLVED DECISIONS
 
-See [DECISIONS.md](DECISIONS.md) for the 24 resolved decisions with rationale.
+See [DECISIONS.md](DECISIONS.md) for the resolved decisions with rationale.
 
 ## 2. FEATURE SPEC
 

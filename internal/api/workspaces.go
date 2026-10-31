@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -89,4 +90,106 @@ func (s *Server) handleDeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handlePatchWorkspace(w http.ResponseWriter, r *http.Request) {
+	ws, ok := s.ownedWorkspace(w, r)
+	if !ok {
+		return
+	}
+	var req patchWorkspaceRequest
+	if err := decodeJSON(w, r, s.cfg.Caps.JSONBodyBytes(), &req); err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	updated, err := s.svc.UpdateWorkspace(ws.ID, req.toUpdate())
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"workspace": toWorkspaceJSON(updated)})
+}
+
+func (s *Server) handleSuspendWorkspace(w http.ResponseWriter, r *http.Request) {
+	ws, ok := s.ownedWorkspace(w, r)
+	if !ok {
+		return
+	}
+	updated, stopped, changed, err := s.svc.SuspendWorkspace(ws.ID)
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"workspace":         toWorkspaceJSON(updated),
+		"changed":           changed,
+		"stopped_run_ids":   stopped,
+		"stopped_run_count": len(stopped),
+	})
+}
+
+func (s *Server) handleResumeWorkspace(w http.ResponseWriter, r *http.Request) {
+	ws, ok := s.ownedWorkspace(w, r)
+	if !ok {
+		return
+	}
+	updated, changed, err := s.svc.ResumeWorkspace(ws.ID)
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"workspace": toWorkspaceJSON(updated),
+		"changed":   changed,
+	})
+}
+
+func (s *Server) handleStopWorkspace(w http.ResponseWriter, r *http.Request) {
+	ws, ok := s.ownedWorkspace(w, r)
+	if !ok {
+		return
+	}
+	stopped, err := s.svc.StopWorkspace(ws.ID)
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	// Re-read so the reported status is current (stop leaves it active).
+	updated, err := s.svc.GetOwnedWorkspace(ws.ID, ws.OwnerID)
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"workspace":         toWorkspaceJSON(updated),
+		"stopped_run_ids":   stopped,
+		"stopped_run_count": len(stopped),
+	})
+}
+
+func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
+	ws, ok := s.ownedWorkspace(w, r)
+	if !ok {
+		return
+	}
+	u, err := s.svc.Usage(ws)
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"workspace_id":        ws.ID,
+		"status":              u.Status,
+		"created_at":          u.CreatedAt.UTC().Format(time.RFC3339),
+		"last_activity_at":    formatTime(u.LastActivityAt),
+		"disk_bytes":          u.DiskBytes,
+		"disk_bytes_complete": u.DiskBytesComplete,
+		"disk_mb":             u.DiskMB,
+		"disk_percent":        u.DiskPercent,
+		"runs_total":          u.RunsTotal,
+		"runs_by_status":      u.RunsByStatus,
+		"active_runs":         u.ActiveRuns,
+		"max_runs":            u.MaxRuns,
+		"limits":              toLimitsJSON(u.Limits),
+	})
 }

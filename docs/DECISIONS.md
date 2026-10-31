@@ -75,11 +75,59 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     _Rationale_: deferring an invalid request to execution time returns success for a request that
     cannot succeed.
 
+## v0.0.6 — workspace control plane
+
+25. **Runtime-mutable limits via `PATCH`.** `PATCH /v1/workspaces/{id}` merges a subset of fields;
+    an absent field or an explicit `null` keeps the current value (a `null` never resets a limit to
+    zero) — implemented with pointer fields so omission and zero are distinguishable.
+    _Rationale_: a workspace should not have to be recreated to change one setting, and a partial
+    update must never silently clobber untouched fields.
+26. **Server-level maxima are hard, not soft.** `max_limits:` in config defines a ceiling
+    (defaults: cpu 8, memory 8192 MB, disk 51200 MB, wall 3600 s, runs 64). A create or PATCH value
+    above a maximum is **rejected with `422`**, never silently clamped.
+    _Rationale_: silently clamping hides a client mistake and makes a write non-idempotent from the
+    caller's point of view; an explicit error is honest.
+27. **Lowering a limit affects the next run/exec.** A run already in flight finishes under the
+    limits it started with and is **not** retroactively killed.
+    _Rationale_: killing live work as a side effect of a config change is surprising; operators who
+    want an immediate stop have the workspace `stop` control.
+28. **Workspace status is `active` | `suspended` and is enforced.** `exec` and run creation on a
+    suspended workspace return **`409 workspace_suspended`**; reads (files, runs, logs) keep working.
+    _Rationale_: a new code is needed because the condition is a policy refusal on an existing,
+    owned resource — none of the existing codes (`conflict`, `forbidden`, `unprocessable`) express it
+    without overloading a meaning.
+29. **`suspend` stops the workspace's running runs; `stop` does not suspend.** Both are idempotent
+    and report what changed (`changed`, `stopped_run_ids`). `suspend` = stop work *and* refuse new
+    work; `stop` = stop current work but keep accepting.
+    _Rationale_: the two controls differ only in whether new work is accepted; giving each a single
+    clear purpose is easier to reason about than a flag on one endpoint.
+30. **Run listing is filterable and paginated with a total.** `GET .../runs` accepts `status`
+    (repeatable or comma-separated), `kind`, `limit`, `offset`, returns newest-first, and includes
+    `total` so a client can page without guessing.
+    _Rationale_: a flat list is unusable once a workspace has many runs; the total makes offset
+    pagination deterministic.
+31. **Purging run history refuses while a run is live.** `DELETE .../runs` (and `DELETE
+    .../runs/{id}`) delete only finished runs and return **`409`** with nothing deleted if any run
+    is queued/running.
+    _Rationale_: never lose the logs of an in-flight run; an all-or-nothing purge is predictable.
+32. **Usage disk size is a bounded walk, not a cached value.** `GET .../usage` walks at most
+    100 000 directory entries; a larger tree yields a lower bound with `disk_bytes_complete: false`.
+    _Rationale_: keeps the endpoint cheap on a large workspace and avoids a cache whose staleness
+    window would itself need explaining; a documented lower bound is more useful than an unbounded
+    scan.
+33. **`last_activity_at` tracks mutations.** Workspace metadata records the most recent run start or
+    mutation (PATCH, suspend/resume/stop, purge); `usage` exposes it alongside `created_at`.
+    _Rationale_: an operator needs to see whether a workspace is still in use.
+34. **Stopping an already-finished run reports its status, never errors.** `POST .../runs/{id}/stop`
+    on a terminal run returns `202` with the stored status.
+    _Rationale_: stop is documented as idempotent; a confusing failure on a race (the run ended
+    between the client's check and the stop) would be worse than a clear no-op.
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.
-- **Error codes**: `unauthorized`, `forbidden`, `not_found`, `conflict`, `validation`,
-  `unprocessable`, `payload_too_large`, `timeout`, `unavailable`, `internal`.
+- **Error codes**: `unauthorized`, `forbidden`, `not_found`, `conflict`, `workspace_suspended`,
+  `validation`, `unprocessable`, `payload_too_large`, `timeout`, `unavailable`, `internal`.
   _Rationale_: fixed vocabulary mapped 1:1 from HTTP status.
 - **CWD default**: `/` normalizes to the workspace root `/workspace` inside the sandbox.
   _Rationale_: the workspace is the only mounted path users should see.

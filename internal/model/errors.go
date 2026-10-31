@@ -17,6 +17,12 @@ const (
 	CodeTimeout         = "timeout"
 	CodeUnavailable     = "unavailable"
 	CodeInternal        = "internal"
+
+	// CodeWorkspaceSuspended is returned when work is requested for a
+	// workspace that has been suspended. It has no existing equivalent: the
+	// condition is a policy refusal (the workspace exists and is owned), not a
+	// conflict with concurrent state, so it gets its own code and HTTP 409.
+	CodeWorkspaceSuspended = "workspace_suspended"
 )
 
 // Error is the canonical API error, carrying an HTTP mapping and a code.
