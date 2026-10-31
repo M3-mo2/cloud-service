@@ -1,21 +1,55 @@
 #!/usr/bin/env bash
-# Full HTTP lifecycle acceptance transcript for sandboxd v0.0.5.
+# End-to-end acceptance test for sandboxd.
+#
+# This is an ASSERTING test: every step compares observed output against the
+# expected value and the script exits non-zero if any assertion fails. It is
+# meant to run against a server backed by REAL nsjail inside a container started
+# with --privileged (or --cap-add=SYS_ADMIN) and --cgroupns=host.
 #
 # Environment:
 #   BASE      base URL of a running server (default http://localhost:8080)
 #   KEY       primary API key (default dev-key-please-rotate)
 #   OTHER_KEY second principal's key (default other-key)
 #   DATA_DIR  host path of the server's data dir, for the symlink-escape check
+#   CONTAINER name of a docker container to run the symlink-escape check within
 #   NSJAIL    real nsjail binary path; the script refuses a stub (default: none)
 #
-# The script requires a server backed by REAL nsjail. It will not run against a
-# stub: set NSJAIL to the real binary path and the check below enforces it.
+# Exit code: 0 if all assertions pass, 1 otherwise.
 set -u
 
 K="Authorization: Bearer ${KEY:-dev-key-please-rotate}"
 OK="Authorization: Bearer ${OTHER_KEY:-other-key}"
 B="${BASE:-http://localhost:8080}"
 DATA_DIR="${DATA_DIR:-}"
+JSON="Content-Type: application/json"
+
+fail=0
+pass=0
+
+# check LABEL ACTUAL EXPECTED
+check() {
+  if [ "$2" = "$3" ]; then
+    pass=$((pass + 1))
+    printf 'ok   %-28s %s\n' "$1" "$2"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL %-28s got %q want %q\n' "$1" "$2" "$3"
+  fi
+}
+
+# check_contains LABEL HAYSTACK NEEDLE
+check_contains() {
+  case "$2" in
+    *"$3"*) pass=$((pass + 1)); printf 'ok   %-28s contains %q\n' "$1" "$3" ;;
+    *) fail=$((fail + 1)); printf 'FAIL %-28s missing %q in %q\n' "$1" "$3" "$2" ;;
+  esac
+}
+
+jsonfield() { python3 -c "import json,sys;print(json.load(sys.stdin)$1)"; }
+httpcode() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+
+echo "### 0. environment"
+echo "base=$B data_dir=${DATA_DIR:-<unset>}"
 
 if [ -n "${NSJAIL:-}" ]; then
   if [ ! -x "$NSJAIL" ]; then
@@ -28,110 +62,163 @@ if [ -n "${NSJAIL:-}" ]; then
   fi
 fi
 
-echo "### 0. environment"
-echo "base=$B data_dir=${DATA_DIR:-<unset>}"
-echo "server readyz:"; curl -s "$B/readyz"; echo
+# Readiness must confirm real nsjail is present; a server without it cannot
+# satisfy any isolation assertion below.
+ready=$(curl -s "$B/readyz")
+check "readyz.status" "$(printf '%s' "$ready" | jsonfield "['status']")" "ready"
+check "readyz.nsjail" "$(printf '%s' "$ready" | jsonfield "['nsjail']")" "True"
 
 echo "### 1. healthz"
-curl -s "$B/healthz"; echo
-echo "### 2. readyz"
-curl -s "$B/readyz"; echo
-echo "### 3. meta"
-curl -s -H "$K" "$B/v1/meta"; echo
-echo "### 4. create workspace"
-WS=$(curl -s -H "$K" -H 'Content-Type: application/json' -d '{"name":"demo"}' "$B/v1/workspaces" | python3 -c "import json,sys;print(json.load(sys.stdin)['workspace']['id'])")
+check "healthz.status" "$(curl -s "$B/healthz" | jsonfield "['status']")" "ok"
+
+echo "### 2. meta"
+check "meta.version" "$(curl -s -H "$K" "$B/v1/meta" | jsonfield "['version']")" "0.0.5"
+
+echo "### 3. create workspace"
+WS=$(curl -s -H "$K" -H "$JSON" -d '{"name":"demo"}' "$B/v1/workspaces" | jsonfield "['workspace']['id']")
+if [ -z "$WS" ] || [ "$WS" = "None" ]; then echo "FATAL: no workspace id" >&2; exit 1; fi
 echo "workspace id: $WS"
-echo "### 5. mkdir /src"
-curl -s -H "$K" -H 'Content-Type: application/json' -d '{"path":"/src"}' "$B/v1/workspaces/$WS/files/mkdir"; echo
-echo "### 6. PUT /main.py"
-curl -s -o /dev/null -w "status=%{http_code}\n" -X PUT -H "$K" -H 'Content-Type: application/json' \
-  -d '{"content":"print(\"hi\")\n"}' "$B/v1/workspaces/$WS/files/content?path=/main.py"
-echo "### 7. upload /uploaded.py (multipart)"
+
+echo "### 4. mkdir /src"
+check "mkdir.src" "$(curl -s -o /dev/null -w '%{http_code}' -H "$K" -H "$JSON" -d '{"path":"/src"}' "$B/v1/workspaces/$WS/files/mkdir")" "201"
+
+echo "### 5. PUT /main.py"
+check "put.main.py" "$(httpcode -X PUT -H "$K" -H "$JSON" -d '{"content":"print(\"hi\")\n"}' "$B/v1/workspaces/$WS/files/content?path=/main.py")" "204"
+
+echo "### 6. upload /uploaded.py (multipart)"
 UP=$(mktemp)
 printf 'print("uploaded")\n' > "$UP"
-curl -s -H "$K" -F path=/uploaded.py -F file=@"$UP" "$B/v1/workspaces/$WS/files/upload"; echo
+check "upload.status" "$(httpcode -H "$K" -F path=/uploaded.py -F file=@"$UP" "$B/v1/workspaces/$WS/files/upload")" "201"
 rm -f "$UP"
-echo "### 8. list /"
-curl -s -H "$K" "$B/v1/workspaces/$WS/files?path=/" | python3 -m json.tool
-echo "### 9. read /main.py (meta)"
-curl -s -H "$K" "$B/v1/workspaces/$WS/files/content?path=/main.py&meta=true"; echo
-echo "### 10. exec (sync)"
-curl -s -H "$K" -H 'Content-Type: application/json' -d '{"cmd":["python3","main.py"]}' "$B/v1/workspaces/$WS/exec"; echo
-echo "### 11. start run (file)"
-RUN=$(curl -s -H "$K" -H 'Content-Type: application/json' -d '{"kind":"file","file":"/main.py"}' "$B/v1/workspaces/$WS/runs" | python3 -c "import json,sys;print(json.load(sys.stdin)['run']['id'])")
+
+echo "### 7. read /main.py (meta)"
+check "read.main.py" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/content?path=/main.py&meta=true" | jsonfield "['sha256']")" "$(printf 'print("hi")\n' | sha256sum | cut -d' ' -f1)"
+
+echo "### 8. exec (sync) -- a successful execution"
+EXEC=$(curl -s -H "$K" -H "$JSON" -d '{"cmd":["python3","main.py"]}' "$B/v1/workspaces/$WS/exec")
+check "exec.exit_code" "$(printf '%s' "$EXEC" | jsonfield "['exit_code']")" "0"
+check "exec.stdout" "$(printf '%s' "$EXEC" | jsonfield "['stdout']" | tr -d '\n')" "hi"
+
+echo "### 9. cwd is honored"
+check "exec.cwd" "$(printf '%s' "$(curl -s -H "$K" -H "$JSON" -d '{"cmd":["pwd"],"cwd":"/src"}' "$B/v1/workspaces/$WS/exec")" | jsonfield "['stdout']" | tr -d '\n')" "/workspace/src"
+
+echo "### 10. start run (file)"
+RUN=$(curl -s -H "$K" -H "$JSON" -d '{"kind":"file","file":"/main.py"}' "$B/v1/workspaces/$WS/runs" | jsonfield "['run']['id']")
 echo "run id: $RUN"
-sleep 1
-echo "### 12. run status"
-curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$RUN"; echo
-echo "### 13. run logs stdout"
-curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$RUN/logs?stream=stdout&offset=0&limit=65536"; echo
-echo "### 14. security: traversal read (expect 422)"
-curl -s -o /dev/null -w "status=%{http_code}\n" -H "$K" "$B/v1/workspaces/$WS/files/content?path=../etc/passwd"
-echo "### 15. security: traversal write (expect 422)"
-curl -s -o /dev/null -w "status=%{http_code}\n" -X PUT -H "$K" -H 'Content-Type: application/json' -d '{"content":"x"}' "$B/v1/workspaces/$WS/files/content?path=../evil"
-echo "### 16. security: traversal delete (expect 422)"
-curl -s -o /dev/null -w "status=%{http_code}\n" -X DELETE -H "$K" "$B/v1/workspaces/$WS/files?path=../etc/passwd"
-echo "### 17. security: missing token (expect 401)"
-curl -s -o /dev/null -w "status=%{http_code}\n" "$B/v1/workspaces"
-echo "### 18. security: cross-owner (expect 403)"
-curl -s -o /dev/null -w "status=%{http_code}\n" -H "$OK" "$B/v1/workspaces/$WS"
-echo "### 19. security: oversized JSON body (expect 413)"
+for _ in $(seq 1 50); do
+  st=$(curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$RUN" | jsonfield "['run']['status']")
+  [ "$st" = "exited" ] && break
+  sleep 0.1
+done
+check "run.status" "$st" "exited"
+check "run.logs.stdout" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$RUN/logs?stream=stdout&offset=0&limit=65536" | jsonfield "['data']" | tr -d '\n')" "hi"
+
+echo "### 11. security: traversal rejected (expect 422)"
+check "traversal.read" "$(httpcode -H "$K" "$B/v1/workspaces/$WS/files/content?path=../etc/passwd")" "422"
+check "traversal.write" "$(httpcode -X PUT -H "$K" -H "$JSON" -d '{"content":"x"}' "$B/v1/workspaces/$WS/files/content?path=../evil")" "422"
+check "traversal.delete" "$(httpcode -X DELETE -H "$K" "$B/v1/workspaces/$WS/files?path=../etc/passwd")" "422"
+
+echo "### 12. security: auth and ownership"
+check "auth.missing" "$(httpcode "$B/v1/workspaces")" "401"
+check "auth.cross_owner" "$(httpcode -H "$OK" "$B/v1/workspaces/$WS")" "403"
+
+echo "### 13. security: oversized JSON body (expect 413)"
 BIG=$(mktemp)
 python3 -c "import json;print(json.dumps({'name':'x'*1100000}))" > "$BIG"
-curl -s -o /dev/null -w "status=%{http_code}\n" -H "$K" -H 'Content-Type: application/json' --data-binary @"$BIG" "$B/v1/workspaces"
+check "body.too_large" "$(httpcode -H "$K" -H "$JSON" --data-binary @"$BIG" "$B/v1/workspaces")" "413"
 rm -f "$BIG"
-echo "### 19b. security: symlink escape (expect 422)"
+
+echo "### 14. security: symlink escape (expect 422)"
 if [ -n "${CONTAINER:-}" ]; then
-  # The workspace is owned by the sandbox uid; create the symlink as root.
   docker exec "$CONTAINER" sh -c "ln -sf /etc/passwd /data/workspaces/$WS/files/passwd"
+  check "symlink.escape" "$(httpcode -H "$K" "$B/v1/workspaces/$WS/files/content?path=/passwd")" "422"
+  docker exec "$CONTAINER" sh -c "rm -f /data/workspaces/$WS/files/passwd"
 elif [ -n "$DATA_DIR" ]; then
   ln -sf /etc/passwd "$DATA_DIR/workspaces/$WS/files/passwd"
+  check "symlink.escape" "$(httpcode -H "$K" "$B/v1/workspaces/$WS/files/content?path=/passwd")" "422"
+  rm -f "$DATA_DIR/workspaces/$WS/files/passwd"
 else
-  echo "skipped (set DATA_DIR or CONTAINER)"
+  echo "skip symlink.escape (set DATA_DIR or CONTAINER)"
 fi
-curl -s -o /dev/null -w "status=%{http_code}\n" -H "$K" "$B/v1/workspaces/$WS/files/content?path=/passwd"
-if [ -n "${CONTAINER:-}" ]; then
-  docker exec "$CONTAINER" sh -c "rm -f /data/workspaces/$WS/files/passwd"
-fi
-echo "### 20. real isolation: network egress blocked (allow_net=false)"
-printf 'import socket\ntry:\n    s=socket.create_connection(("1.1.1.1",80),3)\n    print("NET_OPEN")\nexcept Exception as e:\n    print("NET_BLOCKED:",type(e).__name__)\n' > /tmp/net.py
-curl -s -o /dev/null -X PUT -H "$K" -H 'Content-Type: application/json' \
-  -d "$(python3 -c 'import json;print(json.dumps({"content":open("/tmp/net.py").read()}))')" \
-  "$B/v1/workspaces/$WS/files/content?path=/net.py"
-curl -s -H "$K" -H 'Content-Type: application/json' -d '{"cmd":["python3","net.py"],"timeout_sec":10}' "$B/v1/workspaces/$WS/exec"; echo
-echo "### 21. real isolation: /etc/shadow denied"
-printf 'try:\n    print(open("/etc/shadow").read()[:10])\nexcept Exception as e:\n    print("SHADOW_DENIED:",type(e).__name__)\n' > /tmp/shadow.py
-curl -s -o /dev/null -X PUT -H "$K" -H 'Content-Type: application/json' \
-  -d "$(python3 -c 'import json;print(json.dumps({"content":open("/tmp/shadow.py").read()}))')" \
-  "$B/v1/workspaces/$WS/files/content?path=/shadow.py"
-curl -s -H "$K" -H 'Content-Type: application/json' -d '{"cmd":["python3","shadow.py"],"timeout_sec":10}' "$B/v1/workspaces/$WS/exec"; echo
-echo "### 22. real isolation: mount(2) / ptrace denied"
-printf 'import ctypes,os\nlibc=ctypes.CDLL("libc.so.6",use_errno=True)\nr=libc.mount(b"none",b"/tmp",b"tmpfs",0,None)\nprint("MOUNT_RC",r,"ERRNO",ctypes.get_errno())\n' > /tmp/mount.py
-curl -s -o /dev/null -X PUT -H "$K" -H 'Content-Type: application/json' \
-  -d "$(python3 -c 'import json;print(json.dumps({"content":open("/tmp/mount.py").read()}))')" \
-  "$B/v1/workspaces/$WS/files/content?path=/mount.py"
-curl -s -H "$K" -H 'Content-Type: application/json' -d '{"cmd":["python3","mount.py"],"timeout_sec":10}' "$B/v1/workspaces/$WS/exec"; echo
-echo "### 23. real isolation: fork bomb limited by cgroup pids.max"
-printf 'import os,sys\nn=0\ntry:\n    for _ in range(500):\n        pid=os.fork()\n        if pid==0:\n            os._exit(0)\n        n+=1\nexcept Exception as e:\n    print("FORK_LIMITED:",type(e).__name__)\nprint("FORKED",n)\n' > /tmp/fork.py
-curl -s -o /dev/null -X PUT -H "$K" -H 'Content-Type: application/json' \
-  -d "$(python3 -c 'import json;print(json.dumps({"content":open("/tmp/fork.py").read()}))')" \
-  "$B/v1/workspaces/$WS/files/content?path=/fork.py"
-curl -s -H "$K" -H 'Content-Type: application/json' -d '{"cmd":["python3","fork.py"],"timeout_sec":20}' "$B/v1/workspaces/$WS/exec"; echo
-echo "### 24. stop long run kills process group"
-printf 'import time\nprint("start", flush=True)\nfor i in range(60):\n    time.sleep(1)\n' > /tmp/long.py
-curl -s -o /dev/null -X PUT -H "$K" -H 'Content-Type: application/json' \
-  -d "$(python3 -c 'import json;print(json.dumps({"content":open("/tmp/long.py").read()}))')" \
-  "$B/v1/workspaces/$WS/files/content?path=/long.py"
-LRUN=$(curl -s -H "$K" -H 'Content-Type: application/json' -d '{"kind":"file","file":"/long.py"}' "$B/v1/workspaces/$WS/runs" | python3 -c "import json,sys;print(json.load(sys.stdin)['run']['id'])")
+
+# Helper: write a python file into the workspace and exec it, returning JSON.
+write_and_exec() { # path  source  timeout
+  curl -s -o /dev/null -X PUT -H "$K" -H "$JSON" \
+    -d "$(printf '%s' "$2" | python3 -c 'import json,sys;print(json.dumps({"content":sys.stdin.read()}))')" \
+    "$B/v1/workspaces/$WS/files/content?path=$1"
+  curl -s -H "$K" -H "$JSON" -d "{\"cmd\":[\"python3\",\"${1#/}\"],\"timeout_sec\":$3}" "$B/v1/workspaces/$WS/exec"
+}
+
+echo "### 15. isolation: network egress blocked"
+OUT=$(write_and_exec /net.py 'import socket
+try:
+    s=socket.create_connection(("1.1.1.1",80),3)
+    print("NET_OPEN")
+except Exception as e:
+    print("NET_BLOCKED:",type(e).__name__)
+' 10)
+check_contains "net.blocked" "$(printf '%s' "$OUT" | jsonfield "['stdout']")" "NET_BLOCKED"
+check "net.exit_code" "$(printf '%s' "$OUT" | jsonfield "['exit_code']")" "0"
+
+echo "### 16. isolation: /etc/shadow not reachable"
+check "shadow.denied" "$(write_and_exec /shadow.py 'try:
+    print(open("/etc/shadow").read()[:10])
+except Exception as e:
+    print("SHADOW_DENIED:",type(e).__name__)
+' 10 | jsonfield "['stdout']" | tr -d '\n')" "SHADOW_DENIED: FileNotFoundError"
+
+echo "### 17. isolation: mount(2)/ptrace killed by seccomp (SIGSYS=159)"
+check "seccomp.mount" "$(write_and_exec /mount.py 'import ctypes
+libc=ctypes.CDLL("libc.so.6",use_errno=True)
+libc.mount(b"none",b"/tmp",b"tmpfs",0,None)
+print("MOUNT_RC_AFTER")
+' 10 | jsonfield "['exit_code']")" "159"
+
+echo "### 18. isolation: fork bomb limited by cgroup pids.max"
+check_contains "cgroup.fork_limit" "$(write_and_exec /fork.py 'import os
+n=0
+try:
+    for _ in range(500):
+        pid=os.fork()
+        if pid==0:
+            os._exit(0)
+        n+=1
+except Exception as e:
+    print("FORK_LIMITED:",type(e).__name__)
+print("FORKED",n)
+' 20 | jsonfield "['stdout']")" "FORK_LIMITED"
+
+echo "### 19. resource ceiling: memory limit enforced (F-1)"
+# With a 512 MiB RLIMIT_AS, allocating ~1 GiB must fail rather than succeed.
+check_contains "rlimit.memory" "$(write_and_exec /mem.py 'try:
+    b=bytearray(1024*1024*1024)
+    print("ALLOC_OK")
+except MemoryError:
+    print("MEMORY_DENIED")
+' 20 | jsonfield "['stdout']")" "MEMORY_DENIED"
+
+echo "### 20. stop long run kills process group"
+write_and_exec /long.py 'import time
+print("start", flush=True)
+for i in range(60):
+    time.sleep(1)
+' 60 >/dev/null
+LRUN=$(curl -s -H "$K" -H "$JSON" -d '{"kind":"file","file":"/long.py"}' "$B/v1/workspaces/$WS/runs" | jsonfield "['run']['id']")
 sleep 1
-echo "processes before stop:"
-if [ -n "${CONTAINER:-}" ]; then docker exec "$CONTAINER" pgrep -af "long.py" || true; else pgrep -af "long.py" || true; fi
 curl -s -X POST -H "$K" "$B/v1/workspaces/$WS/runs/$LRUN/stop" >/dev/null
 sleep 1
-echo "run status after stop:"; curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$LRUN" | python3 -c "import json,sys;print(json.load(sys.stdin)['run']['status'])"
-echo "processes after stop (expect none):"
-if [ -n "${CONTAINER:-}" ]; then docker exec "$CONTAINER" pgrep -af "long.py" || echo "(none)"; else pgrep -af "long.py" || echo "(none)"; fi
-echo "### 25. delete workspace (expect 204)"
-curl -s -o /dev/null -w "status=%{http_code}\n" -X DELETE -H "$K" "$B/v1/workspaces/$WS"
-echo "### 26. get after delete (expect 404)"
-curl -s -o /dev/null -w "status=%{http_code}\n" -H "$K" "$B/v1/workspaces/$WS"
+check "stop.run_status" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$LRUN" | jsonfield "['run']['status']")" "killed"
+if [ -n "${CONTAINER:-}" ]; then
+  n=$(docker exec "$CONTAINER" pgrep -fc "long.py" || true)
+else
+  n=$(pgrep -fc "long.py" || true)
+fi
+check "stop.no_survivors" "$([ -z "$n" ] && echo 0 || echo "$n")" "0"
+
+echo "### 21. delete workspace (expect 204) and get after delete (expect 404)"
+check "delete.workspace" "$(httpcode -X DELETE -H "$K" "$B/v1/workspaces/$WS")" "204"
+check "get.after_delete" "$(httpcode -H "$K" "$B/v1/workspaces/$WS")" "404"
+
+echo
+echo "passed=$pass failed=$fail"
+[ "$fail" -eq 0 ]

@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    name: build, vet, race tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt required for:"; echo "$unformatted"; exit 1
+          fi
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+      - name: test (race)
+        run: go test -race ./...
+
+  image:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build image
+        run: docker build -t sandboxd:ci .
+
+  acceptance:
+    name: nsjail acceptance (privileged)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build sandboxd and nsjail image
+        run: |
+          CGO_ENABLED=0 GOOS=linux go build -trimpath -o bin/sandboxd ./cmd/sandboxd
+          docker build -t sandboxd:acceptance .
+      - name: run acceptance against real nsjail
+        run: |
+          # cgroup v2 ceilings require the host cgroup namespace, and nsjail
+          # requires SYS_ADMIN; both are mandatory for a truthful sandbox.
+          docker run -d --name sandboxd-ci \
+            --privileged --cgroupns=host \
+            -v "$PWD/configs:/app/configs:ro" \
+            sandboxd:acceptance \
+            bash -lc '
+              useradd --system --no-create-home --shell /usr/sbin/nologin sandbox 2>/dev/null || true
+              cat > /app/config.yaml <<EOF
+          server: { addr: "127.0.0.1:8099" }
+          storage: { data_dir: "/data" }
+          sandbox: { nsjail_path: "/usr/local/bin/nsjail", user: "sandbox", group: "sandbox", kill_grace_sec: 2 }
+          limits: { cpu_cores: 1, memory_mb: 512, disk_mb: 1024, max_wall_time_sec: 60, max_runs: 3 }
+          keys:
+            - { key: "dev-key-please-rotate", principal_id: "user_dev" }
+            - { key: "other-key", principal_id: "user_other" }
+          EOF
+              sandboxd --config /app/config.yaml >/tmp/sandboxd.log 2>&1 &
+              sleep 2
+              BASE=http://127.0.0.1:8099 KEY=dev-key-please-rotate OTHER_KEY=other-key DATA_DIR=/data NSJAIL=/usr/local/bin/nsjail \
+                bash -s < scripts/acceptance.sh
+            '
+      - name: logs on failure
+        if: failure()
+        run: |
+          docker logs sandboxd-ci || true
+          docker exec sandboxd-ci cat /tmp/sandboxd.log || true
+      - name: cleanup
+        if: always()
+        run: docker rm -f sandboxd-ci || true
