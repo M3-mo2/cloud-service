@@ -9,6 +9,7 @@ import (
 // FakeRunner is an in-memory Runner for tests. It does not invoke nsjail.
 type FakeRunner struct {
 	AvailableFlag bool
+	CgroupsFlag   bool
 	Stdout        string
 	Stderr        string
 	ExitCode      int
@@ -26,6 +27,9 @@ var _ Runner = (*FakeRunner)(nil)
 
 // Available reports the configured availability.
 func (f *FakeRunner) Available() bool { return f.AvailableFlag }
+
+// CgroupsUsable reports the configured cgroup availability.
+func (f *FakeRunner) CgroupsUsable() bool { return f.CgroupsFlag }
 
 // LastRequest returns the most recent request.
 func (f *FakeRunner) LastRequest() *Request {

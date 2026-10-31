@@ -152,7 +152,7 @@ mount {
   rw: true
 }
 
-cwd: "/workspace"
+cwd: "{{ .Cwd }}"
 
 # Run as the sandbox user inside the namespace.
 #
@@ -174,9 +174,11 @@ gidmap {
 }
 
 # Resource limits.
+# nsjail interprets rlimit_as and rlimit_fsize in MEGABYTES (verified against
+# the installed build's --help), so the values below are MB, not bytes.
 time_limit: {{ .TimeLimitSec }}
-rlimit_as: {{ .AsBytes }}
-rlimit_fsize: {{ .FsizeBytes }}
+rlimit_as: {{ .AsMB }}
+rlimit_fsize: {{ .FsizeMB }}
 rlimit_nofile: 256
 rlimit_nproc: {{ .PidsMax }}
 rlimit_core: 0

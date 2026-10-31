@@ -31,6 +31,9 @@ type NsjailRunner struct {
 	procs   map[string]*os.Process // runID -> direct child (nsjail) process
 	avail   bool
 	availMu sync.Once
+
+	cgroupOnce sync.Once
+	cgroups    bool
 }
 
 // NewNsjailRunner constructs a runner. tmplPath points at the nsjail config
@@ -47,6 +50,26 @@ func NewNsjailRunner(cfg config.Config, tmplPath, tmpDir string) *NsjailRunner {
 
 // Identity returns the resolved sandbox identity mapping.
 func (r *NsjailRunner) Identity() Identity { return r.identity }
+
+// CgroupMount is the location nsjail uses for the cgroup v2 hierarchy.
+const CgroupMount = "/sys/fs/cgroup"
+
+// CgroupsUsable reports whether the cgroup v2 hierarchy is writable by this
+// process. nsjail's cgroup ceilings (memory, pids, cpu) require it, which in
+// turn requires the container to be started with --cgroupns=host. The result is
+// probed once and cached.
+func (r *NsjailRunner) CgroupsUsable() bool {
+	r.cgroupOnce.Do(func() {
+		dir, err := os.MkdirTemp(CgroupMount, "sandboxd-probe-*")
+		if err != nil {
+			r.cgroups = false
+			return
+		}
+		_ = os.Remove(dir)
+		r.cgroups = true
+	})
+	return r.cgroups
+}
 
 // Available reports whether the nsjail binary exists and is executable.
 func (r *NsjailRunner) Available() bool {
@@ -156,7 +179,7 @@ func (r *NsjailRunner) Run(req Request) (Result, error) {
 		defer cancel()
 	}
 
-	cmd := exec.CommandContext(ctx, bin, "--really_quiet", "--config", cfgPath)
+	cmd := exec.CommandContext(ctx, bin, "-q", "-L", "3", "--config", cfgPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Ensure context cancellation (timeout or explicit stop) tears down the whole
 	// process group rather than only the direct child.
@@ -179,10 +202,12 @@ func (r *NsjailRunner) Run(req Request) (Result, error) {
 }
 
 // runCapture wires up stdout/stderr either to capped buffers or to log files.
+// nsjail's own diagnostics are routed to a dedicated pipe (its log fd 3) so a
+// setup or launch failure is captured rather than silently discarded.
 func (r *NsjailRunner) runCapture(ctx context.Context, cmd *exec.Cmd, req Request) (Result, error) {
-	streamed := req.RunID != "" && req.StdoutPath != ""
+	diagDone := attachDiagnostics(cmd)
 
-	if streamed {
+	if req.RunID != "" && req.StdoutPath != "" {
 		outF, err := os.OpenFile(req.StdoutPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
 			return Result{}, err
@@ -200,15 +225,21 @@ func (r *NsjailRunner) runCapture(ctx context.Context, cmd *exec.Cmd, req Reques
 		cmd.Stderr = errW
 
 		if err := cmd.Start(); err != nil {
+			closeWriteEnd(cmd)
+			<-diagDone
 			return Result{}, err
 		}
+		closeWriteEnd(cmd)
 		if req.RunID != "" {
 			r.track(req.RunID, cmd.Process)
 			defer r.untrack(req.RunID)
 		}
 		waitErr := cmd.Wait()
+		diagnostic := waitDiagnostic(diagDone)
 		res := Result{Streamed: true, Truncated: outW.truncated || errW.truncated}
-		r.classify(&res, waitErr, ctx)
+		if err := r.classify(&res, waitErr, ctx, diagnostic); err != nil {
+			return res, err
+		}
 		return res, nil
 	}
 
@@ -219,33 +250,89 @@ func (r *NsjailRunner) runCapture(ctx context.Context, cmd *exec.Cmd, req Reques
 	cmd.Stderr = errW
 
 	if err := cmd.Start(); err != nil {
+		closeWriteEnd(cmd)
+		<-diagDone
 		return Result{}, err
 	}
+	closeWriteEnd(cmd)
 	waitErr := cmd.Wait()
+	diagnostic := waitDiagnostic(diagDone)
 	res := Result{
 		Stdout:    stdout.Bytes(),
 		Stderr:    stderr.Bytes(),
 		Truncated: outW.truncated || errW.truncated,
 	}
-	r.classify(&res, waitErr, ctx)
+	if err := r.classify(&res, waitErr, ctx, diagnostic); err != nil {
+		return res, err
+	}
 	return res, nil
 }
 
-// classify fills exit code and terminal-state flags from the wait error.
-func (r *NsjailRunner) classify(res *Result, waitErr error, ctx context.Context) {
+// attachDiagnostics routes nsjail's log fd (3) to a pipe so its own warnings and
+// errors are captured separately from the sandboxed child's stdout/stderr. The
+// returned channel yields the captured text once the process has exited and the
+// pipe reaches EOF. The child cannot forge this: nsjail closes log fd 3 before
+// executing the jailed process.
+func attachDiagnostics(cmd *exec.Cmd) <-chan string {
+	r, w, err := os.Pipe()
+	if err != nil {
+		// Without a diagnostics pipe the runner still works; failures then
+		// surface as exit code 255 with an empty diagnostic.
+		done := make(chan string, 1)
+		done <- ""
+		close(done)
+		return done
+	}
+	cmd.ExtraFiles = append(cmd.ExtraFiles, w)
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		r.Close()
+		done <- strings.TrimSpace(string(b))
+	}()
+	return done
+}
+
+// closeWriteEnd closes the parent's copy of the diagnostics pipe write end so
+// the reader observes EOF once nsjail (and its children) exit.
+func closeWriteEnd(cmd *exec.Cmd) {
+	for _, f := range cmd.ExtraFiles {
+		if f != nil {
+			f.Close()
+		}
+	}
+	cmd.ExtraFiles = nil
+}
+
+// waitDiagnostic reads the captured nsjail diagnostic, bounded so a leaked pipe
+// write end (e.g. a stray fd inherited by a detached process) can never block a
+// run past a short deadline.
+func waitDiagnostic(done <-chan string) string {
+	select {
+	case d := <-done:
+		return d
+	case <-time.After(2 * time.Second):
+		return ""
+	}
+}
+
+// classify fills exit code and terminal-state flags from the wait error. A
+// failed sandbox setup or launch (nsjail exit 255 with its own diagnostic) is
+// reported as ErrSandboxUnavailable rather than a normal exit.
+func (r *NsjailRunner) classify(res *Result, waitErr error, ctx context.Context, diagnostic string) error {
 	if ctx.Err() == context.DeadlineExceeded {
 		res.TimedOut = true
 		res.ExitCode = 124
-		return
+		return nil
 	}
 	if ctx.Err() == context.Canceled {
 		res.Killed = true
 		res.ExitCode = 137
-		return
+		return nil
 	}
 	if waitErr == nil {
 		res.ExitCode = 0
-		return
+		return nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(waitErr, &exitErr) {
@@ -255,10 +342,49 @@ func (r *NsjailRunner) classify(res *Result, waitErr error, ctx context.Context)
 			// Signalled by SIGTERM/SIGKILL (e.g. external stop).
 			res.Killed = true
 			res.ExitCode = 137
+			return nil
 		}
-		return
+		// nsjail exits 255 when it cannot set up or launch the sandbox. Its log
+		// carries a fatal message in that case; a sandboxed program that simply
+		// exits 255 produces stdout/stderr but no nsjail fatal line.
+		if code == 255 && isLaunchFailure(diagnostic) {
+			res.ExitCode = 255
+			return &SandboxError{Diagnostic: summarizeDiagnostic(diagnostic)}
+		}
+		return nil
 	}
 	res.ExitCode = -1
+	return nil
+}
+
+// isLaunchFailure reports whether nsjail's own log indicates it failed to set up
+// or launch the sandbox (as opposed to the jailed program running and exiting).
+func isLaunchFailure(diagnostic string) bool {
+	for _, line := range strings.Split(diagnostic, "\n") {
+		if strings.Contains(line, "[F]") || strings.Contains(line, "[E]") {
+			return true
+		}
+	}
+	return false
+}
+
+// summarizeDiagnostic keeps the most useful nsjail log lines, preferring the
+// last fatal/error line and capping the length.
+func summarizeDiagnostic(diagnostic string) string {
+	const maxLen = 512
+	var chosen string
+	for _, line := range strings.Split(diagnostic, "\n") {
+		if strings.Contains(line, "[F]") || strings.Contains(line, "[E]") {
+			chosen = strings.TrimSpace(line)
+		}
+	}
+	if chosen == "" {
+		chosen = strings.TrimSpace(diagnostic)
+	}
+	if len(chosen) > maxLen {
+		chosen = chosen[:maxLen]
+	}
+	return chosen
 }
 
 func (r *NsjailRunner) track(runID string, p *os.Process) {
@@ -367,8 +493,8 @@ type tmplData struct {
 	MemoryMB      int
 	MemoryBytes   int64
 	PidsMax       int
-	FsizeBytes    int64
-	AsBytes       int64
+	FsizeMB       int
+	AsMB          int
 	AllowNet      bool
 	DisableNet    bool
 	User          string
@@ -406,9 +532,9 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 	if timeoutSec <= 0 {
 		timeoutSec = lim.MaxWallTimeSec
 	}
-	cwd := req.Cwd
-	if cwd == "" {
-		cwd = "/"
+	cwd, err := sandboxCwd(req.Cwd)
+	if err != nil {
+		return "", err
 	}
 
 	data := tmplData{
@@ -421,8 +547,8 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		MemoryMB:      lim.MemoryMB,
 		MemoryBytes:   int64(lim.MemoryMB) * 1024 * 1024,
 		PidsMax:       lim.MaxRuns * 64,
-		FsizeBytes:    int64(lim.DiskMB) * 1024 * 1024,
-		AsBytes:       int64(lim.MemoryMB) * 1024 * 1024,
+		FsizeMB:       lim.DiskMB,
+		AsMB:          lim.MemoryMB,
 		AllowNet:      lim.AllowNet,
 		DisableNet:    !lim.AllowNet,
 		User:          r.cfg.Sandbox.User,
@@ -455,19 +581,75 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 	return f.Name(), nil
 }
 
+// sandboxCwd translates a workspace-relative cwd into an absolute path inside
+// the jail, where the workspace is mounted at /workspace. An empty cwd means the
+// workspace root; any path that would escape the workspace is rejected.
+func sandboxCwd(cwd string) (string, error) {
+	if cwd == "" {
+		return workspaceMount, nil
+	}
+	p := strings.ReplaceAll(cwd, "\\", "/")
+	// A relative cwd is resolved against the workspace root.
+	stack := make([]string, 0, 4)
+	for _, part := range strings.Split(p, "/") {
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if len(stack) == 0 {
+				return "", ErrInvalidCwd
+			}
+			stack = stack[:len(stack)-1]
+		default:
+			stack = append(stack, part)
+		}
+	}
+	if len(stack) == 0 {
+		return workspaceMount, nil
+	}
+	return workspaceMount + "/" + strings.Join(stack, "/"), nil
+}
+
+// workspaceMount is the path at which the workspace is bind-mounted in the jail.
+const workspaceMount = "/workspace"
+
 // formatEnv renders user environment variables as `KEY=VALUE` entries for the
-// nsjail config. Invalid keys are dropped. Output is sorted for stability.
+// nsjail config. Only allowlisted keys are passed; everything else is dropped.
+// Output is sorted for stability.
 func formatEnv(env map[string]string) []string {
 	out := make([]string, 0, len(env))
 	for k, v := range env {
-		key := sanitizeEnvKey(k)
-		if key == "" {
+		if !allowEnvKey(k) {
 			continue
 		}
-		out = append(out, key+"="+v)
+		out = append(out, k+"="+v)
 	}
 	sortStrings(out)
 	return out
+}
+
+// allowedEnvKeys is the allowlist of user-supplied environment variables that
+// may reach the sandbox. It deliberately excludes loader-injection variables
+// (LD_PRELOAD, LD_LIBRARY_PATH, DYLD_*, GLIBC_TUNABLES, ...) which would let the
+// caller alter the behaviour of the interpreter the service chose to run.
+var allowedEnvKeys = map[string]bool{
+	"PYTHONPATH":              true,
+	"PYTHONUNBUFFERED":        true,
+	"PYTHONDONTWRITEBYTECODE": true,
+	"PYTHONHASHSEED":          true,
+	"LANG":                    true,
+	"LC_ALL":                  true,
+	"LC_CTYPE":                true,
+	"TZ":                      true,
+}
+
+// allowEnvKey reports whether a variable name may be passed into the sandbox.
+// The name must also be a syntactically valid identifier.
+func allowEnvKey(k string) bool {
+	if sanitizeEnvKey(k) == "" {
+		return false
+	}
+	return allowedEnvKeys[k]
 }
 
 func sanitizeEnvKey(k string) string {

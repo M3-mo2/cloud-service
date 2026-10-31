@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -81,7 +82,7 @@ func TestRenderConfig(t *testing.T) {
 		WorkspaceRoot: "/tmp/wsroot",
 		Argv:          []string{"python3", "main.py"},
 		Cwd:           "/",
-		Env:           map[string]string{"FOO": "bar"},
+		Env:           map[string]string{"PYTHONPATH": "/workspace/lib", "LD_PRELOAD": "/workspace/evil.so", "FOO": "bar"},
 		Timeout:       30 * time.Second,
 	}, "/tmp/run-tmp")
 	if err != nil {
@@ -97,13 +98,16 @@ func TestRenderConfig(t *testing.T) {
 		`cgroup_mem_max: 268435456`,
 		`cgroup_cpu_ms_per_sec: 2000`,
 		`rlimit_nproc: 192`,
+		`rlimit_as: 256`,
+		`rlimit_fsize: 10`,
 		`use_cgroupv2: true`,
 		`mount_proc: false`,
 		`/tmp/wsroot`,
 		`/tmp/run-tmp`,
 		`exec_bin`,
 		`python3`,
-		`FOO=bar`,
+		`cwd: "/workspace"`,
+		`PYTHONPATH=/workspace/lib`,
 		`KILL`,
 		`DEFAULT ALLOW`,
 		`inside_id: "993"`,
@@ -135,16 +139,118 @@ func TestRenderConfigAllowNet(t *testing.T) {
 	}
 }
 
-func TestFormatEnvSortsAndSanitizes(t *testing.T) {
-	got := formatEnv(map[string]string{"Z": "1", "A": "2", "bad-key": "3", "B": "4"})
-	want := []string{"A=2", "B=4", "Z=1"}
+// TestRenderConfigRlimitUnits guards F-1: nsjail interprets rlimit_as and
+// rlimit_fsize in megabytes, so the rendered values must equal the workspace's
+// MB limits -- never bytes. A regression to bytes would render ~10^6x larger
+// numbers and silently disable the memory and file-size ceilings.
+func TestRenderConfigRlimitUnits(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 256, DiskMB: 10, MaxWallTimeSec: 5, MaxRuns: 1}}
+	path, err := r.renderConfig(Request{Workspace: ws, WorkspaceRoot: "/tmp/x", Argv: []string{"/bin/true"}}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	b, _ := os.ReadFile(path)
+	out := string(b)
+
+	if !strings.Contains(out, "rlimit_as: 256\n") {
+		t.Errorf("rlimit_as must be the MB value (256), got:\n%s", out)
+	}
+	if !strings.Contains(out, "rlimit_fsize: 10\n") {
+		t.Errorf("rlimit_fsize must be the MB value (10), got:\n%s", out)
+	}
+	// A byte-scaled value would be at least 1024x the intended MB figure.
+	if strings.Contains(out, "rlimit_as: 268435456") || strings.Contains(out, "rlimit_fsize: 10485760") {
+		t.Error("rlimit values are byte-scaled; nsjail expects megabytes")
+	}
+}
+
+func TestFormatEnvAllowlist(t *testing.T) {
+	got := formatEnv(map[string]string{
+		"TZ":                    "UTC",
+		"LANG":                  "C.UTF-8",
+		"PYTHONPATH":            "/workspace/lib",
+		"LD_PRELOAD":            "/workspace/evil.so",
+		"LD_LIBRARY_PATH":       "/workspace",
+		"DYLD_INSERT_LIBRARIES": "/workspace/evil.dylib",
+		"GLIBC_TUNABLES":        "glibc.malloc.check=3",
+		"bad-key":               "x",
+		"FOO":                   "bar",
+	})
+	want := []string{"LANG=C.UTF-8", "PYTHONPATH=/workspace/lib", "TZ=UTC"}
 	if len(got) != len(want) {
-		t.Fatalf("got %v", got)
+		t.Fatalf("got %v want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("got %v want %v", got, want)
 		}
+	}
+}
+
+func TestSandboxCwd(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"", "/workspace", false},
+		{"/", "/workspace", false},
+		{"/src", "/workspace/src", false},
+		{"src/nested", "/workspace/src/nested", false},
+		{"/src/../lib", "/workspace/lib", false},
+		{"../etc", "", true},
+		{"/../etc", "", true},
+	}
+	for _, c := range cases {
+		got, err := sandboxCwd(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("sandboxCwd(%q) = %q, want error", c.in, got)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Errorf("sandboxCwd(%q) = %q, %v; want %q", c.in, got, err, c.want)
+		}
+	}
+}
+
+func TestIsLaunchFailure(t *testing.T) {
+	if isLaunchFailure("") {
+		t.Error("empty diagnostic must not be a launch failure")
+	}
+	clean := "[I][t][1] Mode: STANDALONE_ONCE\n[I][t] pid=1 exited with status: 255"
+	if isLaunchFailure(clean) {
+		t.Error("clean run must not be classified as a launch failure")
+	}
+	fatal := "[E][t][1] newProc():262 execve failed\n[F][t][1] runChild():561 Launching child process failed"
+	if !isLaunchFailure(fatal) {
+		t.Error("fatal diagnostic must be classified as a launch failure")
+	}
+}
+
+func TestClassifyLaunchFailure(t *testing.T) {
+	r := &NsjailRunner{}
+	var exitErr *exec.ExitError
+	// Simulate nsjail exit 255 with a fatal diagnostic.
+	cmd := exec.Command("sh", "-c", "exit 255")
+	err := cmd.Run()
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected exit error, got %v", err)
+	}
+	res := Result{}
+	if rerr := r.classify(&res, err, context.Background(), "[F][t][1] runChild():561 Launching child process failed"); !errors.Is(rerr, ErrSandboxUnavailable) {
+		t.Fatalf("classify err = %v, want ErrSandboxUnavailable", rerr)
+	}
+	// A child cleanly exiting 255 must not be a sandbox error.
+	res2 := Result{}
+	if rerr := r.classify(&res2, err, context.Background(), ""); rerr != nil {
+		t.Fatalf("clean 255 classified as error: %v", rerr)
+	}
+	if res2.ExitCode != 255 {
+		t.Fatalf("exit code = %d, want 255", res2.ExitCode)
 	}
 }
 
