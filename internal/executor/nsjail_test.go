@@ -18,6 +18,9 @@ func testCfg() config.Config {
 	c := config.Default()
 	c.Sandbox.NsjailPath = "/nonexistent/nsjail"
 	c.Sandbox.KillGraceSec = 1
+	// Pin ids so rendered-config assertions are deterministic.
+	c.Sandbox.UID = 993
+	c.Sandbox.GID = 971
 	return c
 }
 
@@ -80,7 +83,7 @@ func TestRenderConfig(t *testing.T) {
 		Cwd:           "/",
 		Env:           map[string]string{"FOO": "bar"},
 		Timeout:       30 * time.Second,
-	})
+	}, "/tmp/run-tmp")
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -91,29 +94,37 @@ func TestRenderConfig(t *testing.T) {
 	for _, want := range []string{
 		`clone_newnet: true`,
 		`time_limit: 30`,
-		`cgroup_mem_max: 256`,
+		`cgroup_mem_max: 268435456`,
 		`cgroup_cpu_ms_per_sec: 2000`,
 		`rlimit_nproc: 192`,
+		`use_cgroupv2: true`,
+		`mount_proc: false`,
 		`/tmp/wsroot`,
+		`/tmp/run-tmp`,
 		`exec_bin`,
 		`python3`,
 		`FOO=bar`,
-		`POLICY sandboxd`,
-		`mount`,
+		`KILL`,
+		`DEFAULT ALLOW`,
+		`inside_id: "993"`,
+		`count: 1`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered config missing %q\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, `clone_newnet: false`) && !ws.Limits.AllowNet {
-		t.Error("net should be disabled by default")
+	if strings.Contains(out, `chroot:`) {
+		t.Error("chroot is not a valid nsjail config field and must not be rendered")
+	}
+	if strings.Contains(out, `disable_proc:`) {
+		t.Error("disable_proc is not a valid nsjail config field (use mount_proc)")
 	}
 }
 
 func TestRenderConfigAllowNet(t *testing.T) {
 	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
 	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1, AllowNet: true}}
-	path, err := r.renderConfig(Request{Workspace: ws, WorkspaceRoot: "/tmp/x", Argv: []string{"/bin/true"}})
+	path, err := r.renderConfig(Request{Workspace: ws, WorkspaceRoot: "/tmp/x", Argv: []string{"/bin/true"}}, "/tmp/rt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,6 +154,24 @@ func TestSeccompPolicyHasDangerousCalls(t *testing.T) {
 		if !strings.Contains(pol, sys) {
 			t.Errorf("policy missing %q", sys)
 		}
+	}
+	// libseccomp does not know these names; including them breaks compilation.
+	for _, bad := range []string{"umount2", "_sysctl"} {
+		for _, s := range seccompPolicy() {
+			if s == bad {
+				t.Errorf("policy contains libseccomp-invalid name %q", bad)
+			}
+		}
+	}
+}
+
+func TestSeccompStringIsQuotedPolicy(t *testing.T) {
+	s := seccompString()
+	if !strings.HasPrefix(s, `"`) || !strings.HasSuffix(s, `"`) {
+		t.Fatalf("seccomp string must be a quoted literal: %s", s)
+	}
+	if !strings.Contains(s, "DEFAULT ALLOW") || !strings.Contains(s, "KILL") {
+		t.Fatalf("unexpected seccomp string: %s", s)
 	}
 }
 

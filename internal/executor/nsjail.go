@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,6 +24,7 @@ type NsjailRunner struct {
 	cfg      config.Config
 	tmplPath string
 	tmpDir   string
+	identity Identity
 
 	mu      sync.Mutex
 	procs   map[string]*os.Process // runID -> direct child (nsjail) process
@@ -33,14 +35,17 @@ type NsjailRunner struct {
 // NewNsjailRunner constructs a runner. tmplPath points at the nsjail config
 // template; tmpDir is where per-run configs are written.
 func NewNsjailRunner(cfg config.Config, tmplPath, tmpDir string) *NsjailRunner {
-	r := &NsjailRunner{
+	return &NsjailRunner{
 		cfg:      cfg,
 		tmplPath: tmplPath,
 		tmpDir:   tmpDir,
+		identity: ResolveIdentity(cfg),
 		procs:    make(map[string]*os.Process),
 	}
-	return r
 }
+
+// Identity returns the resolved sandbox identity mapping.
+func (r *NsjailRunner) Identity() Identity { return r.identity }
 
 // Available reports whether the nsjail binary exists and is executable.
 func (r *NsjailRunner) Available() bool {
@@ -80,11 +85,50 @@ func (r *NsjailRunner) Run(req Request) (Result, error) {
 		return Result{}, err
 	}
 
-	cfgPath, err := r.renderConfig(req)
+	// Create a private, per-run temporary directory for the sandbox's /tmp.
+	runTmp, err := os.MkdirTemp(r.tmpDir, "run-*")
+	if err != nil {
+		return Result{}, fmt.Errorf("create run tmp: %w", err)
+	}
+	defer os.RemoveAll(runTmp)
+	// The sandbox process needs to write here; make it world-writable with the
+	// sticky bit (standard /tmp semantics) and, when privileged, hand it to the
+	// sandbox identity.
+	if err := os.Chmod(runTmp, 0o1777); err != nil {
+		return Result{}, err
+	}
+	if err := r.identity.ChownToSandbox(runTmp); err != nil {
+		return Result{}, fmt.Errorf("prepare run tmp ownership: %w", err)
+	}
+	// A privileged orchestrator mounts these paths as the sandbox uid, so every
+	// ancestor directory must be traversable (o+x) by that uid.
+	if r.identity.Privileged {
+		if err := ensureTraversable(runTmp); err != nil {
+			return Result{}, err
+		}
+		if req.WorkspaceRoot != "" {
+			if err := ensureTraversable(req.WorkspaceRoot); err != nil {
+				return Result{}, err
+			}
+		}
+	}
+
+	cfgPath, err := r.renderConfig(req, runTmp)
 	if err != nil {
 		return Result{}, err
 	}
 	defer os.Remove(cfgPath)
+
+	// When the orchestrator is privileged it creates workspace files as root.
+	// The jailed process runs as the sandbox uid, so hand ownership of the
+	// workspace tree to the sandbox identity. Unprivileged orchestrators need
+	// no chown: the kernel maps their files to the sandbox identity inside the
+	// namespace.
+	if r.identity.Privileged && req.WorkspaceRoot != "" {
+		if err := chownTree(req.WorkspaceRoot, r.identity.SandboxUID, r.identity.SandboxGID); err != nil {
+			return Result{}, fmt.Errorf("prepare workspace ownership: %w", err)
+		}
+	}
 
 	ctx := context.Background()
 	var cancel context.CancelFunc
@@ -93,7 +137,7 @@ func (r *NsjailRunner) Run(req Request) (Result, error) {
 		defer cancel()
 	}
 
-	cmd := exec.CommandContext(ctx, bin, "--config", cfgPath)
+	cmd := exec.CommandContext(ctx, bin, "--really_quiet", "--config", cfgPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Ensure context cancellation (timeout or explicit stop) tears down the whole
 	// process group rather than only the direct child.
@@ -302,6 +346,7 @@ type tmplData struct {
 	CPUCores      float64
 	CPUMilli      int
 	MemoryMB      int
+	MemoryBytes   int64
 	PidsMax       int
 	FsizeBytes    int64
 	AsBytes       int64
@@ -309,11 +354,17 @@ type tmplData struct {
 	DisableNet    bool
 	User          string
 	Group         string
+	SandboxUID    int
+	SandboxGID    int
+	OutsideUID    int
+	OutsideGID    int
 	WorkspaceRoot string
+	TempDir       string
+	SeccompString string
 	SeccompPolicy []string
 }
 
-func (r *NsjailRunner) renderConfig(req Request) (string, error) {
+func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) {
 	if req.Workspace == nil {
 		return "", fmt.Errorf("workspace is required")
 	}
@@ -344,6 +395,7 @@ func (r *NsjailRunner) renderConfig(req Request) (string, error) {
 		CPUCores:      lim.CPUCores,
 		CPUMilli:      int(lim.CPUCores * 1000),
 		MemoryMB:      lim.MemoryMB,
+		MemoryBytes:   int64(lim.MemoryMB) * 1024 * 1024,
 		PidsMax:       lim.MaxRuns * 64,
 		FsizeBytes:    int64(lim.DiskMB) * 1024 * 1024,
 		AsBytes:       int64(lim.MemoryMB) * 1024 * 1024,
@@ -351,7 +403,13 @@ func (r *NsjailRunner) renderConfig(req Request) (string, error) {
 		DisableNet:    !lim.AllowNet,
 		User:          r.cfg.Sandbox.User,
 		Group:         r.cfg.Sandbox.Group,
+		SandboxUID:    r.identity.SandboxUID,
+		SandboxGID:    r.identity.SandboxGID,
+		OutsideUID:    r.identity.OutsideUID,
+		OutsideGID:    r.identity.OutsideGID,
 		WorkspaceRoot: req.WorkspaceRoot,
+		TempDir:       runTmp,
+		SeccompString: seccompString(),
 		SeccompPolicy: seccompPolicy(),
 	}
 	if data.PidsMax <= 0 {
@@ -409,15 +467,26 @@ func sortStrings(s []string) {
 }
 
 // seccompPolicy returns the baseline syscall deny list applied to sandboxes.
+// Names are libseccomp identifiers; `umount2` is exposed as `umount` and the
+// obsolete `_sysctl` is omitted because libseccomp does not know it.
 func seccompPolicy() []string {
 	return []string{
-		"mount", "umount2", "ptrace", "bpf", "kexec_load",
+		"mount", "umount", "ptrace", "bpf", "kexec_load",
 		"kexec_file_load", "reboot", "swapon", "swapoff",
 		"pivot_root", "setns", "unshare", "add_key", "keyctl",
 		"request_key", "init_module", "finit_module", "delete_module",
-		"acct", "nfsservctl", "open_by_handle_at", "perf_event_open",
-		"quotactl", "uselib", "_sysctl", "iopl", "ioperm",
+		"nfsservctl", "open_by_handle_at", "perf_event_open",
+		"quotactl", "uselib", "iopl", "ioperm",
 	}
+}
+
+// seccompString renders the deny list as a libseccomp policy: dangerous
+// syscalls are KILLed, everything else is allowed so normal programs run.
+// The result is a Go-quoted string literal suitable for an nsjail `seccomp_string`
+// TextProto field.
+func seccompString() string {
+	policy := "KILL {\n  " + strings.Join(seccompPolicy(), ", ") + "\n}\nDEFAULT ALLOW"
+	return strconv.Quote(policy)
 }
 
 // ConfigTemplatePath returns the default template location relative to a dir.

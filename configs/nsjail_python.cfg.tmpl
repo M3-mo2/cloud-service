@@ -1,27 +1,28 @@
 # nsjail configuration template rendered per run by sandboxd.
 # Rendered by internal/executor/nsjail.go. Do not edit in place; edit the Go
 # template data if you need different fields.
+#
+# This is nsjail TextProto format. Field names below are verified against the
+# installed nsjail build; invalid fields cause a hard parse failure.
 
 name: "sandboxd-run"
 mode: ONCE
 
-# Never chroot; we bind-mount read-only system paths and the workspace instead.
-chroot: ""
-
 hostname: "sandbox"
 
-# Per-run user namespace with a shared sandbox UID/GID on the host.
+# Namespaces. Network is isolated unless the workspace opts in (allow_net).
 clone_newnet: {{ if .AllowNet }}false{{ else }}true{{ end }}
 clone_newuser: true
 clone_newns: true
 clone_newpid: true
 clone_newipc: true
 clone_newuts: true
-clone_newcgroup: true
 
-# Disable /proc (it leaks host process information). Python still runs fine
-# without it for the common cases.
-disable_proc: true
+# Use cgroup v2 (unified hierarchy). Required on modern hosts.
+use_cgroupv2: true
+
+# Do not mount /proc: it leaks host process information.
+mount_proc: false
 
 # Mount the Python runtime and system libraries read-only, then the workspace
 # writable at /workspace.
@@ -37,6 +38,7 @@ mount {
   dst: "/lib"
   is_bind: true
   rw: false
+  mandatory: false
 }
 
 mount {
@@ -142,26 +144,32 @@ mount {
   rw: true
 }
 
-# A writable /tmp for the sandbox.
+# A private, per-run writable /tmp. Never the host's /tmp.
 mount {
-  src: "/tmp"
+  src: "{{ .TempDir }}"
   dst: "/tmp"
   is_bind: true
   rw: true
-  mandatory: false
 }
 
 cwd: "/workspace"
 
-# Run as the shared sandbox user inside the namespace.
+# Run as the sandbox user inside the namespace.
+#
+# The kernel only allows an unprivileged process to write a single-entry
+# UID/GID map whose outside id equals its own effective id. sandboxd therefore
+# maps the sandbox identity *inside* the namespace onto outside ids that are
+# permitted in the current context (see internal/executor/identity.go):
+#   - privileged orchestrator: inside sandbox <-> outside sandbox (real drop)
+#   - unprivileged orchestrator: inside sandbox <-> outside orchestrator
 uidmap {
-  inside_id: {{ .User }}
-  outside_id: {{ .User }}
+  inside_id: "{{ .SandboxUID }}"
+  outside_id: "{{ .OutsideUID }}"
   count: 1
 }
 gidmap {
-  inside_id: {{ .Group }}
-  outside_id: {{ .Group }}
+  inside_id: "{{ .SandboxGID }}"
+  outside_id: "{{ .OutsideGID }}"
   count: 1
 }
 
@@ -173,20 +181,14 @@ rlimit_nofile: 256
 rlimit_nproc: {{ .PidsMax }}
 rlimit_core: 0
 
-cgroup_mem_max: {{ .MemoryMB }}
+# cgroup v2 limits (memory in bytes, cpu in microseconds per second).
+cgroup_mem_max: {{ .MemoryBytes }}
 cgroup_pids_max: {{ .PidsMax }}
 cgroup_cpu_ms_per_sec: {{ .CPUMilli }}
 
-# Baseline seccomp deny list.
-seccomp_string: >-
-  POLICY sandboxd {
-  {{- range .SeccompPolicy }}
-    KILL {
-      {{ . }}
-    }
-  {{- end }}
-  }
-  USE sandboxd DEFAULT
+# Baseline seccomp deny list, applied with a default-allow policy so normal
+# program execution is unaffected while dangerous syscalls are killed.
+seccomp_string: {{ .SeccompString }}
 
 # Environment: a minimal, non-sensitive base plus user-provided variables.
 envar: "PATH=/usr/local/bin:/usr/bin:/bin"
@@ -194,7 +196,7 @@ envar: "HOME=/tmp"
 envar: "LANG=C.UTF-8"
 envar: "PYTHONUNBUFFERED=1"
 {{- range .Env }}
-envar: "{{ . }}"
+envar: {{ printf "%q" . }}
 {{- end }}
 
 exec_bin {

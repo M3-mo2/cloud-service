@@ -35,6 +35,10 @@ type SandboxConfig struct {
 	User         string `koanf:"user"`
 	Group        string `koanf:"group"`
 	KillGraceSec int    `koanf:"kill_grace_sec"`
+	// UID/GID are optional explicit sandbox ids. When zero they are resolved
+	// from User/Group, falling back to built-in defaults.
+	UID int `koanf:"uid"`
+	GID int `koanf:"gid"`
 }
 
 // LimitsConfig holds default per-workspace limits.
