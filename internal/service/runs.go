@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"sandboxd/internal/executor"
@@ -29,8 +30,11 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 	}
 	argv := spec.Argv
 	if spec.Kind == model.RunKindFile {
-		args := append([]string{spec.File}, spec.Args...)
-		argv = args
+		// A file run executes the default runtime (python3) against the file,
+		// whose path is relative to the workspace root (bind-mounted at
+		// /workspace, which is the sandbox CWD).
+		file := strings.TrimPrefix(spec.File, "/")
+		argv = append([]string{"python3", file}, spec.Args...)
 	}
 
 	// Prune old runs before starting a new one (retention policy).
