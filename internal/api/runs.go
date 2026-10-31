@@ -151,12 +151,21 @@ func (s *Server) handleStopRun(w http.ResponseWriter, r *http.Request) {
 		writeErrorWithCode(w, err)
 		return
 	}
-	_, _, err := s.svc.StopRun(ws.ID, runID)
+	_, killedStatus, err := s.svc.StopRun(ws.ID, runID)
 	if err != nil {
 		writeErrorWithCode(w, err)
 		return
 	}
-	run, _ := s.svc.GetRun(ws, runID)
+	run, err := s.svc.GetRun(ws, runID)
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	// Prefer the status driven by the stop when a live process was signalled;
+	// the persisted record may not have caught up yet.
+	if killedStatus == model.RunKilled {
+		run.Status = model.RunKilled
+	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"run": toRunJSON(run)})
 }
 

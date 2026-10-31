@@ -98,13 +98,15 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	dataOK := s.dataDirWritable()
 	nsjailOK := s.svc.Runner().Available()
+	cgroupsOK := s.svc.Runner().CgroupsUsable()
 	status := http.StatusOK
-	if !dataOK || !nsjailOK {
+	if !dataOK || !nsjailOK || !cgroupsOK {
 		status = http.StatusServiceUnavailable
 	}
 	writeJSON(w, status, map[string]any{
 		"status":   map[bool]string{true: "ready", false: "not_ready"}[status == http.StatusOK],
 		"nsjail":   nsjailOK,
+		"cgroups":  cgroupsOK,
 		"data_dir": dataOK,
 	})
 }

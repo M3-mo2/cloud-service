@@ -148,6 +148,29 @@ func (s *Store) SaveWorkspace(w *model.Workspace) error {
 	return writeJSONAtomic(s.WorkspaceMetaPath(w.ID), w)
 }
 
+// ListAllWorkspaces returns every workspace whose metadata is present.
+func (s *Store) ListAllWorkspaces() ([]*model.Workspace, error) {
+	entries, err := os.ReadDir(s.WorkspacesDir())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []*model.Workspace{}, nil
+		}
+		return nil, err
+	}
+	out := make([]*model.Workspace, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), model.WorkspaceIDPrefix) {
+			continue
+		}
+		w, err := s.GetWorkspace(e.Name())
+		if err != nil {
+			continue
+		}
+		out = append(out, w)
+	}
+	return out, nil
+}
+
 // ListWorkspaces returns all workspaces owned by ownerID, newest first.
 func (s *Store) ListWorkspaces(ownerID string) ([]*model.Workspace, error) {
 	entries, err := os.ReadDir(s.WorkspacesDir())

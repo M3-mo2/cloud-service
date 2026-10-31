@@ -11,6 +11,7 @@ import (
 	"sandboxd/internal/executor"
 	"sandboxd/internal/model"
 	"sandboxd/internal/storage"
+	"sandboxd/internal/workspace"
 )
 
 func newTestService(t *testing.T) (*Service, *executor.FakeRunner) {
@@ -146,5 +147,52 @@ func TestFileLifecycle(t *testing.T) {
 	}
 	if _, err := svc.ListFiles(ws, "/dir"); err == nil {
 		t.Fatal("expected dir to be gone")
+	}
+}
+
+func TestStartRunFileRejectsUnsafePath(t *testing.T) {
+	svc, fake := newTestService(t)
+	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	_, err := svc.StartRun(ws, StartRunSpec{Kind: model.RunKindFile, File: "../../etc/passwd"})
+	if err == nil {
+		t.Fatal("expected unsafe path rejection")
+	}
+	if !workspace.IsUnsafe(err) {
+		t.Fatalf("err = %v, want unsafe", err)
+	}
+	if fake.LastRequest() != nil {
+		t.Fatal("runner should not have been invoked")
+	}
+}
+
+func TestRecoverRuns(t *testing.T) {
+	svc, fake := newTestService(t)
+	fake.Delay = 50 * time.Millisecond
+	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	run, err := svc.StartRun(ws, StartRunSpec{Kind: model.RunKindCommand, Argv: []string{"x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Wait for it to finish, then forcibly mark it running on disk to simulate
+	// an orphaned record from a prior process.
+	svc.WaitAll()
+	stored, _ := svc.store.GetRun(ws.ID, run.ID)
+	stored.Status = model.RunRunning
+	if err := svc.store.SaveRun(ws.ID, stored); err != nil {
+		t.Fatal(err)
+	}
+	n, err := svc.RecoverRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("recovered = %d, want 1", n)
+	}
+	got, _ := svc.store.GetRun(ws.ID, run.ID)
+	if got.Status != model.RunInterrupted {
+		t.Fatalf("status = %s, want interrupted", got.Status)
+	}
+	if got.EndedAt.IsZero() {
+		t.Fatal("interrupted run must have an ended_at")
 	}
 }

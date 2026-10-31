@@ -46,7 +46,7 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}
-	fake := &executor.FakeRunner{AvailableFlag: false, Stdout: "hi\n"}
+	fake := &executor.FakeRunner{AvailableFlag: false, CgroupsFlag: true, Stdout: "hi\n"}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(cfg, store, fake, logger)
 	authn := auth.New([]config.KeyConfig{

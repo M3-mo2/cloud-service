@@ -64,8 +64,19 @@ func mapError(err error) *model.Error {
 	if errors.Is(err, executor.ErrNsjailUnavailable) {
 		return model.New(503, model.CodeUnavailable, "nsjail is not available")
 	}
+	var sbErr *executor.SandboxError
+	if errors.As(err, &sbErr) {
+		details := map[string]string{}
+		if sbErr.Diagnostic != "" {
+			details["nsjail"] = sbErr.Diagnostic
+		}
+		return model.Wrap(503, model.CodeUnavailable, "sandbox unavailable: nsjail could not set up or launch the sandbox", details)
+	}
 	if errors.Is(err, executor.ErrCommandNotFound) {
 		return model.New(422, model.CodeUnprocessable, "command not found")
+	}
+	if errors.Is(err, executor.ErrInvalidCwd) {
+		return model.New(422, model.CodeUnprocessable, "cwd escapes workspace root")
 	}
 	if workspace.IsUnsafe(err) {
 		return model.New(422, model.CodeUnprocessable, "unsafe path: escapes workspace root")

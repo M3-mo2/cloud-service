@@ -44,6 +44,11 @@ func main() {
 	runner := executor.NewNsjailRunner(cfg, tmplPath, store.TmpDir())
 
 	svc := service.New(cfg, store, runner, logger)
+	if n, err := svc.RecoverRuns(); err != nil {
+		logger.Error("run recovery failed", "error", err)
+	} else if n > 0 {
+		logger.Info("recovered orphaned runs", "count", n)
+	}
 	authn := auth.New(cfg.Keys)
 	server := api.NewServer(svc, authn, logger)
 
@@ -87,6 +92,9 @@ func main() {
 	if err := httpServer.Shutdown(ctx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
 		os.Exit(1)
+	}
+	if !svc.Shutdown(5 * time.Second) {
+		logger.Warn("run drain deadline exceeded; some runs may not have terminated")
 	}
 	logger.Info("stopped")
 }

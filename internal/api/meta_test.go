@@ -32,15 +32,30 @@ func TestReadyzReportsNotReadyWithoutNsjail(t *testing.T) {
 	}
 }
 
+func TestReadyzReportsNotReadyWithoutCgroups(t *testing.T) {
+	h := newHarness(t)
+	h.runner.AvailableFlag = true
+	h.runner.CgroupsFlag = false
+	rec := h.do("GET", "/readyz", reqOpts{})
+	if rec.Code != 503 {
+		t.Fatalf("code = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := decode[map[string]any](t, rec)
+	if body["cgroups"] != false || body["status"] != "not_ready" {
+		t.Fatalf("body = %v", body)
+	}
+}
+
 func TestReadyzReadyWithNsjail(t *testing.T) {
 	h := newHarness(t)
 	h.runner.AvailableFlag = true
+	h.runner.CgroupsFlag = true
 	rec := h.do("GET", "/readyz", reqOpts{})
 	if rec.Code != 200 {
 		t.Fatalf("code = %d body=%s", rec.Code, rec.Body.String())
 	}
 	body := decode[map[string]any](t, rec)
-	if body["status"] != "ready" || body["nsjail"] != true {
+	if body["status"] != "ready" || body["nsjail"] != true || body["cgroups"] != true {
 		t.Fatalf("body = %v", body)
 	}
 }

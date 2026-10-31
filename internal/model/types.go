@@ -70,12 +70,13 @@ type RunStatus string
 
 // Run statuses.
 const (
-	RunQueued  RunStatus = "queued"
-	RunRunning RunStatus = "running"
-	RunExited  RunStatus = "exited"
-	RunKilled  RunStatus = "killed"
-	RunTimeout RunStatus = "timeout"
-	RunFailed  RunStatus = "failed"
+	RunQueued      RunStatus = "queued"
+	RunRunning     RunStatus = "running"
+	RunExited      RunStatus = "exited"
+	RunKilled      RunStatus = "killed"
+	RunTimeout     RunStatus = "timeout"
+	RunFailed      RunStatus = "failed"
+	RunInterrupted RunStatus = "interrupted"
 )
 
 // Log streams.

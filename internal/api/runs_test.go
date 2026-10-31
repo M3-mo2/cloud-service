@@ -196,6 +196,34 @@ func TestStopRunNotFound(t *testing.T) {
 	}
 }
 
+func TestCreateRunFileValidatesPath(t *testing.T) {
+	h := newHarness(t)
+	h.runner.AvailableFlag = true
+	id := h.createWorkspace("runs")
+
+	// Missing file is a 404 at request time, not a deferred failure.
+	rec := h.doJSON("POST", "/v1/workspaces/"+id+"/runs", keyA, map[string]any{"kind": "file", "file": "/nope.py"})
+	if rec.Code != 404 {
+		t.Fatalf("missing file code = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Traversal is rejected as unsafe.
+	rec = h.doJSON("POST", "/v1/workspaces/"+id+"/runs", keyA, map[string]any{"kind": "file", "file": "../../etc/passwd"})
+	if rec.Code != 422 {
+		t.Fatalf("traversal code = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// An existing file is accepted.
+	rec = h.doJSON("PUT", "/v1/workspaces/"+id+"/files/content?path=/main.py", keyA, map[string]any{"content": "print(1)\n"})
+	if rec.Code != 204 {
+		t.Fatalf("put code = %d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = h.doJSON("POST", "/v1/workspaces/"+id+"/runs", keyA, map[string]any{"kind": "file", "file": "/main.py"})
+	if rec.Code != 202 {
+		t.Fatalf("valid file code = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestRunsCrossOwner(t *testing.T) {
 	h := newHarness(t)
 	h.runner.AvailableFlag = true

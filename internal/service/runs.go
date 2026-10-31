@@ -30,6 +30,25 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 	}
 	argv := spec.Argv
 	if spec.Kind == model.RunKindFile {
+		// Validate the target file resolves inside the workspace and exists
+		// before accepting the run, rather than deferring the failure to
+		// execution time.
+		fs, err := s.WorkspaceFs(w)
+		if err != nil {
+			return nil, err
+		}
+		resolved, err := fs.Resolve(spec.File)
+		if err != nil {
+			return nil, err
+		}
+		if fi, err := os.Stat(resolved); err != nil {
+			if os.IsNotExist(err) {
+				return nil, model.ErrNotFound
+			}
+			return nil, err
+		} else if fi.IsDir() {
+			return nil, model.New(422, model.CodeUnprocessable, "file run target is a directory")
+		}
 		// A file run executes the default runtime (python3) against the file,
 		// whose path is relative to the workspace root (bind-mounted at
 		// /workspace, which is the sandbox CWD).
@@ -145,6 +164,8 @@ func (s *Service) executeRun(ctx context.Context, w *model.Workspace, run *model
 
 // StopRun stops a running run by ID. Returns true if a running process was
 // signalled. Idempotent: stopping an unknown/finished run returns false, nil.
+// The returned status reflects the state driven by the stop: a live run is
+// reported as killed; an already-finished run reports its stored status.
 func (s *Service) StopRun(wsID, runID string) (bool, model.RunStatus, error) {
 	run, err := s.store.GetRun(wsID, runID)
 	if err != nil {
@@ -157,7 +178,11 @@ func (s *Service) StopRun(wsID, runID string) (bool, model.RunStatus, error) {
 		return false, run.Status, nil
 	}
 	rr.cancel()
-	return s.runner.Kill(runID), run.Status, nil
+	killed := s.runner.Kill(runID)
+	if killed {
+		return true, model.RunKilled, nil
+	}
+	return false, run.Status, nil
 }
 
 // StopAllRuns cancels every running run for a workspace and waits briefly.
@@ -211,6 +236,70 @@ func (s *Service) WaitAll() {
 	for _, done := range pending {
 		<-done
 	}
+}
+
+// RecoverRuns reconciles run state after a restart. Any run still recorded as
+// queued or running has no surviving process, so it is moved to the terminal
+// interrupted state. Returns the number of runs recovered.
+func (s *Service) RecoverRuns() (int, error) {
+	workspaces, err := s.store.ListAllWorkspaces()
+	if err != nil {
+		return 0, err
+	}
+	recovered := 0
+	now := time.Now().UTC()
+	for _, w := range workspaces {
+		runs, err := s.store.ListRuns(w.ID)
+		if err != nil {
+			s.logger.Warn("recover runs: list failed", "workspace_id", w.ID, "error", err)
+			continue
+		}
+		for _, run := range runs {
+			if run.Status != model.RunQueued && run.Status != model.RunRunning {
+				continue
+			}
+			run.Status = model.RunInterrupted
+			if run.EndedAt.IsZero() {
+				run.EndedAt = now
+			}
+			if err := s.store.SaveRun(w.ID, run); err != nil {
+				s.logger.Warn("recover run: save failed", "run_id", run.ID, "error", err)
+				continue
+			}
+			recovered++
+		}
+	}
+	return recovered, nil
+}
+
+// Shutdown stops every running run and waits for them to drain, bounded by
+// deadline. It returns false if the deadline elapsed with runs still active.
+func (s *Service) Shutdown(deadline time.Duration) bool {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.runs))
+	for id, rr := range s.runs {
+		ids = append(ids, id)
+		rr.cancel()
+	}
+	s.mu.Unlock()
+	for _, id := range ids {
+		s.runner.Kill(id)
+	}
+	timer := time.After(deadline)
+	s.mu.Lock()
+	pending := make([]chan struct{}, 0, len(s.runs))
+	for _, rr := range s.runs {
+		pending = append(pending, rr.done)
+	}
+	s.mu.Unlock()
+	for _, done := range pending {
+		select {
+		case <-done:
+		case <-timer:
+			return false
+		}
+	}
+	return true
 }
 
 // GetRun returns a run for a workspace.
