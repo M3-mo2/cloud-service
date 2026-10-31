@@ -23,6 +23,7 @@ func newTestService(t *testing.T) (*Service, *executor.FakeRunner) {
 	}
 	fake := &executor.FakeRunner{AvailableFlag: true, Stdout: "hi\n"}
 	svc := New(cfg, store, fake, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(svc.WaitAll)
 	return svc, fake
 }
 

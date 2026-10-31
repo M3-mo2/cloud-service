@@ -182,6 +182,35 @@ func (s *Service) StopAllRuns(wsID string) {
 	}
 }
 
+// WaitRuns blocks until no run for the workspace is executing. It is primarily
+// useful for orderly shutdown and tests.
+func (s *Service) WaitRuns(wsID string) {
+	s.mu.Lock()
+	var pending []chan struct{}
+	for _, rr := range s.runs {
+		if rr.wsID == wsID {
+			pending = append(pending, rr.done)
+		}
+	}
+	s.mu.Unlock()
+	for _, done := range pending {
+		<-done
+	}
+}
+
+// WaitAll blocks until every tracked run across all workspaces has finished.
+func (s *Service) WaitAll() {
+	s.mu.Lock()
+	var pending []chan struct{}
+	for _, rr := range s.runs {
+		pending = append(pending, rr.done)
+	}
+	s.mu.Unlock()
+	for _, done := range pending {
+		<-done
+	}
+}
+
 // GetRun returns a run for a workspace.
 func (s *Service) GetRun(w *model.Workspace, runID string) (*model.Run, error) {
 	return s.store.GetRun(w.ID, runID)

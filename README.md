@@ -39,7 +39,7 @@ end-to-end HTTP transcript can be reproduced with `scripts/acceptance.sh`.
 
 ## Requirements
 
-- Go 1.22+
+- Go 1.23+
 - `nsjail` (the service runs without it, but `/readyz` reports 503 and runs return
   `503 unavailable`)
 - A host user and group named `sandbox` for sandboxed processes

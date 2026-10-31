@@ -56,3 +56,7 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
 - **Log offset semantics**: byte offsets into the log file; `next` is the offset to pass on the
   next poll; `eof` is true when the reader reached the current end of file.
   _Rationale_: deterministic and simple to resume.
+- **Go directive `1.23`**: the brief targeted Go 1.22, but `koanf`'s YAML parser (and several
+  transitive deps) declare a `go 1.23` floor, so `go.mod` requires Go 1.23+.
+  _Rationale_: the mandated YAML config dependency cannot build on 1.22 without pinning
+  unsupported older versions; 1.23 is the smallest compatible toolchain.

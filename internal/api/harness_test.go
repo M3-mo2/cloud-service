@@ -29,6 +29,7 @@ type harness struct {
 	router  http.Handler
 	store   *storage.Store
 	runner  *executor.FakeRunner
+	svc     *service.Service
 	cfg     config.Config
 	dataDir string
 }
@@ -53,12 +54,16 @@ func newHarness(t *testing.T) *harness {
 		{Key: keyB, PrincipalID: usrB},
 	})
 	srv := NewServer(svc, authn, logger)
+	// Ensure background run goroutines finish before TempDir cleanup runs.
+	// t.Cleanup is LIFO, so this executes before the TempDir removal.
+	t.Cleanup(svc.WaitAll)
 	return &harness{
 		t:       t,
 		server:  srv,
 		router:  srv.Router(),
 		store:   store,
 		runner:  fake,
+		svc:     svc,
 		cfg:     cfg,
 		dataDir: cfg.Storage.DataDir,
 	}
