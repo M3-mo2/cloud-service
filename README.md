@@ -22,7 +22,9 @@ curl -s localhost:8080/healthz
 curl -s -H 'Authorization: Bearer dev-key-please-rotate' localhost:8080/v1/meta
 ```
 
-See [docs/API.md](docs/API.md) for a full endpoint guide and curl examples.
+See [docs/API.md](docs/API.md) for a full endpoint guide and curl examples, and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for a diagrammed walkthrough of how
+the service is built and how the isolation works.
 
 ## Build, test, lint
 
@@ -96,7 +98,7 @@ internal/config       koanf loader + struct
 internal/model        domain types
 configs/              example config + nsjail template
 api/openapi.yaml      OpenAPI 3.1 spec (source of truth)
-docs/                 SPEC, API guide, decisions, verification
+docs/                 ARCHITECTURE, SPEC, API guide, decisions, verification
 ```
 
 ## License
