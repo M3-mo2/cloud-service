@@ -34,6 +34,9 @@ make lint        # golangci-lint if present, else go vet
 make integration # tests that require a real nsjail binary (//go:build integration)
 ```
 
+Acceptance evidence lives in [docs/VERIFICATION.md](docs/VERIFICATION.md). The
+end-to-end HTTP transcript can be reproduced with `scripts/acceptance.sh`.
+
 ## Requirements
 
 - Go 1.22+
