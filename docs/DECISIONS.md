@@ -44,6 +44,36 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     _Rationale_: separates liveness from readiness for orchestrators.
 17. **Version**: the service version string is `0.0.5`.
     _Rationale_: single source of truth matching the API version contract.
+18. **cgroup v2 is a hard requirement; `--cgroupns=host` is mandatory.** nsjail applies memory,
+    pids and cpu ceilings via cgroup v2, which requires write access to the host/root cgroup
+    hierarchy. A container started without `--cgroupns=host` cannot apply them, so nsjail aborts
+    before `execve`. `/readyz` reports `cgroups`, and a failed launch is returned as
+    `503 unavailable` with nsjail's own diagnostic — never a silent non-zero exit.
+    _Rationale_: the resource model treats cgroup ceilings as active; making the requirement
+    explicit and observable is safer than silently running without ceilings.
+19. **rlimit units**: nsjail's `rlimit_as` and `rlimit_fsize` are **megabytes** (verified against the
+    installed build), so the rendered config passes `memory_mb` / `disk_mb` directly.
+    _Rationale_: passing bytes multiplied every ceiling by ~10^6, effectively disabling them.
+20. **User environment is allowlisted.** Only `PYTHONPATH`, `PYTHONUNBUFFERED`,
+    `PYTHONDONTWRITEBYTECODE`, `PYTHONHASHSEED`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ` pass through.
+    Loader-injection variables (`LD_*`, `DYLD_*`, `GLIBC_TUNABLES`) are rejected by name.
+    _Rationale_: a preloaded object could alter the interpreter the service chose to run, breaking
+    the trust model that the jail contains a known entry point.
+21. **Sandbox launch failures are explicit.** A non-zero nsjail exit that carries a fatal/error
+    diagnostic on its log fd is classified as `ErrSandboxUnavailable` and surfaced as
+    `503 unavailable` (sync) or a `failed` run with the diagnostic in the log (async).
+    _Rationale_: an empty `stdout` exit 255 is indistinguishable from a blocked syscall unless the
+    failure is reported.
+22. **cwd is honored and validated** relative to the workspace root (mounted at `/workspace`); a
+    `cwd` that would escape the root is rejected with `422`.
+    _Rationale_: a documented contract field must have an effect and must not weaken path safety.
+23. **Run recovery on startup.** Runs left `queued`/`running` by a prior process are moved to the
+    terminal `interrupted` state; shutdown stops all runs and drains under a bounded deadline.
+    _Rationale_: a run record must always reach a terminal state a polling client can observe.
+24. **`kind=file` targets are validated at request time** via `workspace.Resolve` (`422` unsafe,
+    `404` missing); the target must exist before the run is accepted.
+    _Rationale_: deferring an invalid request to execution time returns success for a request that
+    cannot succeed.
 
 ## Additional defaults chosen during implementation
 

@@ -200,12 +200,16 @@ sequenceDiagram
     SVC->>SVC: clamp timeout to execHardCapSec (60)
     SVC->>EX: Run(Request{Argv, StdoutCap, StderrCap, Timeout})
     EX->>EX: render nsjail config (temp file)
-    EX->>N: nsjail --really_quiet --config <file>
-    N-->>EX: exit + capped stdout/stderr
+    EX->>N: nsjail -q -L 3 --config <file>
+    N-->>EX: exit + capped stdout/stderr + nsjail diagnostic (fd 3)
     EX-->>SVC: Result{ExitCode, Stdout, Stderr, Truncated}
     SVC-->>API: ExecOutcome
     API-->>C: 200 {exit_code, stdout, stderr, duration_ms, truncated}
 ```
+
+When nsjail cannot set up or launch the sandbox (exit 255 with a fatal
+diagnostic), the runner returns `ErrSandboxUnavailable` and the API responds
+`503 unavailable` with the nsjail diagnostic in `details.nsjail`.
 
 ### 4.3 Asynchronous `run`
 
@@ -251,16 +255,24 @@ stateDiagram-v2
     running --> exited: exit code 0..N
     running --> timeout: wall-clock / nsjail time_limit
     running --> killed: POST /stop or workspace delete
-    running --> failed: executor error (e.g. nsjail missing)
+    running --> failed: executor error (nsjail missing / launch failure)
+    queued --> interrupted: restart recovery
+    running --> interrupted: restart recovery
     exited --> [*]
     timeout --> [*]
     killed --> [*]
     failed --> [*]
+    interrupted --> [*]
 ```
+
+On startup the service sweeps runs still recorded `queued`/`running` and moves
+them to the terminal `interrupted` state, because no sandbox process survives a
+restart. Shutdown stops every running run and drains under a bounded deadline.
 
 `stop` is **idempotent**: stopping an unknown or finished run returns the
 current status and signals `false`. A stop both cancels the context and calls
-`runner.Kill`, which kills the whole process group.
+`runner.Kill`, which kills the whole process group; when a live process was
+signalled the response status is `killed`.
 
 ---
 
@@ -274,16 +286,25 @@ subtle real-world behavior.
 Each run gets a fresh nsjail instance described by a config file rendered on the
 fly (`configs/nsjail_python.cfg.tmpl`). The rendered sandbox has:
 
-| Layer | Setting | Effect |
-|-------|---------|--------|
-| Namespaces | `clone_newpid/ns/ipc/uts/user` always; `newnet` unless `allow_net` | Isolated PID, mount, IPC, UTS, user; no network |
-| mount ns | host `/usr`,`/lib`,`/lib64`,`/bin`,`/sbin` RO; workspace RW at `/workspace`; private `/tmp` | Child sees only the runtime + its own files |
-| `/proc` | `mount_proc: false` | Host process table not visible |
-| cgroup v2 | `cgroup_mem_max`, `cgroup_pids_max`, `cgroup_cpu_ms_per_sec` | Memory, process-count, CPU throttling |
-| rlimits | `as`, `fsize`, `nofile`, `nproc`, `core=0` | Kernel-enforced ceilings |
-| seccomp | default-allow, KILL a dangerous denylist | `mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`, modules, keyctl, … |
-| identity | uid/gid map + `--user sandbox` | Runs as the unprivileged `sandbox` user |
-| time | `time_limit` | Wall-clock kill |
+| Layer | Setting | Effect | Applied when |
+|-------|---------|--------|--------------|
+| Namespaces | `clone_newpid/ns/ipc/uts/user` always; `newnet` unless `allow_net` | Isolated PID, mount, IPC, UTS, user; no network | always |
+| mount ns | host `/usr`,`/lib`,`/lib64`,`/bin`,`/sbin` RO; workspace RW at `/workspace`; private `/tmp` | Child sees only the runtime + its own files | always |
+| `/proc` | `mount_proc: false` | Host process table not visible | always |
+| cgroup v2 | `cgroup_mem_max` (bytes), `cgroup_pids_max`, `cgroup_cpu_ms_per_sec` | Memory, process-count, CPU throttling | **only with `--cgroupns=host`** |
+| rlimits | `as` (MB), `fsize` (MB), `nofile`, `nproc`, `core=0` | Kernel-enforced ceilings | always |
+| seccomp | default-allow, KILL a dangerous denylist | `mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`, modules, keyctl, … | always |
+| identity | uid/gid map + `--user sandbox` | Runs as the unprivileged `sandbox` user | always |
+| time | `time_limit` | Wall-clock kill | always |
+
+> **Units and availability (two corrected defects).** nsjail reads `rlimit_as`
+> and `rlimit_fsize` in **megabytes**, not bytes: the renderer passes
+> `memory_mb`/`disk_mb` directly (a bytes value made every ceiling ~10⁶× too
+> large). cgroup v2 ceilings require write access to the host cgroup hierarchy,
+> i.e. the container must run with `--cgroupns=host`; without it nsjail aborts
+> before `execve` and **no** cgroup ceiling applies (see §5.4 and §10). The
+> process ceiling comes from `cgroup_pids_max`, because `RLIMIT_NPROC` does not
+> bind for the root-run sandbox.
 
 ### 5.2 The filesystem the sandbox sees
 
@@ -350,7 +371,10 @@ error. Getting to a green real-nsjail run required:
 - Remove invalid fields `chroot`, `chroot_base`, `disable_proc`, `proc_path`;
   use `mount_proc: false`.
 - `use_cgroupv2: true` is required for the unified cgroup hierarchy on modern
-  hosts; `cgroup_mem_max` is in **bytes**.
+  hosts; `cgroup_mem_max` is in **bytes**, but **`rlimit_as`/`rlimit_fsize` are
+  in megabytes** (a subtle unit mismatch that is now covered by a test).
+- cgroup v2 is only usable when the container is started with
+  `--cgroupns=host`; otherwise nsjail aborts before `execve`.
 - `uidmap`/`gidmap` `inside_id`/`outside_id` must be quoted **strings**.
 - The seccomp policy string format is `KILL { sys1, sys2 }\nDEFAULT ALLOW` (no
   `POLICY`/`USE` wrapper); libseccomp knows `umount` not `umount2`, and not
@@ -358,7 +382,9 @@ error. Getting to a green real-nsjail run required:
 - `exec_bin.path` goes straight to `execve` — **no PATH lookup** — so argv[0]
   is resolved to an absolute path on the host first (valid inside because the
   host `/usr`,`/bin` are bind-mounted at identical paths).
-- nsjail's own stderr noise is suppressed with `--really_quiet`.
+- nsjail's own diagnostics are routed to a dedicated log fd (3) so a setup or
+  launch failure is captured separately from the child's stdout/stderr and
+  surfaced as `503 unavailable` instead of a silent exit 255.
 
 These findings are encoded in the template and `internal/executor/nsjail.go`.
 
@@ -546,12 +572,19 @@ workspace. It therefore requires one of:
 2. a **setuid** nsjail binary, or
 3. a **privileged container**.
 
+In addition, cgroup v2 ceilings (memory, pids, cpu) require the container to run
+with **`--cgroupns=host`** so nsjail can write the host cgroup subtree. Without
+it nsjail aborts before `execve`; the service reports `cgroups:false` on
+`/readyz` and returns `503 unavailable` (naming the nsjail diagnostic) for every
+execution.
+
 ```mermaid
 flowchart TD
     Q([Where will you run sandboxd?])
-    Q --> A["Bare host, root\n✅ works"]
+    Q --> A["Bare host, root\n✅ works (add --cgroupns=host if containerised)"]
     Q --> B["Bare host, unprivileged\n⚠️ fails at uid_map if\napparmor_restrict_unprivileged_userns=1\nor no CAP_SYS_ADMIN"]
     Q --> C["docker --privileged --cgroupns=host\n✅ works (used for E2E)"]
+    Q --> D["docker --privileged (no --cgroupns=host)\n❌ nsjail aborts before execve\ncgroup ceilings absent"]
 ```
 
 Observed on Ubuntu Noble (kernel 7.0, Go 1.26.8): with
@@ -565,8 +598,8 @@ docker run --rm --privileged --cgroupns=host -p 8080:8080 \
   ./bin/sandboxd --config config.yaml
 ```
 
-This is a **host restriction, not a sandboxd bug**; `/readyz` will accurately
-report readiness as long as the data dir is writable and nsjail is found.
+This is a **host restriction, not a sandboxd bug**. `/readyz` reports `nsjail`
+and `cgroups` separately so an operator can tell which requirement is missing.
 
 ---
 
@@ -593,8 +626,10 @@ real-nsjail acceptance transcript:
 | network egress | `NET_BLOCKED: OSError` | net namespace isolates |
 | `/etc/shadow` | `FileNotFoundError` | not mounted |
 | `mount(2)`/`ptrace` | exit **159** (SIGSYS) | seccomp kills it |
+| memory ceiling (`RLIMIT_AS`) | `AS_LIMIT_MB 512`, 1 GiB alloc denied | rlimit unit fix holds |
 | fork bomb | `FORKED 191` then `BlockingIOError` | cgroup pids limit |
 | stop long run | status `killed`, no orphan | process-group kill |
+| launch failure (no `--cgroupns=host`) | 503 + nsjail diagnostic | failure is explicit |
 
 `scripts/acceptance.sh` deliberately **refuses to run against the test stub**:
 set `NSJAIL=/usr/local/bin/nsjail` and it will verify the binary is real.
@@ -607,12 +642,16 @@ Deferred to v0.1 (documented, not bugs):
 
 - **SSE log streaming** — v0.0.5 polls logs with `offset`/`limit`.
 - **Multi-node storage / sharding** — storage is a local filesystem.
-- **Dynamic/DB authentication** — keys are static in config.
+- **Dynamic/DB authentication** — keys are static in config (bearer auth itself
+  is exercised by `TestAuth*`).
 - **Per-UID-per-workspace isolation** — v0.0.5 uses a shared `sandbox` UID/GID
   with per-run user namespaces + cgroups.
 - **Kernel-enforced per-run disk quota** — disk is accounted on the file API
   path and rechecked with `du`; the sandbox process is bounded by `rlimit_fsize`
-  per file, not a total per-tree quota.
+  per file (now correctly in MB), not a total per-tree quota.
+- **Process ceiling** — `RLIMIT_NPROC` does not bind for the root-run sandbox;
+  the ceiling is provided by `cgroup_pids_max`, hence cgroup v2
+  (`--cgroupns=host`) is mandatory.
 - **Bare-host unprivileged operation** — blocked by AppArmor unprivileged-userns
   restrictions on some kernels; run as root / setuid / privileged container.
 
@@ -620,10 +659,11 @@ Deferred to v0.1 (documented, not bugs):
 
 ## 13. Decision index
 
-The 17 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
+The 24 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
 including the isolation model, network default-off, retention (100 runs),
 exec-vs-runs split, disk-quota strategy, caps, path safety, process kill, error
-envelope, ULID IDs, and health-probe semantics.
+envelope, ULID IDs, health-probe semantics, the cgroup/rlimit/env/lifecycle
+corrections, and run recovery.
 
 ---
 

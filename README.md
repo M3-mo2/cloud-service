@@ -37,7 +37,11 @@ make integration # tests that require a real nsjail binary (//go:build integrati
 ```
 
 Acceptance evidence lives in [docs/VERIFICATION.md](docs/VERIFICATION.md). The
-end-to-end HTTP transcript can be reproduced with `scripts/acceptance.sh`.
+end-to-end HTTP transcript is an **asserting** test: `scripts/acceptance.sh`
+compares every step against its expected value and exits non-zero on any
+mismatch. It requires a server backed by real nsjail inside a container started
+with `--privileged --cgroupns=host`. `make acceptance` builds the official image
+and runs it.
 
 ## Requirements
 
@@ -67,9 +71,15 @@ The sandbox user needs no home directory; the workspace is bind-mounted at `/wor
 
 ### Host requirements for nsjail
 
-nsjail needs to create user/mount/pid namespaces, mount cgroup v2, and chown the
-workspace. Run the service either as **root**, with nsjail setuid, or inside a
-privileged container. On hosts that restrict unprivileged user namespaces
+nsjail needs to create user/mount/pid namespaces and write the cgroup v2 subtree.
+Run the service either as **root**, with nsjail setuid, or inside a container
+started with `--privileged` (or `--cap-add=SYS_ADMIN`) **and `--cgroupns=host`**.
+`--cgroupns=host` is required: nsjail applies the memory/pids/cpu ceilings through
+cgroup v2, and without it nsjail aborts before `execve`. In that case `/readyz`
+reports `"cgroups":false` and every execution returns `503 unavailable` with
+nsjail's diagnostic — it is never reported as a successful run.
+
+On hosts that restrict unprivileged user namespaces
 (`kernel.apparmor_restrict_unprivileged_userns=1`, common on Ubuntu 24.04) and
 without `CAP_SYS_ADMIN`, nsjail fails at `uid_map`. A working local/e2e setup:
 
@@ -77,6 +87,14 @@ without `CAP_SYS_ADMIN`, nsjail fails at `uid_map`. A working local/e2e setup:
 docker run --rm --privileged --cgroupns=host -p 8080:8080 \
   -v "$PWD":/src -w /src ubuntu:24.04 \
   ./bin/sandboxd --config config.yaml
+```
+
+The `Dockerfile` builds nsjail from source (it is not packaged in Ubuntu/Debian)
+and is the recommended runtime image:
+
+```sh
+docker build -t sandboxd .
+docker run --rm --privileged --cgroupns=host -p 8080:8080 sandboxd
 ```
 
 The executor maps the sandbox identity by privilege level: as root it maps

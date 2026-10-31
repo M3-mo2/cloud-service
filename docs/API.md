@@ -33,7 +33,9 @@ The machine-readable contract is [api/openapi.yaml](../api/openapi.yaml).
 curl -s localhost:8080/healthz
 
 curl -s localhost:8080/readyz
-# {"status":"ready","nsjail":true,"data_dir":true}  (or 503 when nsjail is absent)
+# {"status":"ready","nsjail":true,"cgroups":true,"data_dir":true}
+# (503 when nsjail is absent or cgroup v2 is unusable -- the latter means the
+#  container was not started with --cgroupns=host)
 
 curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/meta
 # {"version":"0.0.5","api_version":"v1","runtimes":["python3"],"limits_defaults":{...}}
@@ -119,6 +121,13 @@ curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 ```
 
 Hard cap: 60 s. stdout/stderr are each capped at 256 KB (`truncated:true` when hit).
+`cwd` is relative to the workspace root (mounted at `/workspace`); it defaults to
+the root and is rejected with 422 if it would escape. `env` is filtered through a
+name allowlist (loader-injection names such as `LD_PRELOAD` are dropped).
+
+If the sandbox cannot be set up (e.g. nsjail cannot apply cgroup v2 because the
+container was not started with `--cgroupns=host`), exec returns
+`503 unavailable` and the body's `details.nsjail` carries nsjail's diagnostic.
 
 ## Runs (asynchronous)
 
@@ -137,7 +146,9 @@ RUN=run_REPLACE_ME
 
 # Poll status
 curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/workspaces/$WS/runs/$RUN
-# status progresses queued -> running -> exited|killed|timeout|failed
+# status progresses queued -> running -> exited|killed|timeout|failed|interrupted
+# (interrupted = the run was still recorded as queued/running after a restart;
+#  it is moved to interrupted on startup, since no process survives a restart)
 
 # Poll logs (byte-offset based)
 curl -s -H "Authorization: Bearer $KEY" \

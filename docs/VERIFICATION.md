@@ -1,25 +1,32 @@
 # Verification
 
 Results for sandboxd v0.0.5 against the acceptance criteria in the spec.
-Environment: Ubuntu Noble x86_64, kernel 7.0.0-38-generic, Go 1.26.8, real
-`nsjail` binary at `/usr/local/bin/nsjail`.
 
-The transcript below was produced against **real nsjail** (not the test stub).
-The host restricts unprivileged user namespaces
-(`kernel.apparmor_restrict_unprivileged_userns = 1`) and the orchestrator runs
-without `CAP_SYS_ADMIN`, so nsjail cannot create its namespaces on the bare
-host. The server is therefore run inside a `docker run --privileged
---cgroupns=host` container; `scripts/acceptance.sh` refuses to run unless
-`NSJAIL` points at the real binary (it rejects the stub script). The isolation
-steps (20–24) below are only meaningful under real nsjail and are what prove the
-sandbox actually contains the process.
+Environment:
+
+- Host: Ubuntu 26.04 x86_64, kernel `7.1.8-zabbly+`, orchestrator unprivileged
+  (`CapEff=0`, `kernel.apparmor_restrict_unprivileged_userns=1`).
+- nsjail: real binary, `sha256 91e2049e…b680c6` (`/usr/local/bin/nsjail`).
+- Go: `go1.26.8 linux/amd64`.
+- Runtime container: `ubuntu:24.04`, started `--privileged --cgroupns=host`.
+
+The transcript below was produced against **real nsjail** (not the test stub)
+inside a `docker run --privileged --cgroupns=host` container. `--cgroupns=host`
+is required for cgroup v2 ceilings; `scripts/acceptance.sh` refuses to run unless
+`NSJAIL` points at the real binary (it rejects the stub script) and `/readyz`
+reports `"cgroups":true`.
+
+> History: an earlier revision of this document presented a non-asserting
+> transcript as evidence while executions were in fact failing. `acceptance.sh`
+> is now a real test (it exits non-zero on any mismatch) and the results below
+> are copied from a run where every assertion passed.
 
 ## 1. Build and tests
 
 ```
+$ gofmt -l .              # empty
 $ go build ./...          # exit 0
 $ go vet ./...            # exit 0
-$ gofmt -l .              # empty
 $ go test ./... -race     # exit 0
 ok  	sandboxd/internal/api
 ok  	sandboxd/internal/auth
@@ -52,117 +59,108 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: 111 (109 unit + 2 `integration`-tagged).
+Test functions: 119 (117 unit + 2 `integration`-tagged), including regression
+tests for the findings below (`TestRenderConfigRlimitUnits`,
+`TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
+`TestRecoverRuns`, `TestCreateRunFileValidatesPath`).
 
 ## 2. Probes
 
 - `GET /healthz` → 200 `{"status":"ok"}` always while the process is alive.
-- `GET /readyz` → 200 when the data directory is writable **and** nsjail is
-  found; 503 `{"status":"not_ready","nsjail":false,"data_dir":true}` otherwise.
-  Verified by `TestReadyzReportsNotReadyWithoutNsjail` and
-  `TestReadyzReadyWithNsjail`.
+- `GET /readyz` → 200 only when the data directory is writable, nsjail is found,
+  **and** cgroup v2 is usable (`--cgroupns=host`):
+  503 `{"status":"not_ready","nsjail":true,"cgroups":false,"data_dir":true}`
+  otherwise. Verified by `TestReadyzReportsNotReadyWithoutNsjail` and
+  `TestReadyzReportsNotReadyWithoutCgroups`.
 
-## 3. Full lifecycle transcript
+## 3. Full lifecycle transcript (asserting)
 
-Reproduce against a real-nsjail server:
+Reproduce against a real-nsjail server (`make acceptance` builds the official
+image and runs this):
 
 ```sh
-BASE=http://localhost:8080 CONTAINER=sandboxd-e2e \
-  NSJAIL=/usr/local/bin/nsjail bash scripts/acceptance.sh
+BASE=http://127.0.0.1:8099 KEY=dev-key-please-rotate OTHER_KEY=other-key \
+  DATA_DIR=/data NSJAIL=/usr/local/bin/nsjail bash scripts/acceptance.sh
 ```
 
 ```
 ### 0. environment
-base=http://localhost:8080 data_dir=<unset>
-server readyz:
-{"data_dir":true,"nsjail":true,"status":"ready"}
-
+base=http://127.0.0.1:8099 data_dir=/data
+ok   readyz.status                ready
+ok   readyz.nsjail                True
 ### 1. healthz
-{"status":"ok"}
+ok   healthz.status               ok
+### 2. meta
+ok   meta.version                 0.0.5
+### 3. create workspace
+workspace id: ws_01M69M8Y86VCFBX9291SA7ZWHY
+### 4. mkdir /src
+ok   mkdir.src                    201
+### 5. PUT /main.py
+ok   put.main.py                  204
+### 6. upload /uploaded.py (multipart)
+ok   upload.status                201
+### 7. read /main.py (meta)
+ok   read.main.py                 0ca9091eb4e31fb1ab24c8c5de92a08e4e5f402919f82ea3ca784f38534f03f3
+### 8. exec (sync) -- a successful execution
+ok   exec.exit_code               0
+ok   exec.stdout                  hi
+### 9. cwd is honored
+ok   exec.cwd                     /workspace/src
+### 10. start run (file)
+run id: run_01M69M8YFKZ2V4XDX5GFXSV2ZV
+ok   run.status                   exited
+ok   run.logs.stdout              hi
+### 11. security: traversal rejected (expect 422)
+ok   traversal.read               422
+ok   traversal.write              422
+ok   traversal.delete             422
+### 12. security: auth and ownership
+ok   auth.missing                 401
+ok   auth.cross_owner             403
+### 13. security: oversized JSON body (expect 413)
+ok   body.too_large               413
+### 14. security: symlink escape (expect 422)
+ok   symlink.escape               422
+### 15. isolation: network egress blocked
+ok   net.blocked                  contains NET_BLOCKED
+ok   net.exit_code                0
+### 16. isolation: /etc/shadow not reachable
+ok   shadow.denied                SHADOW_DENIED: FileNotFoundError
+### 17. isolation: mount(2)/ptrace killed by seccomp (SIGSYS=159)
+ok   seccomp.mount                159
+### 18. isolation: fork bomb limited by cgroup pids.max
+ok   cgroup.fork_limit            contains FORK_LIMITED
+### 19. resource ceiling: memory limit enforced
+ok   rlimit.memory                contains MEMORY_DENIED
+### 20. stop long run kills process group
+ok   stop.run_status              killed
+ok   stop.no_survivors            0
+### 21. delete workspace (expect 204) and get after delete (expect 404)
+ok   delete.workspace             204
+ok   get.after_delete             404
 
-### 2. readyz
-{"data_dir":true,"nsjail":true,"status":"ready"}
-
-### 3. meta
-{"api_version":"v1","limits_defaults":{"allow_net":false,"cpu_cores":1,"disk_mb":1024,"max_runs":3,"max_wall_time_sec":300,"memory_mb":512},"runtimes":["python3"],"version":"0.0.5"}
-
-### 4. create workspace
-workspace id: ws_01M68XWAP48NHSSX4FCRBNGJVK
-### 5. mkdir /src
-{"path":"/src"}
-
-### 6. PUT /main.py
-status=204
-### 7. upload /uploaded.py (multipart)
-{"name":"tmp.SObRuGNr8w","path":"/uploaded.py","size":18}
-
-### 8. list /
-{
-    "entries": [
-        {"name": "main.py", "path": "/main.py", "type": "file", "size": 12, "mod_time": "2026-10-31T12:10:18Z"},
-        {"name": "src", "path": "/src", "type": "dir", "size": 40, "mod_time": "2026-10-31T12:10:18Z"},
-        {"name": "uploaded.py", "path": "/uploaded.py", "type": "file", "size": 18, "mod_time": "2026-10-31T12:10:18Z"}
-    ]
-}
-### 9. read /main.py (meta)
-{"content":"print(\"hi\")\n","content_type":"text/x-python; charset=utf-8","encoding":"text","path":"/main.py","sha256":"0ca9091eb4e31fb1ab24c8c5de92a08e4e5f402919f82ea3ca784f38534f03f3","size":12,"truncated":false}
-
-### 10. exec (sync)
-{"duration_ms":36,"exit_code":0,"stderr":"","stdout":"hi\n","truncated":false}
-
-### 11. start run (file)
-run id: run_01M68XWAXE5H4JKA4T3ZP56H8M
-### 12. run status
-{"run":{"id":"run_01M68XWAXE5H4JKA4T3ZP56H8M","workspace_id":"ws_01M68XWAP48NHSSX4FCRBNGJVK","kind":"file","argv":["python3","main.py"],"status":"exited","exit_code":0,"started_at":"2026-10-31T12:10:18Z","ended_at":"2026-10-31T12:10:18Z","logs":{"stdout_bytes":3,"stderr_bytes":0,"truncated":false}}}
-
-### 13. run logs stdout
-{"data":"hi\n","eof":true,"next":3,"offset":0,"truncated":false}
-
-### 14. security: traversal read (expect 422)
-status=422
-### 15. security: traversal write (expect 422)
-status=422
-### 16. security: traversal delete (expect 422)
-status=422
-### 17. security: missing token (expect 401)
-status=401
-### 18. security: cross-owner (expect 403)
-status=403
-### 19. security: oversized JSON body (expect 413)
-status=413
-### 19b. security: symlink escape (expect 422)
-status=422
-### 20. real isolation: network egress blocked (allow_net=false)
-{"duration_ms":47,"exit_code":0,"stderr":"","stdout":"NET_BLOCKED: OSError\n","truncated":false}
-
-### 21. real isolation: /etc/shadow denied
-{"duration_ms":33,"exit_code":0,"stderr":"","stdout":"SHADOW_DENIED: FileNotFoundError\n","truncated":false}
-
-### 22. real isolation: mount(2) / ptrace denied
-{"duration_ms":203,"exit_code":159,"stderr":"","stdout":"","truncated":false}
-
-### 23. real isolation: fork bomb limited by cgroup pids.max
-{"duration_ms":76,"exit_code":0,"stderr":"","stdout":"FORK_LIMITED: BlockingIOError\nFORKED 191\n","truncated":false}
-
-### 24. stop long run kills process group
-processes before stop:
-486 /usr/bin/python3 long.py
-run status after stop:
-killed
-processes after stop (expect none):
-(none)
-### 25. delete workspace (expect 204)
-status=204
-### 26. get after delete (expect 404)
-status=404
+passed=30 failed=0
 ```
 
-The run's stdout contained `hi`, the status reached `exited` with exit code 0,
-polling the logs returned `hi\n`, a long run was stopped and reached `killed`,
-and deleting the workspace removed its directory tree. Steps 20–24 are the
-real-isolation evidence: network egress fails, `/etc/shadow` is unreachable,
-`mount(2)`/`ptrace` are killed by seccomp, the fork bomb is stopped by the
-cgroup pids limit, and the process group is reaped on stop.
+Every step asserts on content, not merely on the absence of a crash: a
+successful execution must print `hi` with exit code 0, the network probe must
+report `NET_BLOCKED`, the seccomp probe must exit `159`, the fork bomb must
+report `FORK_LIMITED`, and the memory probe must report `MEMORY_DENIED`.
+
+### Resource-ceiling evidence
+
+Raw introspection through the API with declared `memory_mb=512`,
+`disk_mb=1024`, `max_runs=3` (`cgroup_pids_max = 3 * 64 = 192`):
+
+```
+$ curl … -d '{"cmd":["python3","lim.py"]}' …/exec     # lim.py prints getrlimit
+AS_LIMIT_MB 512                                        # was 512 TiB before the unit fix
+
+$ curl … -d '{"cmd":["python3","f.py"]}' …/exec       # f.py attempts 500 live forks
+FORK_LIMITED BlockingIOError
+FORKED 191                                             # stopped at the cgroup pids ceiling
+```
 
 ## 4. Security rejections
 
@@ -179,37 +177,48 @@ above:
 | missing/bad token | 401 `unauthorized` |
 | cross-owner access | 403 `forbidden` |
 | oversized (>1 MB) JSON body | 413 `payload_too_large` |
+| `kind=file` with `../../etc/passwd` | 422 `unprocessable` |
+| `kind=file` with a missing file | 404 `not_found` |
+| `cwd` escaping the workspace | 422 `unprocessable` |
+| user env var not on the allowlist (`LD_PRELOAD`, …) | dropped silently |
+| sandbox launch failure (no `--cgroupns=host`) | 503 `unavailable` + nsjail diagnostic |
 
 ## 5. Process-group kill
 
 `exec.Cmd` starts with `SysProcAttr{Setpgid: true}`. `stop` and timeout send
 `SIGTERM` to `-pgid`, wait the configured grace (3 s), then `SIGKILL` to
 `-pgid`. `TestKillProcessGroupReal` starts a real `sleep` in its own group,
-kills it, and asserts a signalled exit. The transcript (step 24) shows
-`python3 long.py` present before stop and absent after:
-
-```
-processes before stop:
-486 /usr/bin/python3 long.py
-run status after stop:
-killed
-processes after stop (expect none):
-(none)
-```
+kills it, and asserts a signalled exit. The transcript (step 20) shows the run
+reaches `killed` and no `long.py` process survives stop.
 
 Reproduce the process check manually (inside the nsjail container the process
 runs in):
 
 ```sh
-docker exec sandboxd-e2e pgrep -af 'long.py|nsjail'
+docker exec <container> pgrep -af 'long.py|nsjail'
 ```
 
-## 6. Decisions
+## 6. Sandbox launch failure is explicit
 
-`docs/DECISIONS.md` contains all 17 resolved decisions, each with a one-line
+Without `--cgroupns=host`, cgroup v2 is not usable and nsjail aborts before
+`execve`. This is surfaced explicitly rather than as a silent exit 255:
+
+```
+$ curl -s -o body -w 'HTTP %{http_code}\n' -d '{"cmd":["python3","-c","print(1)"]}' …/exec
+HTTP 503
+{"error":{"code":"unavailable","message":"sandbox unavailable: nsjail could not set up or launch the sandbox",
+ "details":{"nsjail":"[E]… main():380 Couldn't setup parent cgroup (cgroupv2)"}}}
+```
+
+For async runs the run is recorded `failed` and the nsjail diagnostic is written
+to the run's stderr log.
+
+## 7. Decisions
+
+`docs/DECISIONS.md` contains all 24 resolved decisions, each with a one-line
 rationale, plus implementation defaults.
 
-## 7. OpenAPI
+## 8. OpenAPI
 
 `api/openapi.yaml` validates as OpenAPI 3.1:
 
@@ -221,7 +230,7 @@ You have 9 warnings.          # operation-4xx-response on unauthenticated probes
 
 All paths, methods, request/response schemas, and error codes are described.
 
-## 8. Git
+## 9. Git
 
 `git log --oneline` shows the milestone commits; `git status` is clean.
 
@@ -229,14 +238,18 @@ All paths, methods, request/response schemas, and error codes are described.
 
 - SSE log streaming is deferred to v0.1; logs are polled with `offset`/`limit`.
 - Multi-node storage is deferred; storage is local filesystem JSON.
-- DB-backed/dynamic authentication is deferred; keys are static in the config.
+- DB-backed/dynamic authentication is deferred; keys are static in the config
+  (bearer auth itself is exercised by `TestAuth*`).
 - Per-UID-per-workspace isolation is deferred to v0.1 (v0.0.5 uses a shared
   `sandbox` UID/GID with per-run user namespaces and cgroups).
-- Disk quota is advisory to the sandboxed process (enforced on the file API
-  path and via rlimit/`du` rechecks), not by the kernel per process tree.
-- Real nsjail needs namespace/cgroup privileges. On this host
-  (`kernel.apparmor_restrict_unprivileged_userns=1` with no `CAP_SYS_ADMIN`)
-  the bare-host run fails writing `uid_map`; this is a host restriction, not a
-  bug in sandboxd. Verification therefore runs the service in a privileged
-  container. On a normal deployment run as root / setuid nsjail / privileged
-  container.
+- `rlimit_fsize` bounds a single file, and `disk_mb` is enforced on the file API
+  path and via a `du` recheck on workspace load; it is not enforced by the
+  kernel against the sandboxed process tree.
+- `RLIMIT_NPROC` does not bind for the root-run sandbox; the process ceiling is
+  therefore provided by `cgroup_pids_max`, which is why `--cgroupns=host` is a
+  hard requirement.
+- Real nsjail needs namespace/cgroup privileges. On hosts with
+  `kernel.apparmor_restrict_unprivileged_userns=1` and no `CAP_SYS_ADMIN` the
+  bare-host run fails writing `uid_map`; this is a host restriction, not a bug in
+  sandboxd. Verification therefore runs the service in a privileged container
+  with `--cgroupns=host`.

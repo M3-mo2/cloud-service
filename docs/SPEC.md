@@ -30,7 +30,7 @@ execution backend exposed over HTTP/JSON.
 
 ## 1. RESOLVED DECISIONS
 
-See [DECISIONS.md](DECISIONS.md) for the 17 resolved decisions with rationale.
+See [DECISIONS.md](DECISIONS.md) for the 24 resolved decisions with rationale.
 
 ## 2. FEATURE SPEC
 
@@ -120,7 +120,8 @@ config template `configs/nsjail_python.cfg.tmpl` must include:
   `/bin`, `/etc/alternatives`, `/etc/ssl/certs`, and the Python runtime;
   `--bindmount` workspace at `/workspace`; `--cwd /workspace`
 - cgroups: memory = `limits.memory_mb`, pids = `max_runs * 64`, cpu derived from `cpu_cores`
-- rlimits: nproc, fsize (disk_mb), as (memory_mb)
+  (applied via cgroup v2; requires the container to run with `--cgroupns=host`)
+- rlimits: nproc, fsize (disk_mb), as (memory_mb) — nsjail interprets `as`/`fsize` in **megabytes**
 - `--time_limit` = timeout
 - `--user sandbox --group sandbox` (create on host if missing; document in README)
 - `--seccomp_string` baseline deny: `mount`, `umount2`, `ptrace`, `bpf`,
@@ -128,7 +129,10 @@ config template `configs/nsjail_python.cfg.tmpl` must include:
   `setns`, `unshare`, `clone3` if problems — but allow `clone`/`clone3` with
   restrictions; default to documented safe list
 - `--disable_proc` (or read-only `/proc`)
-- `--env` passthrough for user-provided env only; strip sensitive host vars
+- `--env` filtered to an allowlist for user-provided env only
+  (`PYTHONPATH`, `PYTHONUNBUFFERED`, `PYTHONDONTWRITEBYTECODE`, `PYTHONHASHSEED`,
+  `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`); loader-injection names such as
+  `LD_PRELOAD`/`LD_LIBRARY_PATH`/`DYLD_*`/`GLIBC_TUNABLES` are rejected
 
 If nsjail binary is absent, executor returns `ErrNsjailUnavailable` (mapped to
 503 `unavailable`). `/readyz` reflects this. Tests must NOT require nsjail; use
