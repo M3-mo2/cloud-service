@@ -349,6 +349,14 @@ func (s *Service) InstallPackages(w *model.Workspace, reqs []string) (InstallRes
 		SharedPackagesDir:  sharedHost,
 		PrivatePackagesDir: privateHost,
 	}
+	// Install inside the workspace's own network. A pip install needs egress to
+	// reach the package index; an allow_net:false workspace gets an empty
+	// namespace and the install fails honestly (reported through exit_code),
+	// never through a host-network share.
+	req, err = s.ApplyNetwork(w, req)
+	if err != nil {
+		return InstallResult{}, err
+	}
 	start := time.Now()
 	res, err := s.runner.Run(req)
 	if err != nil {

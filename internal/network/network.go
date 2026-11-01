@@ -455,7 +455,10 @@ func (m *Manager) killOurSlirps() {
 	}
 }
 
-// Stop closes every inner slirp and the relay (graceful shutdown).
+// Stop closes every inner slirp and the relay, tears every workspace namespace
+// and the relay namespace down, and stops every tunnel (graceful shutdown). On
+// return no engine-owned namespace or process remains, so a clean stop leaves
+// the host exactly as it was.
 func (m *Manager) Stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -472,6 +475,26 @@ func (m *Manager) Stop() {
 		m.relayCmd = nil
 	}
 	m.relayApplied = false
+	// Tear down EVERY engine-owned namespace under NetnsDir, not only those
+	// that had an inner slirp: an allow_net:false workspace has an empty
+	// namespace with no slirp process, and it must not be left behind either.
+	m.destroyOwnedNamespacesLocked()
+	m.applied = map[string]bool{}
+	m.alloc.reset()
+}
+
+// destroyOwnedNamespacesLocked removes every workspace namespace this package
+// owns plus the relay namespace. The caller holds m.mu.
+func (m *Manager) destroyOwnedNamespacesLocked() {
+	entries, err := os.ReadDir(m.cfg.NetnsDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), netnsNamePrefix) || e.Name() == m.cfg.RelayNetns {
+			m.destroyNetns(e.Name())
+		}
+	}
 }
 
 // wsNetnsName returns the namespace name for a workspace.
