@@ -1,7 +1,6 @@
 package service
 
 import (
-	"sort"
 	"time"
 
 	"sandboxd/internal/config"
@@ -137,17 +136,4 @@ func (s *Service) ReleaseWorkspaceNetwork(wsID string) {
 	if s.net != nil {
 		s.net.ReleaseWorkspace(wsID)
 	}
-}
-
-// envSlice converts a map to sorted KEY=VALUE entries for the nsjail template.
-func envSlice(m map[string]string) []string {
-	if len(m) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(m))
-	for k, v := range m {
-		out = append(out, k+"="+v)
-	}
-	sort.Strings(out)
-	return out
 }

@@ -50,17 +50,7 @@ type ManagerConfig struct {
 	Tunnels config.TunnelsConfig
 }
 
-// DefaultManagerConfig returns the measured-safe defaults for this host.
-func DefaultManagerConfig(net config.NetworkConfig, tunnels config.TunnelsConfig) ManagerConfig {
-	return ManagerConfig{
-		WorkspaceSubnet: mustPrefix("10.201.0.0/16"),
-		NetnsDir:        "/run/netns",
-		RelayNetns:      "sbxdrelay",
-		Network:         net,
-		Tunnels:         tunnels,
-	}
-}
-
+// mustPrefix parses a CIDR constant; a malformed one is a programming error.
 func mustPrefix(s string) netip.Prefix {
 	p, err := netip.ParsePrefix(s)
 	if err != nil {
