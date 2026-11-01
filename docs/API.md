@@ -81,6 +81,8 @@ additional code the router emits:
 | `forbidden` | 403 | Resource belongs to another principal | Valid key, `owner_id` mismatch. |
 | `not_found` | 404 | Resource missing | Unknown workspace/run/file, unknown route. |
 | `conflict` | 409 | Operation conflicts with current state | Purging run history (or deleting one run) while a run is still queued/running. |
+| `tunnels_disabled` | 422 | Quick tunnels forbidden | `POST .../tunnels` when `tunnels.enabled` is false (`details.config:"tunnels.enabled"`), the workspace has not opted in (`limits.allow_tunnels`), or the workspace has no egress (`limits.allow_net`), which cloudflared needs. |
+| `too_many_tunnels` | 422 | Per-workspace tunnel cap reached | `POST .../tunnels` when `tunnels.max_per_workspace` active tunnels already exist. |
 | `workspace_suspended` | 409 | Work refused because the workspace is suspended | `POST .../exec`, `POST .../runs`, `POST .../sessions` or a session sub-resource on a `suspended` workspace. |
 | `too_many_sessions` | 409 | Per-workspace concurrent-session cap reached | `POST .../sessions` when `sessions.max_per_workspace` is already in use. |
 | `session_ended` | 409 | Operation on a terminal session | `input`/`signal`/`resize` (or `output` after `DELETE`) on a session that has ended; the workspace check wins while suspended. |
@@ -90,7 +92,8 @@ additional code the router emits:
 | `payload_too_large` | 413 | Body or file over a hard cap | JSON body > `json_body_mb`, upload > `upload_mb`, file write > `file_write_mb`, a `GET /files/content` `limit` above `file_read_mb`. |
 | `insufficient_storage` | 507 | Workspace disk quota exceeded | Write/upload/rename past `limits.disk_mb`. |
 | `timeout` | 504 | Timeout | **Defined but never emitted** (see discrepancies). |
-| `unavailable` | 503 | Sandbox backend unavailable | nsjail binary missing, or nsjail could not set up/launch the sandbox (`details.nsjail`). |
+| `tunnel_url_unavailable` | 504 | No public URL was observed in time | `POST .../tunnels` when cloudflared did not print a `trycloudflare.com` URL within `tunnels.url_timeout_sec`. The engine never fabricates a URL. |
+| `unavailable` | 503 | Sandbox backend unavailable | nsjail binary missing, or nsjail could not set up/launch the sandbox (`details.nsjail`); also when the network/tunnel layer is not configured. |
 | `internal` | 500 | Unexpected server error | Bugs and genuinely unmapped conditions. |
 
 Note the code is not always a 1:1 mirror of the status: a **405 method not
@@ -188,12 +191,19 @@ default per-workspace limits.
     "limits_defaults": {
       "cpu_cores": 1, "memory_mb": 512, "disk_mb": 1024,
       "max_wall_time_sec": 300, "max_runs": 3, "allow_net": false,
-      "allow_unlimited_runs": false
+      "allow_unlimited_runs": false, "allow_tunnels": false
     },
     "limits_maxima": {
       "cpu_cores": 8, "memory_mb": 8192, "disk_mb": 51200,
       "max_wall_time_sec": 3600, "max_runs": 64, "allow_net": true,
       "allow_unlimited_runs": false
+    },
+    "network": {
+      "enabled": false, "available": true, "ready": true, "egress": false
+    },
+    "tunnels": {
+      "enabled": false, "ready": false,
+      "max_per_workspace": 2, "url_timeout_sec": 45, "reason": "tunnels.enabled is false"
     }
   }
   ```
@@ -205,6 +215,10 @@ default per-workspace limits.
   `kind:file` run may use (see [File execution and interpreters](#file-execution-and-interpreters));
   `runnable_extensions` is the file extensions those interpreters cover, which
   is exactly what a file's `runnable` field (from `stat`/listing) reports.
+  `network` and `tunnels` report the egress/tunnel capabilities **truthfully**:
+  `enabled` is the server switch, `ready` is whether the layer can actually
+  serve, and `reason` explains a `ready:false`. `network.egress` is true only
+  when the chained-slirp4netns egress fabric is configured on.
 
 ```sh
 KEY=dev-key-please-rotate
@@ -232,8 +246,9 @@ Create a workspace owned by the authenticated principal.
   | `disk_mb` | `int` | `disk_mb` | disk quota |
   | `max_wall_time_sec` | `int` | `max_wall_time_sec` | async run ceiling |
   | `max_runs` | `int` | `max_runs` | maps to cgroup pids max = value × 64 |
-  | `allow_net` | `bool` | `allow_net` | `false` (no network) or `true` |
+  | `allow_net` | `bool` | `allow_net` | `false` (own empty namespace, no egress) or `true` (egress via chained slirp4netns) |
   | `allow_unlimited_runs` | `bool` | `allow_unlimited_runs` | workspace opt-in for wall-clock-unbounded runs; `false` by default; a `true` value is rejected with `422` unless the server `max_limits.allow_unlimited_runs` is also `true` |
+  | `allow_tunnels` | `bool` | `allow_tunnels` | workspace opt-in for quick tunnels; `false` by default; a `true` value is rejected with `422` unless the server `tunnels.enabled` is also `true` |
 
   Unknown JSON fields are rejected (`400 validation`, `details.error`).
 - **Response 201:**
@@ -681,6 +696,76 @@ curl -s -X DELETE -H "Authorization: Bearer $KEY" \
   "localhost:8080/v1/workspaces/$WS/packages?all=true"
 # {"all":true,"removed":2}
 ```
+
+### POST /v1/workspaces/{workspaceID}/tunnels
+
+Expose one workspace port to the public internet with a **quick Cloudflare
+tunnel** (no account, no token). Returns the public URL captured from
+cloudflared's own output.
+
+- **Path parameter:** `workspaceID`.
+- **Request body:** `{"port": 5000}` — the port the workspace's app listens on
+  inside its own namespace. Required; must be `1024`–`65535` (privileged ports
+  cannot be bound by the unprivileged sandbox uid, so they are refused).
+- **Response 201:**
+
+  ```json
+  {"tunnel":{"id":"tun_01J...","workspace_id":"ws_01J...","port":5000,
+             "url":"https://random-words-here.trycloudflare.com",
+             "status":"active","created_at":"2026-01-02T15:04:05Z"}}
+  ```
+- **Errors:** 400 `validation` (missing/out-of-range/privileged `port`),
+  401, 403 `forbidden` (foreign workspace), 404 `not_found` (no such workspace),
+  409 `workspace_suspended`, 422 `tunnels_disabled` (server switch off, workspace
+  not opted in, or no `allow_net`), 422 `too_many_tunnels` (per-workspace cap),
+  503 `unavailable` (the tunnel/network layer is not configured),
+  **504 `tunnel_url_unavailable`** (cloudflared did not print a URL within
+  `tunnels.url_timeout_sec`).
+- **Semantics:** the URL is **only ever the one cloudflared printed**, captured
+  with a bounded wait; the engine never fabricates a URL. If none is observed
+  within the timeout the create fails with the machine-readable 504 and leaves
+  no record. The cloudflared process runs **inside the workspace's own
+  namespace** and reaches Cloudflare through the workspace's egress; a tunnel
+  therefore requires `limits.allow_net` as well as the two tunnel keys.
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"port":5000}' localhost:8080/v1/workspaces/$WS/tunnels
+# {"tunnel":{"id":"tun_...","url":"https://....trycloudflare.com","status":"active", ...}}
+```
+
+The user's own simplest path is the same mechanism: with a shell inside the
+workspace, `cloudflared tunnel --url http://localhost:5000` prints a working URL
+(cloudflared is on `PATH` in the sandbox). See
+[Quick tunnels and egress](#quick-tunnels-and-egress).
+
+### GET /v1/workspaces/{workspaceID}/tunnels
+
+List the workspace's tunnels.
+
+- **Response 200:** `{"tunnels":[ <tunnel>, ... ]}`, newest first. Each
+  tunnel's `status` is refreshed from the live cloudflared process: `active`
+  while it is running, `stopped` once it is gone.
+- **Errors:** 401, 403, 404.
+
+### GET /v1/workspaces/{workspaceID}/tunnels/{tunnelID}
+
+Fetch one tunnel.
+
+- **Response 200:** `{"tunnel": <tunnel>}`.
+- **Errors:** 401, 403, 404 `not_found` (unknown tunnel or workspace).
+
+### DELETE /v1/workspaces/{workspaceID}/tunnels/{tunnelID}
+
+Stop the tunnel's cloudflared process and remove the record. After it returns,
+the public URL no longer serves.
+
+- **Response 204:** empty body.
+- **Errors:** 401, 403, 404 `not_found`.
+- **Semantics:** idempotent in effect — the URL stops working; the record is
+  removed, so a second `DELETE` is `404`. A tunnel also dies with its workspace
+  (`stop`/`suspend`/`DELETE`) and with a service restart (orphaned cloudflared
+  processes are reaped at startup).
 
 ### Two-tier Python packages
 
@@ -1819,6 +1904,98 @@ curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 # {"run":{...,"unlimited":true,"timeout_sec":null,...}}
 ```
 
+## Quick tunnels and egress
+
+The operator's core need: a workspace has **normal outbound internet** (so
+`pip install` and `cloudflared` work inside it), and one command exposes one of
+its ports **to the public internet**.
+
+### Egress (`allow_net`) without host-network sharing
+
+An `allow_net:true` workspace gets **its own network namespace**, connected to
+the public internet only through **chained slirp4netns** instances:
+
+```
+workspace ns --slirp(UNIX socket)--> relay ns --slirp(UNIX socket)--> host
+```
+
+- The engine-owned **relay** namespace is connected to the host by one
+  slirp4netns instance; each workspace is connected to the relay by a second.
+- slirp4netns speaks to its parent over a **UNIX socket** and wires up a tap
+  interface only inside the child namespace, so this creates **zero host
+  interfaces, zero host routes and zero veth pairs**. The host's own topology is
+  byte-for-byte unchanged.
+- The relay installs a **blackhole route for every operator-private range**
+  (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`,
+  `100.64.0.0/10`), so a workspace reaches the **public internet and a public
+  resolver** but **never the host LAN, the host's own services, or another
+  workspace**.
+- The workspace's `/etc/resolv.conf` names **public resolvers**
+  (`network.resolver`, default `1.1.1.1`/`8.8.8.8`). The host's own resolver is
+  deliberately never published.
+- `allow_net:false` gets a private, **empty** namespace: no egress at all, and
+  never the host network. Both states are measured by
+  [`scripts/tunnel-check.sh`](../scripts/tunnel-check.sh).
+
+> **Recorded hazard.** The abandoned first design created host `veth` pairs,
+  addresses and routes, and took the target host off the network three times in
+  one evening. It is deleted from this tree; see
+  [DECISIONS.md](DECISIONS.md) (the host-topology ADR). No code path adds,
+  removes or renames a host interface, address or route.
+
+### Quick tunnels (one command → public URL)
+
+`POST .../tunnels {port:5000}` starts `cloudflared tunnel --url
+http://localhost:5000` **inside the workspace's namespace** and returns the
+`https://<name>.trycloudflare.com` URL cloudflared prints. Quick tunnels need no
+Cloudflare account and no token. The same binary is on `PATH` inside the sandbox,
+so the user can also run `cloudflared tunnel --url http://localhost:5000`
+themselves and get a working URL.
+
+- **Gated twice, default deny.** `tunnels.enabled` (server) **and**
+  `limits.allow_tunnels` (workspace) must both be true, **and** the workspace
+  must have `allow_net` (cloudflared needs egress). Otherwise `422
+  tunnels_disabled`, with `details.config` naming the refusing level.
+- **Never a fabricated URL.** The URL is captured from cloudflared's own output
+  with a bounded wait (`tunnels.url_timeout_sec`); if none is observed the
+  create fails with **504 `tunnel_url_unavailable`** and leaves no record.
+- **Tunnels die with their workspace.** `stop`, `suspend` and `DELETE` stop the
+  cloudflared process and drop the records; a restart reaps orphaned cloudflared
+  processes.
+
+```sh
+# enable (operator): network.enabled: true and tunnels.enabled: true
+# opt in and expose a port:
+curl -s -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"web","limits":{"allow_net":true,"allow_tunnels":true}}' \
+  localhost:8080/v1/workspaces
+
+# run the app, then expose it
+curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"kind":"command","argv":["python3","-m","http.server","5000","--bind","0.0.0.0"],"no_timeout":true}' \
+  localhost:8080/v1/workspaces/$WS/runs
+curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"port":5000}' localhost:8080/v1/workspaces/$WS/tunnels
+# {"tunnel":{"url":"https://....trycloudflare.com", ...}}
+# fetch that URL from anywhere; DELETE the tunnel to stop it.
+```
+
+### Configuration
+
+| Block | Key | Default | Meaning |
+|-------|-----|---------|---------|
+| `network:` | `enabled` | `false` | server switch for the egress fabric |
+| `network:` | `netns_dir` | `/run/netns` | where the engine's namespaces are bind-mounted |
+| `network:` | `relay_netns` | `sbxdrelay` | name of the shared relay namespace |
+| `network:` | `slirp_path` | `slirp4netns` | the slirp4netns binary |
+| `network:` | `mtu` | `65520` | passed to each slirp instance |
+| `network:` | `resolver` | `["1.1.1.1","8.8.8.8"]` | public resolvers for `/etc/resolv.conf` |
+| `network:` | `start_timeout_ms` | `5000` | bound for a slirp interface to come up |
+| `tunnels:` | `enabled` | `false` | server switch for quick tunnels |
+| `tunnels:` | `max_per_workspace` | `2` | concurrent tunnels per workspace |
+| `tunnels:` | `url_timeout_sec` | `45` | bounded wait for the URL |
+| `tunnels:` | `cloudflared_path` | `cloudflared` | the cloudflared binary |
+
 ## Lifecycle and limits
 
 ### Workspace lifecycle
@@ -1892,15 +2069,16 @@ Per-workspace limits (`limits:` config; overridable at creation and via
 | Disk | `limits.disk_mb` | 1024 | 51200 | file-API quota; `RLIMIT_FSIZE` per file |
 | Wall time | `limits.max_wall_time_sec` | 300 | 3600 | async run timeout (`--time_limit`) |
 | Runs / procs | `limits.max_runs` | 3 | 64 | cgroup pids max = `max_runs * 64`; also `RLIMIT_NPROC` |
-| Network | `limits.allow_net` | false | true | clones the network namespace unless true |
+| Network | `limits.allow_net` | false | true | private namespace connected to the internet via chained slirp4netns (never the host network) |
 | Unbounded runs | `limits.allow_unlimited_runs` | false | false | workspace opt-in for `no_timeout:true`; **both** levels must be true |
+| Tunnels | `limits.allow_tunnels` | false | server switch `tunnels.enabled` | workspace opt-in for quick tunnels; **both** this and `tunnels.enabled` must be true, and `allow_net` must also be true |
 
 The server maximum is a hard ceiling: a create or `PATCH` value above it is
 rejected with `422 unprocessable` (never silently clamped). `max_limits:` is
-loaded from config and always at least the defaults. `allow_unlimited_runs` is
-the one non-numeric ceiling: it is a switch, and the workspace value can only be
-`true` when the server value is `true` (see
-[Unbounded runs](#unbounded-runs)).
+loaded from config and always at least the defaults. `allow_unlimited_runs` and
+`allow_tunnels` are the two non-numeric ceilings: each is a switch, and the
+workspace value can only be `true` when the server switch is `true` (see
+[Unbounded runs](#unbounded-runs) and [Quick tunnels](#quick-tunnels-and-egress)).
 
 Process-level hard caps (`caps:` config; **not** overridable per request):
 `exec_stdout_kb` 256, `exec_stderr_kb` 256, `run_log_mb` 10, `json_body_mb` 1,
@@ -1927,8 +2105,11 @@ out-of-band changes cannot drift the quota.
   `/etc/{alternatives,ssl/certs,ld.so.cache,nsswitch.conf,passwd,group}`, plus
   `/dev/{urandom,null,zero}`. `/etc/shadow`, the host `/proc`, and other tenants'
   data are not mounted.
-- **Network:** unavailable by default. The network namespace is cloned unless the
-  workspace sets `allow_net:true`; there is no host allowlist in v0.0.5.
+- **Network:** a private network namespace always. With `allow_net:false` it is
+  empty (no egress). With `allow_net:true` it is connected to the public internet
+  through chained slirp4netns over UNIX sockets — the host network namespace is
+  never shared, and the host LAN is blackholed. There is no host allowlist in
+  v0.0.5 (see [Quick tunnels and egress](#quick-tunnels-and-egress)).
 - **Syscalls:** a default-allow seccomp policy KILLs a denylist of dangerous
   syscalls (`mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`,
   module loading, …). `cgroup v2` ceilings require the container to run with

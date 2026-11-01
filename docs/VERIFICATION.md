@@ -83,7 +83,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **288** (284 unit + 4 `integration`-tagged), including regression
+Test functions: **308** (304 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -103,7 +103,7 @@ browsing/viewing (`TestListFileNotDirectory`, `TestPutOverDirectoryRejected`,
 `TestRangeReadHonestHash`, `TestRangeReadBadParams`,
 `TestRangeReadLimitAboveCapRejected`, `TestLineRangeRead`,
 `TestBinaryDetectionAndEncoding`, `TestDownloadFileExemptFromReadCap`,
-`TestStatSymlink`, `TestReadRangeHonestHash`, `TestReadLines`; see §9c), and for
+`TestStatSymlink`, `TestReadRangeHonestHash`, `TestReadLines`; see §9c), for
 native file execution / unbounded runs / workspace stop
 (`TestStartRunFileInterpreterByExtension`,
 `TestStartRunFileUnsupportedExtensionRejected`,
@@ -112,14 +112,24 @@ native file execution / unbounded runs / workspace stop
 `TestRunFileUsesCwdAndInterpreter`, `TestRunFileExtensionSelection`,
 `TestRunCwdMissingIs422Not503`, `TestRunNoTimeoutDeniedByDefault`,
 `TestRunNoTimeoutAllowedRecordsUnlimited`, `TestFileStatAndListingRunnable`,
-`TestStopWorkspaceStopsRunsAndSessions`; see §9d–§9e).
+`TestStopWorkspaceStopsRunsAndSessions`; see §9d–§9e), and for egress and quick
+tunnels (`TestAllocatorReserveRelease`, `TestMatchTunnelURL`,
+`TestIsQuickTunnelArgs`, `TestShortIDStable`, `TestShellQuote`,
+`TestCreateTunnelHappyPath`, `TestTunnelsDisabledByServer`,
+`TestTunnelsDisabledByWorkspace`, `TestTunnelsNeedEgress`,
+`TestTunnelsIsolationBetweenPrincipals`, `TestTunnelsUnknownIDs`,
+`TestTunnelsBadBody`, `TestTunnelsMaxPerWorkspace`, `TestTunnelNoURLIs504`,
+`TestDeleteTunnelStopsProcessAndRecord`, `TestStopSuspendDeleteReleaseTunnels`,
+`TestPatchAllowTunnelsRejectedWhenServerDisabled`,
+`TestCreateWorkspaceAllowTunnelsRejectedWhenServerDisabled`,
+`TestMetaReportsTunnelsCapability`; see §9g).
 
 The count is the number of `^func Test` declarations across every `*_test.go`
 file (the same measure `scripts/docs-consistency.sh` asserts against):
 
 ```
 $ find . -name '*_test.go' -exec grep -hE '^func Test' {} + | wc -l
-288
+308
 ```
 
 ## 2. Probes
@@ -1156,6 +1166,79 @@ covers the contract at the handler level (`TestListProcesses*`,
 `TestProcessesCrossOwnerForbidden`) and the executor renders/parses the tag and
 `/proc` inputs (`TestTagEnvRenderedIntoConfig`, `TestParseStatPPIDAndStart`,
 `TestCgroupDirOfPIDSelf`); the harness proves the real behaviour.
+
+## 9g. Egress and quick tunnels (acceptance)
+
+`scripts/tunnel-check.sh` is the real-nsjail acceptance harness for per-workspace
+egress and quick Cloudflare tunnels. It builds sandboxd, runs it under the host's
+REAL nsjail, slirp4netns and cloudflared, and asserts the whole contract — and,
+critically, that the host's interface and route topology is byte-for-byte
+unchanged. It prints `SKIP` and exits 0 when root, nsjail, slirp4netns or
+cloudflared is absent (it cannot prove anything without them).
+
+```
+$ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh
+=== building ===
+=== host topology before: 0 netns entries ===
+=== starting the service under real nsjail ===
+  service started
+=== 1) allow_net workspace: DNS + pypi + package install ===
+  PASS  egress.dns_resolves (yes)
+  PASS  egress.pypi_http (yes)
+  PASS  egress.package_installs (0)
+=== 2) isolation: host LAN + another workspace unreachable ===
+  PASS  isolation.host_22_blocked (blocked)
+  PASS  isolation.host_dns_blocked (blocked)
+  PASS  isolation.control_443_blocked (blocked)
+  PASS  isolation.other_workspace_blocked (blocked)
+=== 3) allow_net:false workspace reaches nothing ===
+  PASS  no_net.host_22_blocked (blocked)
+  PASS  no_net.public_ip_blocked (blocked)
+=== 4) create a tunnel and fetch it publicly ===
+  PASS  tunnel.app_listens_inside (tunnelcheck-…)
+  PASS  tunnel.url_is_trycloudflare (yes)
+  PASS  tunnel.public_fetch_serves_workspace (yes)
+=== 5) delete the tunnel; the URL stops working ===
+  PASS  tunnel.delete_204 (204)
+  PASS  tunnel.url_dead_after_delete (yes)
+=== 6) error contracts (403/404/400) and the documented 5xx ===
+  PASS  contract.foreign_create_403 (403)
+  PASS  contract.unknown_tunnel_404 (404)
+  PASS  contract.bad_port_400 (400)
+  PASS  contract.out_of_range_400 (400)
+  PASS  contract.no_url_code (tunnel_url_unavailable)
+  PASS  contract.no_url_status (504)
+=== 7) the tunnel dies with its workspace ===
+  PASS  lifetime.cf_running_before (yes)
+  PASS  lifetime.ws_delete_204 (204)
+  PASS  lifetime.cf_gone_after_delete (0)
+=== 8) zero host topology ===
+  PASS  topology.links_unchanged (same)
+  PASS  topology.routes_unchanged (same)
+  PASS  topology.no_new_veth_or_tap (0)
+  PASS  topology.netns_empty_after (0)
+
+================ tunnel acceptance: 27 passed / 0 failed ================
+```
+
+**Measured mechanism.** The egress fabric is chained slirp4netns:
+`workspace ns --slirp(UNIX)--> relay ns --slirp(UNIX)--> host`. The relay carries
+a blackhole route for every operator-private range, so a workspace reaches the
+public internet and a public resolver but not the host LAN, the host's own
+services, or another workspace. No host interface, address or route is ever
+created: the harness asserts `ip -o link` and `ip route` are identical before and
+after, no `veth`/`tap` interface exists, and `/run/netns` is left empty.
+
+**What is genuinely host-privileged here.** The harness needs root only for the
+real nsjail (cgroup v2 + mount namespaces) and for slirp4netns to create the
+engine namespaces. The unprivileged suite covers the API contract
+(`TestCreateTunnelHappyPath`, `TestTunnelNoURLIs504`,
+`TestTunnelsDisabledBy*`, `TestTunnelsNeedEgress`, `TestTunnelsMaxPerWorkspace`,
+`TestDeleteTunnelStopsProcessAndRecord`, `TestStopSuspendDeleteReleaseTunnels`,
+`TestPatchAllowTunnelsRejectedWhenServerDisabled`,
+`TestMetaReportsTunnelsCapability`) and the network layer's pure logic
+(`TestMatchTunnelURL`, `TestIsQuickTunnelArgs`, `TestAllocatorReserveRelease`,
+`TestShortIDStable`, `TestShellQuote`).
 
 ## 10. Decisions
 

@@ -32,6 +32,11 @@ limits:
   # server-level max_limits.allow_unlimited_runs are true. Default false (deny):
   # a workspace cannot ask for unlimited by omission.
   allow_unlimited_runs: false
+  # Default workspace opt-in for quick Cloudflare tunnels. A tunnel is created
+  # only if BOTH this workspace-level value and the server-level
+  # tunnels.enabled are true; a tunnel also needs allow_net (cloudflared must
+  # reach Cloudflare). Default false (deny).
+  allow_tunnels: false
 
 # Server-level maxima. No workspace may exceed these at creation or via PATCH;
 # a request above a maximum is rejected with 422 (never silently clamped).
@@ -104,6 +109,53 @@ sessions:
   # cannot allocate a PTY) so the response can report the session already
   # failed instead of running. Short: a healthy shell is not delayed by it.
   start_probe_ms: 250
+
+# Per-workspace egress (allow_net).
+#
+# Egress is delivered by chained slirp4netns instances over UNIX sockets: an
+# engine-owned "relay" namespace is connected to the host by one slirp4netns,
+# and each workspace namespace is connected to the relay by a second. This
+# creates ZERO host interfaces and ZERO host routes, and the relay blackholes
+# every operator-private range, so a workspace can reach the public internet
+# and a public resolver but never the host LAN, the host's own services, or
+# another workspace. Default-deny: with enabled:false, allow_net workspaces get
+# a private empty namespace (no egress) and never the host network.
+network:
+  enabled: false
+  # Where the engine's namespaces are bind-mounted. The engine never uses
+  # `ip netns add` (it is broken on some hosts): it creates namespaces with
+  # unshare and bind-mounts them here.
+  netns_dir: "/run/netns"
+  # Name of the shared intermediate namespace.
+  relay_netns: "sbxdrelay"
+  # The slirp4netns binary. It is the only path a workspace has to the
+  # internet; it speaks to its parent over a UNIX socket.
+  slirp_path: "slirp4netns"
+  mtu: 65520
+  # Public resolvers written into an allow_net workspace's /etc/resolv.conf.
+  # The host's own resolver is deliberately never published to a workspace.
+  resolver: ["1.1.1.1", "8.8.8.8"]
+  # How long a slirp instance is given to configure its interface.
+  start_timeout_ms: 5000
+
+# Quick Cloudflare tunnels (one command -> public URL).
+#
+# A tunnel exposes one workspace port to the public internet with cloudflared,
+# run INSIDE the workspace's own namespace. Quick tunnels need no Cloudflare
+# account and no token: cloudflared prints a random
+# https://<name>.trycloudflare.com URL. Default-deny: a tunnel needs
+# tunnels.enabled AND the workspace's limits.allow_tunnels (and allow_net).
+tunnels:
+  enabled: false
+  # Maximum concurrent tunnels per workspace.
+  max_per_workspace: 2
+  # How long to wait for cloudflared to print its public URL. The engine never
+  # fabricates a URL: if none is observed within this bound the create fails
+  # with 504 tunnel_url_unavailable.
+  url_timeout_sec: 45
+  # The cloudflared binary. It lives in /usr/local/bin, which the sandbox
+  # mounts, so it is on PATH inside a workspace too.
+  cloudflared_path: "cloudflared"
 
 # Static API keys. Each entry maps a key to a principal_id.
 # Multiple keys may share a principal_id.
