@@ -373,7 +373,13 @@ replaces.
   `https://<name>.trycloudflare.com` address **captured from cloudflared's own
   output** with a bounded wait. The engine never fabricates a URL: if none is
   observed within `tunnels.url_timeout_sec` the create fails with **`504
-  tunnel_url_unavailable`** and leaves no record.
+  tunnel_url_unavailable`** and leaves no record. Quick tunnels are
+  **unauthenticated and rate limited** by Cloudflare; repeated creation in a
+  short window can return `429`, reported as the same `504
+  tunnel_url_unavailable` (cloudflared's own text in `details.reason`). The
+  quick-tunnel **URL is ephemeral** — it changes on every start, so nothing may
+  cache it; a named tunnel is the eventual answer and is out of scope. See
+  [DECISIONS.md](DECISIONS.md) #70.
 - `GET /v1/workspaces/{id}/tunnels` → list (status refreshed from the live
   process); `GET /v1/workspaces/{id}/tunnels/{tunnelID}` → one;
   `DELETE /v1/workspaces/{id}/tunnels/{tunnelID}` → `204`, and the public URL

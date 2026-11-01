@@ -1176,6 +1176,22 @@ critically, that the host's interface and route topology is byte-for-byte
 unchanged. It prints `SKIP` and exits 0 when root, nsjail, slirp4netns or
 cloudflared is absent (it cannot prove anything without them).
 
+**The third state — skipped-environment.** Cloudflare's quick-tunnel
+provisioning is unauthenticated and **rate limited**, and `cloudflared` prints
+the literal line `quick tunnel provisioning failed with status 429` when the
+shared quota is spent (the engine surfaces that as `504 tunnel_url_unavailable`
+with cloudflared's own text in `details.reason`). The harness matches **that
+message — never a timeout** to distinguish "somebody else's quota ran out" from
+"the engine is broken", retries the create with bounded backoff
+(`TUNNEL_RETRIES` attempts, `TUNNEL_BACKOFF` seconds base), and if the limit
+persists records the six tunnel-dependent assertions
+(`tunnel.url_is_trycloudflare`, `tunnel.public_fetch_serves_workspace`,
+`tunnel.delete_204`, `tunnel.url_dead_after_delete`,
+`lifetime.cf_running_before`, `lifetime.cf_gone_after_delete`) as **SKIP** with
+the reason and exits **0**. Any **other** failure stays a hard **FAIL** — the
+skip is never blanket — and the documented `504` + `tunnel_url_unavailable`
+contract is asserted in both cases. The tally separates the three states.
+
 ```
 $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh
 === building ===
@@ -1221,6 +1237,39 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-
 ================ tunnel acceptance: 27 passed / 0 failed ================
 ```
 
+**Measured: a rate-limited run is skipped, not failed.** The same host, on a day
+when Cloudflare's quick-tunnel quota was spent, produced (raw transcript, exit
+`0`):
+
+```
+=== 4) create a tunnel and fetch it publicly ===
+  PASS  tunnel.app_listens_inside (tunnelcheck-46865)
+  cloudflare 429 on attempt 1/3; retrying in 5s
+  cloudflare 429 on attempt 2/3; retrying in 10s
+  cloudflare quick-tunnel rate limit persisted after 3 attempt(s)
+  cloudflare quick-tunnel rate limit (HTTP 429 from provisioning); tunnel-dependent assertions will be SKIPPED
+  SKIP  tunnel.url_is_trycloudflare (cloudflare quick-tunnel rate limit (HTTP 429 from provisioning))
+  SKIP  tunnel.public_fetch_serves_workspace (cloudflare quick-tunnel rate limit (HTTP 429 from provisioning))
+...
+  PASS  contract.no_url_code (tunnel_url_unavailable)
+  PASS  contract.no_url_status (504)
+...
+  PASS  topology.links_unchanged (same)
+  PASS  topology.routes_unchanged (same)
+  PASS  topology.no_new_veth_or_tap (0)
+  PASS  topology.netns_empty_after (0)
+
+================ tunnel acceptance: 21 passed / 0 failed / 6 skipped (cloudflare quick-tunnel rate limit (HTTP 429 from provisioning)) ================
+```
+
+**Measured: a non-rate-limit failure still FAILS.** With a stub `cloudflared`
+that prints `quick tunnel provisioning failed with status 530` (not 429), the
+same harness reported `23 passed / 4 failed / 0 skipped` and exited **1** — the
+skip is not blanket. The `contract.no_url_code` / `contract.no_url_status`
+assertions stayed green in every case, proving the documented `504
+tunnel_url_unavailable` path (the state a rate limit also produces) is under
+test.
+
 **Measured mechanism.** The egress fabric is chained slirp4netns:
 `workspace ns --slirp(UNIX)--> relay ns --slirp(UNIX)--> host`. The relay carries
 a blackhole route for every operator-private range, so a workspace reaches the
@@ -1242,13 +1291,15 @@ engine namespaces. The unprivileged suite covers the API contract
 
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **69** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **70** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
-service non-goal, #63, native process control, and #64–69, per-workspace
-egress via chained slirp4netns and quick Cloudflare tunnels, including the
-recorded host-topology hazard of the abandoned veth/route design).
+service non-goal, #63, native process control, #64–69, per-workspace egress via
+chained slirp4netns and quick Cloudflare tunnels, including the recorded
+host-topology hazard of the abandoned veth/route design, and #70, the
+quick-tunnel rate-limit / ephemeral-URL operational limit and the harness's
+skipped-environment third state).
 
 ## 11. OpenAPI
 

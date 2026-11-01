@@ -92,7 +92,7 @@ additional code the router emits:
 | `payload_too_large` | 413 | Body or file over a hard cap | JSON body > `json_body_mb`, upload > `upload_mb`, file write > `file_write_mb`, a `GET /files/content` `limit` above `file_read_mb`. |
 | `insufficient_storage` | 507 | Workspace disk quota exceeded | Write/upload/rename past `limits.disk_mb`. |
 | `timeout` | 504 | Timeout | **Defined but never emitted** (see discrepancies). |
-| `tunnel_url_unavailable` | 504 | No public URL was observed in time | `POST .../tunnels` when cloudflared did not print a `trycloudflare.com` URL within `tunnels.url_timeout_sec`. The engine never fabricates a URL. |
+| `tunnel_url_unavailable` | 504 | No public URL was observed in time | `POST .../tunnels` when cloudflared did not print a `trycloudflare.com` URL within `tunnels.url_timeout_sec`, including when Cloudflare's rate-limited quick-tunnel provisioning returns `429` (cloudflared's own text is in `details.reason`). The engine never fabricates a URL. |
 | `unavailable` | 503 | Sandbox backend unavailable | nsjail binary missing, or nsjail could not set up/launch the sandbox (`details.nsjail`); also when the network/tunnel layer is not configured. |
 | `internal` | 500 | Unexpected server error | Bugs and genuinely unmapped conditions. |
 
@@ -1959,6 +1959,20 @@ themselves and get a working URL.
 - **Never a fabricated URL.** The URL is captured from cloudflared's own output
   with a bounded wait (`tunnels.url_timeout_sec`); if none is observed the
   create fails with **504 `tunnel_url_unavailable`** and leaves no record.
+- **Unauthenticated and rate limited.** Quick tunnels use Cloudflare's
+  account-less path, which is **shared and rate limited**: creating several in a
+  short window can make provisioning return `429`, surfaced as the same `504
+  tunnel_url_unavailable` (with cloudflared's own text in `details.reason`). This
+  is a limit of the external service, not a bug — a deployment that expects many
+  users creating tunnels must account for it; an account-scoped **named tunnel**
+  is the eventual answer and is **out of scope** here. See
+  [DECISIONS.md](DECISIONS.md) #70.
+- **The URL is ephemeral.** A quick-tunnel URL changes on every start, so nothing
+  (client, cache or UI) may store or rely on it; the only valid URL is the one
+  just observed from cloudflared's output. `scripts/tunnel-check.sh` reports the
+  tunnel-dependent assertions as **skipped-environment** (not failed) when the
+  quota is spent, so a green run is never faked and a quota outage never trains
+  people to ignore the suite.
 - **Tunnels die with their workspace.** `stop`, `suspend` and `DELETE` stop the
   cloudflared process and drop the records; a restart reaps orphaned cloudflared
   processes.

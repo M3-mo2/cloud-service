@@ -630,6 +630,43 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     request would return a URL that can never answer; refusing it honestly is the
     only truthful option.
 
+## v0.0.15 — deterministic tunnel acceptance and the quick-tunnel operational limit
+
+70. **Quick tunnels are unauthenticated and rate limited; the engine reports that
+    honestly and a rate-limited suite run is skipped, not failed.**
+    _Context_: quick tunnels need no Cloudflare account and no token, which is
+    exactly why the feature needs no credential (decision #66) — but the same
+    no-account path is **shared and rate limited by Cloudflare**. Creating
+    several in a short window makes `cloudflared` print `quick tunnel
+    provisioning failed with status 429` and exit. This is a limit of the
+    **external service**, not of the engine: the engine already surfaces it as
+    the documented `504 tunnel_url_unavailable` (with cloudflared's own text in
+    `details.reason`) and **never fabricates a URL**. `scripts/tunnel-check.sh` is
+    not hermetic for that reason — the runs themselves could exhaust the quota,
+    and a suite that goes red because somebody else's quota ran out trains people
+    to ignore it, which is worse than not having the suite.
+    _Decision_: the harness detects the rate limit precisely — it matches
+    cloudflared's literal `provisioning failed with status 429` in
+    `details.reason`, **never a timeout** — retries the create with bounded
+    backoff (`TUNNEL_RETRIES` attempts, `TUNNEL_BACKOFF` seconds base), and, if
+    the limit persists, reports exactly the tunnel-dependent assertions
+    (`tunnel.url_is_trycloudflare`, `tunnel.public_fetch_serves_workspace`,
+    `tunnel.delete_204`, `tunnel.url_dead_after_delete`, `lifetime.cf_running_before`,
+    `lifetime.cf_gone_after_delete`) as a distinct **skipped-environment** third
+    state, prints the reason, and exits **0**. Any **other** tunnel failure — a
+    crash, a missing binary, a wrong status — stays a hard **FAIL**; the skip is
+    never blanket. The tally separates the three states
+    (`21 passed / 0 failed / 6 skipped (cloudflare quick-tunnel rate limit)`),
+    and the documented `504` + `tunnel_url_unavailable` path is **always**
+    asserted, including while rate limited.
+    _Operational limit_: quick tunnels are **unauthenticated and rate limited**;
+    repeated creation in a short window can return `429`; a production deployment
+    that expects many users creating tunnels must account for this — **a named
+    tunnel with a Cloudflare account is the eventual answer and is explicitly out
+    of scope**. **The quick-tunnel URL is ephemeral**: it changes on every start,
+    so nothing (client, cache, UI) may store or rely on it; the only valid URL is
+    the one just observed from cloudflared's own output.
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.

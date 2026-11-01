@@ -37,6 +37,10 @@ A secure per-user code execution backend exposed over HTTP/JSON.
   internet with cloudflared quick tunnels (no account, no token): `POST
   /v1/workspaces/{id}/tunnels {"port":5000}` returns the observed
   `https://…trycloudflare.com` URL. Default-deny, and the URL is never fabricated.
+  Quick tunnels are **unauthenticated and rate limited** by Cloudflare: repeated
+  creation can return `429`, surfaced honestly as `504 tunnel_url_unavailable`,
+  and the URL is **ephemeral** (never cache it). See
+  [docs/DECISIONS.md](docs/DECISIONS.md) #70.
 
 See [docs/API.md](docs/API.md) for the full endpoint reference.
 
