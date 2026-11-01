@@ -149,7 +149,7 @@ flowchart TD
 | `internal/storage` | `store.go` | Atomic JSON metadata + run-log/session-output files on disk |
 | `internal/executor` | `executor.go`, `nsjail.go`, `live.go`, `identity.go`, `fake.go`, `pty_relay.py` | nsjail config rendering, UID/GID mapping, one-shot and interactive process lifecycles, capped capture, PTY relay helper |
 | `configs` | `nsjail_python.cfg.tmpl`, `embed.go` | nsjail TextProto template (also compiled into the binary) |
-| `scripts` | `acceptance.sh`, `nsjail-stub.py` | End-to-end acceptance transcript; test stub |
+| `scripts` | `acceptance.sh`, `session-nsjail-check.sh`, `nsjail-stub.py` | End-to-end acceptance transcript; privileged real-nsjail terminal-session acceptance; test stub |
 
 Total ≈ 6.4k lines of Go across 8 packages, plus one embedded template and an
 OpenAPI 3.1 spec (`api/openapi.yaml`).
@@ -900,8 +900,15 @@ Testing is layered so that most of the suite needs neither nsjail nor root:
 flowchart LR
     U["Unit tests\n(go test ./...)\nhandlers via httptest\nFakeRunner\npath-safety, storage, config"] --> R["Race suite\n(go test -race ./...)"]
     R --> I["Integration\n(//go:build integration)\nreal nsjail in privileged container"]
-    I --> A["Acceptance\nscripts/acceptance.sh\nfull HTTP lifecycle + isolation"]
+    I --> A["Privileged suites\nscripts/acceptance.sh\nscripts/session-nsjail-check.sh\nfull HTTP lifecycle + isolation\nreal-nsjail terminal sessions"]
 ```
+
+Both `scripts/acceptance.sh` and `scripts/session-nsjail-check.sh` are the
+**privileged suites**: `acceptance.sh` runs the full HTTP lifecycle + isolation
+transcript (normally inside the `--privileged --cgroupns=host` image via
+`make acceptance`), and `session-nsjail-check.sh` runs the terminal-session
+acceptance against real nsjail on the host (via `make session-check`; no
+container, but root + a real nsjail).
 
 Evidence lives in [`docs/VERIFICATION.md`](VERIFICATION.md). Highlights from the
 real-nsjail acceptance transcript:

@@ -141,6 +141,27 @@ else
   fail "verification.sessions-section" "no sessions section in docs/VERIFICATION.md"
 fi
 
+# --- 4b. the privileged session acceptance harness exists and is documented
+# The real-nsjail session harness is the only check that catches a dead PTY
+# where the unit tests stay green, so it must exist, be executable, and be named
+# in VERIFICATION.md -- it cannot silently rot.
+
+if [ -f scripts/session-nsjail-check.sh ]; then
+  ok "session-harness.exists"
+else
+  fail "session-harness.exists" "scripts/session-nsjail-check.sh is missing"
+fi
+if [ -x scripts/session-nsjail-check.sh ]; then
+  ok "session-harness.executable"
+else
+  fail "session-harness.executable" "scripts/session-nsjail-check.sh is not executable"
+fi
+if grep -qF 'session-nsjail-check.sh' docs/VERIFICATION.md; then
+  ok "session-harness.documented"
+else
+  fail "session-harness.documented" "docs/VERIFICATION.md does not mention scripts/session-nsjail-check.sh"
+fi
+
 # --- 5. stated test count equals the real test count -----------------------
 
 STATED="$(grep -oE 'Test functions:[^0-9]*[0-9]+' docs/VERIFICATION.md | grep -oE '[0-9]+' | head -1)"

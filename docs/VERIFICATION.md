@@ -412,6 +412,11 @@ of which is the **measured real-nsjail before/after** for the devpts fix:
 4. **A real session inside a real nsjail** (`TestIntegrationSessionRealPTY`,
    `//go:build integration`, [requires privileged container]) — the measured
    transcript below.
+5. **The privileged acceptance harness** (`scripts/session-nsjail-check.sh`) —
+   the end-to-end real-nsjail run of the whole session matrix, including the
+   forced PTY-allocation failure and the cross-principal / ended-session
+   contracts (see §9b.4). It is the check that catches a dead PTY where the unit
+   tests stay green.
 
 ### 9b.1 The measured devpts failure and fix
 
@@ -589,6 +594,99 @@ the offset reader (`TestIntegrationSessionRealPTY`, transcript in §9b.2). The
 unprivileged suite asserts the launch path against the rendered config and the
 live-process interface instead, so the feature is covered on hosts without nsjail
 too.
+
+### 9b.4 The privileged session acceptance harness
+
+`scripts/session-nsjail-check.sh` is the purpose-built real-nsjail acceptance
+harness for terminal sessions. It hosts the service itself (no container), so an
+operator with a host that can run real nsjail (root, cgroup v2, the real
+`nsjail` binary) can reproduce the whole session contract in one command:
+
+```sh
+sudo -E bash scripts/session-nsjail-check.sh
+```
+
+No assertion is ever weakened to make a run pass, and the script exits non-zero
+on any failure. It builds the binary, starts the service against the host's real
+nsjail on a spare port (`PORT`, default 18099), and asserts:
+
+1. a **real terminal** — `tty` prints a `/dev/pts/N` device, `test -t 1`
+   succeeds, and the stream carries **neither** `out of pty devices` **nor** a
+   traceback;
+2. **state survives** between commands (`cd /tmp` then `pwd` → `/tmp`);
+3. an **interrupt does not end the session** (signal `INT` to `sleep 30`, the
+   session is still `running` afterwards);
+4. **resize reaches the PTY** (`stty size` reports the new `rows cols`);
+5. a **foreign principal** (a second API key in the test config) is refused with
+   `403`/`404` — never success — on create, input, output and delete;
+6. `DELETE` ends the session cleanly;
+7. `POST /sessions/{id}/input` on the ended session returns **409** with the
+   documented code `session_ended`;
+8. a **failed PTY allocation** surfaces as a session in `failed` state with
+   reason `sandbox_unavailable` and a diagnostic carrying the PTY error — never
+   a session reported `running` whose stream is a traceback.
+
+Check 8 is forced honestly: a **second** sandboxd instance is started whose
+nsjail template is a copy of `configs/nsjail_python.cfg.tmpl` with its
+`{{- if .PTY }}` guard rewritten to `{{- if false }}`, so that instance
+deliberately never binds `/dev/pts` and `/dev/ptmx` into a session's jail.
+Inside that jail `pty.fork()` fails with `out of pty devices`, and the check
+proves the service turns that into a failed session with a diagnostic. It is the
+real-nsjail analogue of the unit test `TestSessionPTYFailureIsLoud` (which forces
+the same condition through a fake-runner error) and asserts the real failure
+path, not a mock.
+
+Observed on this host (real `nsjail` at `/usr/local/bin/nsjail`, root):
+
+```
+$ sudo -E bash scripts/session-nsjail-check.sh
+=== building ===
+=== starting the service under real nsjail ===
+  service ready: {"cgroups":true,"data_dir":true,"nsjail":true,"status":"ready"}
+  workspace=ws_01M6B9GQFV7N5EXYNXXHVEWSTD session=ses_01M6B9GQH62FGMB6C8NAPQKPEX
+=== 1) the session must provide a REAL terminal ===
+  PASS  no PTY allocation failure (yes)
+  PASS  tty is a pts device (yes)
+  PASS  stdout is a tty (yes)
+  PASS  no traceback in the stream (yes)
+=== 2) state survives between commands ===
+  PASS  cd then pwd (yes)
+=== 3) an interrupt must not end the session ===
+  PASS  session still running after SIGINT (running)
+=== 4) resize reaches the PTY ===
+  PASS  stty size reflects the resize (yes)
+=== 5) a foreign principal is refused on every session route ===
+  PASS  foreign POST /sessions refused (refused)
+  PASS  foreign POST /sessions/ses_01M6B9GQH62FGMB6C8NAPQKPEX/input refused (refused)
+  PASS  foreign GET /sessions/ses_01M6B9GQH62FGMB6C8NAPQKPEX/output?offset=0 refused (refused)
+  PASS  foreign DELETE /sessions/ses_01M6B9GQH62FGMB6C8NAPQKPEX refused (refused)
+=== 6) cleanup ===
+  PASS  delete ends the session (yes)
+=== 7) input on an ended session returns the documented 409 ===
+  PASS  input on an ended session is 409 (409)
+  PASS  ended-session error code (session_ended)
+=== 8) a failed PTY allocation surfaces as a failed session ===
+  PASS  forced PTY failure session status (failed)
+  PASS  forced PTY failure reason (sandbox_unavailable)
+  PASS  forced PTY failure carries the PTY diagnostic (yes)
+  PASS  forced PTY failure is terminal on GET (failed)
+
+================ session acceptance: 18 passed / 0 failed ================
+```
+
+The harness stops each service by its **exact PID** (never `pkill -f <pattern>`,
+which can match the shell running it) and cleans up in a `trap`. On a host
+without root, without nsjail, or without the Go toolchain it prints a `SKIP`
+line and exits 0 — it makes no claim it cannot prove. `make session-check` runs
+it; unlike `make acceptance` it needs **no container**, only root and a real
+nsjail on the host.
+
+**This is the check that catches a dead PTY where unit tests stay green.** The
+feature once shipped with every unit test passing while sessions returned
+`201 Created` and reported `running` with a terminal stream that was a Python
+`OSError: out of pty devices` traceback. Only a session run against the **real**
+nsjail can observe that the sandbox's `/dev` lacks a working devpts; the stub
+runner and the rendered-config assertions cannot.
 
 ## 10. Decisions
 
