@@ -16,6 +16,7 @@ tags:
   - name: Sessions
   - name: Packages
   - name: Processes
+  - name: Tunnels
 
 security:
   - bearerAuth: []
@@ -366,6 +367,90 @@ paths:
         "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "422": { $ref: "#/components/responses/Unprocessable" }
         "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/workspaces/{workspaceId}/tunnels:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: postv1_workspaces_workspaceId_tunnels
+      tags: [Tunnels]
+      summary: Expose a workspace port with a quick Cloudflare tunnel
+      description: >
+        Starts `cloudflared tunnel --url http://localhost:{port}` INSIDE the
+        workspace's own network namespace and returns the public
+        `https://<name>.trycloudflare.com` URL cloudflared prints. Quick tunnels
+        need no Cloudflare account and no token. The URL is only ever the one
+        cloudflared printed, captured with a bounded wait (`tunnels.url_timeout_sec`);
+        if none is observed the create fails with 504 tunnel_url_unavailable and
+        leaves no record. Requires the server switch `tunnels.enabled`, the
+        workspace opt-in `limits.allow_tunnels`, and `limits.allow_net` (cloudflared
+        needs egress).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateTunnelRequest" }
+      responses:
+        "201":
+          description: The created tunnel with its observed public URL
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TunnelEnvelope" }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/WorkspaceSuspended" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "504":
+          description: No public URL was observed from cloudflared within the timeout
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    get:
+      operationId: getv1_workspaces_workspaceId_tunnels
+      tags: [Tunnels]
+      summary: List the workspace's tunnels
+      responses:
+        "200":
+          description: The workspace's tunnels, newest first
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TunnelList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/workspaces/{workspaceId}/tunnels/{tunnelId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/TunnelId"
+    get:
+      operationId: getv1_workspaces_workspaceId_tunnels_tunnelId
+      tags: [Tunnels]
+      summary: Fetch one tunnel
+      responses:
+        "200":
+          description: The tunnel
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TunnelEnvelope" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: deletev1_workspaces_workspaceId_tunnels_tunnelId
+      tags: [Tunnels]
+      summary: Stop the tunnel and remove its record
+      description: >
+        Stops the tunnel's cloudflared process and removes the record; after it
+        returns the public URL no longer serves. A tunnel also dies with its
+        workspace (stop/suspend/DELETE) and with a service restart.
+      responses:
+        "204": { description: The tunnel was stopped and removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
 
   /v1/workspaces/{workspaceId}/files:
     parameters:
@@ -1020,6 +1105,12 @@ components:
       required: true
       description: "A stable process id from the process inventory (`proc_<hex>`)."
       schema: { type: string, pattern: "^proc_[0-9a-f]{24}$" }
+    TunnelId:
+      name: tunnelId
+      in: path
+      required: true
+      description: "A tunnel id (`tun_<ULID>`)."
+      schema: { type: string, pattern: "^tun_[0-9A-HJKMNP-TV-Z]{26}$" }
   responses:
     Unauthorized:
       description: Missing or invalid credentials
@@ -1090,12 +1181,15 @@ components:
         - workspace_suspended
         - too_many_sessions
         - session_ended
+        - tunnels_disabled
+        - too_many_tunnels
         - validation
         - unprocessable
         - not_directory
         - payload_too_large
         - insufficient_storage
         - timeout
+        - tunnel_url_unavailable
         - unavailable
         - internal
     ErrorEnvelope:
@@ -1124,6 +1218,19 @@ components:
         nsjail: { type: boolean }
         cgroups: { type: boolean, description: "cgroup v2 usable (requires --cgroupns=host)" }
         data_dir: { type: boolean }
+        network:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            available: { type: boolean }
+            ready: { type: boolean }
+            reason: { type: string }
+        tunnels:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            ready: { type: boolean }
+            reason: { type: string }
     Meta:
       type: object
       required: [version, api_version, runtimes, limits_defaults]
@@ -1146,6 +1253,24 @@ components:
         limits_maxima:
           allOf: [{ $ref: "#/components/schemas/Limits" }]
           description: Server-enforced maxima for per-workspace limits.
+        network:
+          type: object
+          description: Isolated-egress capability, reported truthfully.
+          properties:
+            enabled: { type: boolean }
+            available: { type: boolean }
+            ready: { type: boolean }
+            egress: { type: boolean }
+            reason: { type: string }
+        tunnels:
+          type: object
+          description: Quick-tunnel capability, reported truthfully.
+          properties:
+            enabled: { type: boolean }
+            ready: { type: boolean }
+            max_per_workspace: { type: integer }
+            url_timeout_sec: { type: integer }
+            reason: { type: string }
     Limits:
       type: object
       properties:
@@ -1158,6 +1283,9 @@ components:
         allow_unlimited_runs:
           type: boolean
           description: "Workspace opt-in for wall-clock-unbounded runs (no_timeout:true). A true value is rejected with 422 unless max_limits.allow_unlimited_runs is also true."
+        allow_tunnels:
+          type: boolean
+          description: "Workspace opt-in for quick Cloudflare tunnels. A true value is rejected with 422 unless tunnels.enabled is also true; a tunnel additionally requires allow_net."
     Workspace:
       type: object
       required: [id, owner_id, name, created_at, status, limits]
@@ -1186,6 +1314,7 @@ components:
         max_runs: { type: [integer, "null"] }
         allow_net: { type: [boolean, "null"] }
         allow_unlimited_runs: { type: [boolean, "null"] }
+        allow_tunnels: { type: [boolean, "null"] }
     PatchWorkspaceRequest:
       type: object
       description: "Partial workspace update; absent fields keep their current value."
@@ -1285,6 +1414,39 @@ components:
           description: "`stopped` when a live tree was signalled; `gone` when the process had already exited (idempotent)."
         stopped: { type: boolean }
         stopped_at: { type: string, format: date-time }
+    CreateTunnelRequest:
+      type: object
+      required: [port]
+      properties:
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: "The workspace port cloudflared connects to at localhost:port. Must be 1024-65535 (privileged ports cannot be bound by the sandbox uid)."
+    Tunnel:
+      type: object
+      required: [id, workspace_id, port, url, status, created_at]
+      properties:
+        id: { type: string, examples: ["tun_01H..."] }
+        workspace_id: { type: string }
+        port: { type: integer }
+        url:
+          type: string
+          description: "The public https://<name>.trycloudflare.com URL cloudflared printed. Only ever observed, never fabricated."
+        status: { type: string, enum: [active, stopped] }
+        created_at: { type: string, format: date-time }
+    TunnelEnvelope:
+      type: object
+      required: [tunnel]
+      properties:
+        tunnel: { $ref: "#/components/schemas/Tunnel" }
+    TunnelList:
+      type: object
+      required: [tunnels]
+      properties:
+        tunnels:
+          type: array
+          items: { $ref: "#/components/schemas/Tunnel" }
     Entry:
       type: object
       required: [name, path, type, size, mode, mod_time]

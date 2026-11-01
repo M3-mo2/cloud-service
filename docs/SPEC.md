@@ -45,7 +45,7 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 
 - `GET /healthz` → 200 `{"status":"ok"}`
 - `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool}`
-- `GET /v1/meta` → `{"version":"0.0.5","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...}}`
+- `GET /v1/meta` → `{"version":"0.0.5","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...}}`
 - `GET /metrics` → Prometheus text
 
 ### 2.2 Workspaces
@@ -64,9 +64,11 @@ Workspace JSON:
 ```
 
 `limits` is `{cpu_cores, memory_mb, disk_mb, max_wall_time_sec, max_runs,
-allow_net, allow_unlimited_runs}`; `allow_unlimited_runs` is a boolean switch
-(default false) that must be true (with the server switch) before a workspace
-may request `no_timeout:true` runs.
+allow_net, allow_unlimited_runs, allow_tunnels}`; `allow_unlimited_runs` and
+`allow_tunnels` are boolean switches (default false) that must each be true
+(along with the matching server switch — `max_limits.allow_unlimited_runs` and
+`tunnels.enabled` respectively) before a workspace may request `no_timeout:true`
+runs or quick tunnels.
 
 `status` is `active` or `suspended` (`deleted` exists in the type vocabulary but
 is never persisted: a deleted workspace is removed outright). The status is
@@ -348,6 +350,51 @@ three are refused with **`409 workspace_suspended`** while the workspace is
 suspended (this is the one exception to "reads keep working" — listing packages
 is refused too).
 
+### 2.5.2 Egress and quick tunnels
+
+**Egress (`allow_net`).** An `allow_net:true` workspace gets **its own network
+namespace**, connected to the public internet only through **chained slirp4netns**
+instances: `workspace ns --slirp(UNIX)--> relay ns --slirp(UNIX)--> host`. The
+engine-owned relay namespace carries a **blackhole route for every
+operator-private range** (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
+`169.254.0.0/16`, `100.64.0.0/10`), so a workspace reaches the public internet
+and a public resolver but **never the host LAN, the host's own services, or
+another workspace**. It creates **zero host interfaces, routes or veth pairs**;
+the host's topology is unchanged. `allow_net:false` gets a private, empty
+namespace (no egress at all). `allow_net:true` is never a host-network share.
+See [DECISIONS.md](DECISIONS.md) for the recorded host-topology hazard this
+replaces.
+
+**Quick tunnels.** `cloudflared` (quick tunnels only: no account, no token) is on
+`PATH` inside the sandbox:
+
+- `POST /v1/workspaces/{id}/tunnels` body `{"port":5000}` → `201
+  {tunnel:{id,workspace_id,port,url,status,created_at}}` where `url` is the
+  `https://<name>.trycloudflare.com` address **captured from cloudflared's own
+  output** with a bounded wait. The engine never fabricates a URL: if none is
+  observed within `tunnels.url_timeout_sec` the create fails with **`504
+  tunnel_url_unavailable`** and leaves no record.
+- `GET /v1/workspaces/{id}/tunnels` → list (status refreshed from the live
+  process); `GET /v1/workspaces/{id}/tunnels/{tunnelID}` → one;
+  `DELETE /v1/workspaces/{id}/tunnels/{tunnelID}` → `204`, and the public URL
+  stops working.
+- Honest failure contract: unknown id → `404`; foreign principal → `403`; bad
+  body / port out of range (`<1`, `>65535`) or a privileged port (`<1024`) →
+  `400`; server/workspace switch off or no `allow_net` → `422 tunnels_disabled`;
+  per-workspace cap → `422 too_many_tunnels`; no URL in time → `504
+  tunnel_url_unavailable`.
+- A tunnel **dies with its workspace** (`stop`/`suspend`/`DELETE`) and startup
+  reaps orphaned cloudflared processes. The user's own simplest path — a shell
+  inside the workspace running `cloudflared tunnel --url http://localhost:5000` —
+  works too, because cloudflared is on `PATH`.
+
+**Config.** `network: {enabled, netns_dir, relay_netns, slirp_path, mtu,
+resolver, start_timeout_ms}` and `tunnels: {enabled, max_per_workspace,
+url_timeout_sec, cloudflared_path}`, plus `limits.allow_tunnels` (the
+per-workspace opt-in). Both blocks are **default-deny**: `enabled` defaults to
+`false`, and a workspace can opt in to tunnels only when the server switch is on
+and it has `allow_net`.
+
 ### 2.6 Auth
 
 Middleware `auth.Bearer(cfg.Keys)` extracts `principal_id`. Every workspace
@@ -395,6 +442,8 @@ the table) is:
 | `forbidden` | 403 | Valid key, resource owned by another principal. |
 | `not_found` | 404 | Unknown workspace/run/file/package or unknown route. |
 | `conflict` | 409 | Purging run history (or deleting one run) while a run is still queued/running. |
+| `tunnels_disabled` | 422 | Tunnels forbidden: server switch off, workspace not opted in, or no workspace egress. |
+| `too_many_tunnels` | 422 | Concurrent tunnels exceed `tunnels.max_per_workspace`. |
 | `workspace_suspended` | 409 | Work (exec/run/package management/session) requested on a suspended workspace. |
 | `too_many_sessions` | 409 | Concurrent terminal sessions exceed `sessions.max_per_workspace`. |
 | `session_ended` | 409 | Operation on a terminal session (input/signal/resize, or output after DELETE). |
@@ -404,7 +453,8 @@ the table) is:
 | `payload_too_large` | 413 | Body/file over a hard cap (including a `GET .../files/content` `limit` above `file_read_mb`). |
 | `insufficient_storage` | 507 | Workspace disk quota exceeded. **Emitted as a string literal in `internal/api/errors.go`; not defined as a constant in `internal/model/errors.go`.** |
 | `timeout` | 504 | **Defined but never emitted** by any handler (retained in the vocabulary and the OpenAPI enum). |
-| `unavailable` | 503 | nsjail missing, or nsjail could not set up/launch the sandbox. |
+| `tunnel_url_unavailable` | 504 | Cloudflared did not print a public URL within `tunnels.url_timeout_sec`; the create fails and leaves no record. |
+| `unavailable` | 503 | nsjail missing, or nsjail could not set up/launch the sandbox; or the network/tunnel layer is not configured. |
 | `internal` | 500 | Unexpected server error. |
 
 The code is not always a 1:1 mirror of the status: a **405 method not allowed**
@@ -458,7 +508,10 @@ Implement `internal/executor/nsjail.go` that builds a per-run nsjail config
 file (temp file under `data/tmp/`) and invokes `nsjail --config <file>`. The
 config template `configs/nsjail_python.cfg.tmpl` must include:
 
-- namespaces: pid, mount, ipc, uts, user, net (net only if `allow_net=true`)
+- namespaces: pid, mount, ipc, uts, user, net. The network namespace is **never**
+  the host's. With no engine-managed namespace nsjail creates a fresh, empty one;
+  with one, the runner enters the workspace's own namespace and renders
+  `clone_newnet:false`.
 - `--chroot` disabled; use `--bindmount_ro` for `/usr`, `/lib`, `/lib64`,
   `/bin`, `/etc/alternatives`, `/etc/ssl/certs`, and the Python runtime;
   `--bindmount` workspace at `/workspace`; `--cwd /workspace`
@@ -472,12 +525,11 @@ config template `configs/nsjail_python.cfg.tmpl` must include:
   `setns`, `unshare`, `clone3` if problems — but allow `clone`/`clone3` with
   restrictions; default to documented safe list
 - `--disable_proc` (or read-only `/proc`)
-- DNS: mount `/etc/resolv.conf` and `/etc/hosts` read-only **only when
-  `allow_net=true`**. With the host network namespace shared, name resolution
-  otherwise fails with `Temporary failure in name resolution` (the resolver has
-  no nameserver to query) even though TCP to a raw IP works — this is what made
-  `pip install` impossible for an `allow_net` workspace. A workspace without
-  `allow_net` must not see the host resolver at all.
+- DNS: mount `/etc/resolv.conf` naming **public resolvers** (and `/etc/hosts`)
+  read-only **only when `allow_net=true`**. The workspace reaches those resolvers
+  through its chained-slirp4netns egress; the host's own resolver is deliberately
+  never published to a workspace. A workspace without `allow_net` must not see
+  any resolver at all.
 - package tiers: when the shared tier is configured and available, bind-mount it
   read-only at `/opt/python/shared`; always bind-mount the workspace's private
   tier read-write at `/opt/python/private`; inject both (shared first) via
