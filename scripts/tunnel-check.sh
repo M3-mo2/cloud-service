@@ -28,6 +28,21 @@
 #   8. zero host topology: ip -o link shows no new interface, ip route is
 #      unchanged, and /run/netns is empty before and after.
 #
+# THE THIRD STATE: skipped-environment.
+#   Checks 4, 5 and 7 depend on Cloudflare's quick-tunnel provisioning, which is
+#   UNAUTHENTICATED and RATE LIMITED. When the shared quota is spent cloudflared
+#   prints, verbatim, "quick tunnel provisioning failed with status 429" and
+#   exits; the engine surfaces that honestly as 504 tunnel_url_unavailable with
+#   cloudflared's own text in details.reason. The harness matches THAT message
+#   (never a timeout) to tell "somebody else's quota ran out" apart from "our
+#   engine is broken". On a match it retries with bounded backoff (TUNNEL_RETRIES
+#   attempts, TUNNEL_BACKOFF seconds base) and, if the limit persists, records
+#   the affected assertions as SKIP with the reason and still exits 0: a suite
+#   that goes red because an external quota ran out trains people to ignore it.
+#   Any OTHER tunnel failure stays a hard FAIL — the skip is never blanket. The
+#   count of skipped checks and the reason appear in the one-line tally, e.g.
+#   "24 passed / 0 failed / 3 skipped (cloudflare quick-tunnel rate limit)".
+#
 # REQUIREMENTS
 #   Root (nsjail needs cgroup v2 and mount namespaces; slirp4netns must create
 #   the engine namespaces), the real nsjail binary, slirp4netns, cloudflared, the
@@ -36,12 +51,14 @@
 #
 # USAGE
 #   sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh
-#   Environment: PORT (default 8099), PORT2 (the no-URL instance, default 8098).
+#   Environment: PORT (default 8099), PORT2 (the no-URL instance, default 8098),
+#     TUNNEL_RETRIES (default 3), TUNNEL_BACKOFF (default 5 seconds).
 #
 # EXIT
-#   0 when every assertion passes; non-zero on any failure. When root, nsjail,
-#   slirp4netns or cloudflared is absent the script prints SKIP and exits 0: it
-#   cannot prove anything without them.
+#   0 when every assertion passes, or when only tunnel-dependent assertions were
+#   skipped for the external rate limit; non-zero on any real failure. When root,
+#   nsjail, slirp4netns or cloudflared is absent the script prints SKIP and exits
+#   0: it cannot prove anything without them.
 set -uo pipefail
 
 usage() {
@@ -53,8 +70,13 @@ It builds sandboxd, runs it under the host's real nsjail, and asserts the
 egress/isolation contract, the tunnel API, and that host topology is unchanged.
 
 Environment:
-  PORT    port for the main service (default 8099).
-  PORT2   port for the no-URL service instance (default 8098).
+  PORT            port for the main service (default 8099).
+  PORT2           port for the no-URL service instance (default 8098).
+  TUNNEL_RETRIES  attempts for a tunnel create while rate limited (default 3).
+  TUNNEL_BACKOFF  base seconds between retries; attempt N waits N*this (default 5).
+
+Tunnel-dependent assertions are reported as SKIP (a third state, exit 0) when
+Cloudflare's quick-tunnel quota is spent (429), and as FAIL for any other cause.
 USAGE
 }
 case "${1:-}" in
@@ -84,6 +106,10 @@ BASE="http://127.0.0.1:$PORT"
 BASE2="http://127.0.0.1:$PORT2"
 PASS=0
 FAIL=0
+SKIP=0
+SKIP_REASON=""
+CF_LIMITED=no
+URL_OK=no
 WORK=$(mktemp -d)
 MARK="tunnelcheck-$$"
 
@@ -94,7 +120,58 @@ chk() { # label expected actual
     echo "  FAIL  $1 expected=$2 got=$3"; FAIL=$((FAIL + 1))
   fi
 }
+# skip records a tunnel-dependent assertion that COULD NOT be exercised because
+# an external dependency (Cloudflare's quick-tunnel quota) was unavailable. It is
+# a distinct third state: not a pass (nothing was proved) and not a fail (the
+# engine is not at fault). The suite exits 0 on skips.
+skip() { # label reason
+  echo "  SKIP  $1 ($2)"; SKIP=$((SKIP + 1))
+}
 jsonf() { python3 -c "import json,sys;print(json.load(sys.stdin)$1)"; }
+
+# Cloudflare quick-tunnel provisioning is rate limited. cloudflared prints the
+# exact line "quick tunnel provisioning failed with status 429" and exits; the
+# engine surfaces that as 504 tunnel_url_unavailable with cloudflared's own
+# output in details.reason. THAT message -- matched literally, never a timeout --
+# is the signal that the external quota is spent, so the tunnel-dependent
+# assertions become skipped-environment rather than failures. Any other 504
+# reason (a bug, a missing binary, a crash) stays a hard failure; nothing is
+# blanket-skipped.
+CF_RATELIMIT_RE='provisioning failed with status 429'
+is_rate_limited() { printf '%s' "$1" | grep -qE "$CF_RATELIMIT_RE"; }
+
+TUNNEL_RETRIES=${TUNNEL_RETRIES:-3}
+TUNNEL_BACKOFF=${TUNNEL_BACKOFF:-5}
+
+# create_tunnel_retry POSTs a tunnel create for a workspace/port and retries ONLY
+# while cloudflared reports the 429 rate limit, with bounded backoff. It sets
+# TUN_BODY to the last response body and returns:
+#   0 -> a tunnel with a usable trycloudflare URL was created
+#   1 -> provisioning stayed rate limited (external; caller skips those checks)
+#   2 -> the create failed for any other reason (caller must FAIL)
+create_tunnel_retry() { # ws port
+  local ws="$1" port="$2" attempt=0 body url reason wait
+  while :; do
+    attempt=$((attempt + 1))
+    body=$(curl -s -m 150 -X POST "$BASE/v1/workspaces/$ws/tunnels" -H "$A" -H "$J" -d "{\"port\":$port}")
+    TUN_BODY="$body"
+    url=$(printf '%s' "$body" | jsonf "['tunnel']['url']" 2>/dev/null || echo "")
+    case "$url" in https://*.trycloudflare.com) return 0 ;; esac
+    reason=$(printf '%s' "$body" | jsonf "['error']['details'].get('reason','')" 2>/dev/null || echo "")
+    if is_rate_limited "$reason"; then
+      if [ "$attempt" -ge "$TUNNEL_RETRIES" ]; then
+        echo "  cloudflare quick-tunnel rate limit persisted after $attempt attempt(s)"
+        return 1
+      fi
+      wait=$((TUNNEL_BACKOFF * attempt))
+      echo "  cloudflare 429 on attempt $attempt/$TUNNEL_RETRIES; retrying in ${wait}s"
+      sleep "$wait"
+      continue
+    fi
+    # Not the rate limit: a genuine failure the caller must surface.
+    return 2
+  done
+}
 
 # host topology snapshots
 topo_links() { ip -o link | awk '{print $2,$9}' | sort; }
@@ -283,28 +360,48 @@ INSIDE=$(curl -s -m 40 -X POST "$BASE/v1/workspaces/$WSA/exec" -H "$A" -H "$J" \
   -d '{"cmd":["python3","-c","import urllib.request;print(urllib.request.urlopen(\"http://127.0.0.1:5000/index.html\",timeout=5).read().decode().strip())"],"timeout_sec":15}' | jsonf "['stdout']" | tr -d '\n')
 chk "tunnel.app_listens_inside" "$MARK" "$INSIDE"
 
-TUNJSON=$(curl -s -m 150 -X POST "$BASE/v1/workspaces/$WSA/tunnels" -H "$A" -H "$J" -d '{"port":5000}')
-TID=$(printf '%s' "$TUNJSON" | jsonf "['tunnel']['id']" 2>/dev/null || echo "")
-URL=$(printf '%s' "$TUNJSON" | jsonf "['tunnel']['url']" 2>/dev/null || echo "")
-case "$URL" in https://*.trycloudflare.com) URL_OK=yes ;; *) URL_OK=no ;; esac
-chk "tunnel.url_is_trycloudflare" "yes" "$URL_OK"
-echo "  url=$URL"
-PUBOK=no
-if [ "$URL_OK" = "yes" ]; then
+CREATE_RC=0
+create_tunnel_retry "$WSA" 5000 || CREATE_RC=$?
+TID=""
+URL=""
+if [ "$CREATE_RC" = "0" ]; then
+  TID=$(printf '%s' "$TUN_BODY" | jsonf "['tunnel']['id']" 2>/dev/null || echo "")
+  URL=$(printf '%s' "$TUN_BODY" | jsonf "['tunnel']['url']" 2>/dev/null || echo "")
+  case "$URL" in https://*.trycloudflare.com) URL_OK=yes ;; *) URL_OK=no ;; esac
+  chk "tunnel.url_is_trycloudflare" "yes" "$URL_OK"
+  echo "  url=$URL"
+  PUBOK=no
   for _ in $(seq 1 40); do
     BODY=$(timeout 25 curl -s -L -m 20 "$URL/" 2>/dev/null)
     printf '%s' "$BODY" | grep -q "$MARK" && { PUBOK=yes; break; }
     sleep 3
   done
+  chk "tunnel.public_fetch_serves_workspace" "yes" "$PUBOK"
+elif [ "$CREATE_RC" = "1" ]; then
+  # Cloudflare's quick-tunnel quota is spent. Nothing about the engine is
+  # broken, so this is a skipped-environment state, not a failure.
+  CF_LIMITED=yes
+  SKIP_REASON="cloudflare quick-tunnel rate limit (HTTP 429 from provisioning)"
+  echo "  $SKIP_REASON; tunnel-dependent assertions will be SKIPPED"
+  skip "tunnel.url_is_trycloudflare" "$SKIP_REASON"
+  skip "tunnel.public_fetch_serves_workspace" "$SKIP_REASON"
+else
+  # A create failure that is NOT the rate limit: surface it as a hard failure,
+  # with the engine's own error, and still run the derived assertions.
+  echo "  tunnel create failed (not a rate limit): $TUN_BODY" >&2
+  chk "tunnel.url_is_trycloudflare" "yes" "no"
+  chk "tunnel.public_fetch_serves_workspace" "yes" "no"
 fi
-chk "tunnel.public_fetch_serves_workspace" "yes" "$PUBOK"
 
 # ---- 5) delete: 204 and the URL stops working ------------------------------
 echo "=== 5) delete the tunnel; the URL stops working ==="
-CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 30 -X DELETE "$BASE/v1/workspaces/$WSA/tunnels/$TID" -H "$A")
-chk "tunnel.delete_204" "204" "$CODE"
-sleep 3
-if [ "$URL_OK" = "yes" ]; then
+if [ "$CF_LIMITED" = "yes" ]; then
+  skip "tunnel.delete_204" "$SKIP_REASON"
+  skip "tunnel.url_dead_after_delete" "$SKIP_REASON"
+else
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 30 -X DELETE "$BASE/v1/workspaces/$WSA/tunnels/$TID" -H "$A")
+  chk "tunnel.delete_204" "204" "$CODE"
+  sleep 3
   GONE=$(timeout 20 curl -s -o /dev/null -w '%{http_code}' -m 12 "$URL/" 2>/dev/null)
   # After delete the edge answers 530 (origin gone) or the connection fails; a
   # 200 serving our body would be a failure.
@@ -336,14 +433,32 @@ fi
 
 # ---- 7) the tunnel dies with its workspace ---------------------------------
 echo "=== 7) the tunnel dies with its workspace ==="
-curl -s -o /dev/null -m 150 -X POST "$BASE/v1/workspaces/$WSA/tunnels" -H "$A" -H "$J" -d '{"port":5000}'
-CF_BEFORE=$(pgrep -fc 'cloudflared tunnel --no-autoupdate --url' 2>/dev/null || true)
-chk "lifetime.cf_running_before" "yes" "$([ -n "$CF_BEFORE" ] && [ "$CF_BEFORE" -ge 1 ] && echo yes || echo no)"
+if [ "$CF_LIMITED" = "yes" ]; then
+  # No cloudflared process can exist when provisioning is rate limited, so the
+  # lifetime assertions cannot be exercised. Workspace delete is still asserted
+  # (it must clean up regardless of tunnels).
+  skip "lifetime.cf_running_before" "$SKIP_REASON"
+  skip "lifetime.cf_gone_after_delete" "$SKIP_REASON"
+else
+  lifecycle_rc=0
+  create_tunnel_retry "$WSA" 5000 || lifecycle_rc=$?
+  if [ "$lifecycle_rc" = "1" ]; then
+    CF_LIMITED=yes
+    SKIP_REASON="cloudflare quick-tunnel rate limit (HTTP 429 from provisioning)"
+    skip "lifetime.cf_running_before" "$SKIP_REASON"
+    skip "lifetime.cf_gone_after_delete" "$SKIP_REASON"
+  else
+    CF_BEFORE=$(pgrep -fc 'cloudflared tunnel --no-autoupdate --url' 2>/dev/null || true)
+    chk "lifetime.cf_running_before" "yes" "$([ -n "$CF_BEFORE" ] && [ "$CF_BEFORE" -ge 1 ] && echo yes || echo no)"
+  fi
+fi
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 40 -X DELETE "$BASE/v1/workspaces/$WSA" -H "$A")
 chk "lifetime.ws_delete_204" "204" "$CODE"
-sleep 3
-CF_AFTER=$(pgrep -fc 'cloudflared tunnel --no-autoupdate --url' 2>/dev/null || true)
-chk "lifetime.cf_gone_after_delete" "0" "$([ -z "$CF_AFTER" ] && echo 0 || echo "$CF_AFTER")"
+if [ "$CF_LIMITED" != "yes" ]; then
+  sleep 3
+  CF_AFTER=$(pgrep -fc 'cloudflared tunnel --no-autoupdate --url' 2>/dev/null || true)
+  chk "lifetime.cf_gone_after_delete" "0" "$([ -z "$CF_AFTER" ] && echo 0 || echo "$CF_AFTER")"
+fi
 
 # ---- 8) zero host topology -------------------------------------------------
 echo "=== 8) zero host topology ==="
@@ -358,5 +473,11 @@ chk "topology.no_new_veth_or_tap" "0" "${noveth:-0}"
 chk "topology.netns_empty_after" "0" "$(ls -A "$NSDIR" 2>/dev/null | wc -l | tr -d ' ')"
 
 echo
-echo "================ tunnel acceptance: $PASS passed / $FAIL failed ================"
+if [ "$SKIP" -gt 0 ]; then
+  echo "================ tunnel acceptance: $PASS passed / $FAIL failed / $SKIP skipped ($SKIP_REASON) ================"
+else
+  echo "================ tunnel acceptance: $PASS passed / $FAIL failed / 0 skipped ================"
+fi
+# Exit 0 when nothing failed: skipped is an external-environment outcome, not a
+# failure of the engine. A single non-rate-limit failure still exits non-zero.
 [ "$FAIL" -eq 0 ]
