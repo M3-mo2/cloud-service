@@ -690,8 +690,9 @@ runner and the rendered-config assertions cannot.
 
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **51** numbered resolved decisions, each with a
-one-line rationale, plus implementation defaults.
+`docs/DECISIONS.md` contains **54** numbered resolved decisions, each with a
+one-line rationale, plus implementation defaults (including #54, the engine/
+frontend product boundary).
 
 ## 11. OpenAPI
 

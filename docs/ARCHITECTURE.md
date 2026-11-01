@@ -17,11 +17,12 @@
 ## 1. What is sandboxd, and what is it useful for?
 
 sandboxd is a **secure, multi-tenant code-execution backend exposed over
-HTTP/JSON**. A client (a web IDE, a CI runner, an AI agent, a grading system, a
-notebook frontend… anything that can make HTTP calls) authenticates with an API
-key, creates a *workspace*, uploads files into it, and runs code inside that
-workspace. The code runs in a locked-down `nsjail` sandbox with CPU, memory,
-disk, and process limits, and with **no network by default**.
+HTTP/JSON**. It is a **headless sandbox engine**: its clients are **trusted
+backend services**, not end users. A backend service (see
+[Who consumes sandboxd](#who-consumes-sandboxd)) holds a bearer service key,
+creates a *workspace* on a user's behalf, uploads files into it, and runs code
+inside that workspace. The code runs in a locked-down `nsjail` sandbox with CPU,
+memory, disk, and process limits, and with **no network by default**.
 
 ### The problem it solves
 
@@ -48,11 +49,35 @@ kernel-enforced isolation at the execution layer.
 | Data-transform jobs | Upload inputs, `run` a script, download results from the workspace |
 | Plugin/extension sandbox | Confine third-party code with no network + resource caps |
 
+### Who consumes sandboxd
+
+sandboxd is a **headless sandbox engine**. Its clients are **trusted backend
+services** that call it on a user's behalf — not the users themselves.
+
+- **The bearer keys are service credentials held by an operator-owned
+  frontend**, not user credentials. End users never see, hold, or send a
+  sandboxd key; the frontend keeps it server-side and attaches it to every
+  call. The static keys in `config.yaml` (`{key, principal_id}`) identify that
+  frontend (or a handful of trusted backends), and `principal_id` is the
+  ownership identity the service enforces.
+- **The frontend is a separate product with its own repo** — for example a
+  **Telegram bot product** that we are building separately. That product owns
+  accounts, authentication, plans, quotas, rate limiting, billing and credential
+  issuance, and calls cloud-service as a trusted backend client. Its internals
+  are **not decided in this document**.
+- **Out of scope for this repo, and owned by the frontend**: end-user accounts,
+  sign-up, per-user quota, plans, rate limiting, billing, and credential
+  issuance. This service neither implements nor enforces any of them.
+
+See [DECISIONS.md](DECISIONS.md) #54 for the decision and its consequences.
+
 ### What it deliberately is *not* (v0.0.5)
 
 Pre-alpha scope. It is a single-node, static-key service. Not yet: a hardened
 public-internet multi-tenant platform, a distributed scheduler, or a
 GPGPU/long-running job engine. See [§12 Known limitations](#12-known-limitations).
+It must **not be exposed directly to end users**, and it is not a user account
+or billing system (see [Who consumes sandboxd](#who-consumes-sandboxd)).
 
 ---
 
@@ -60,8 +85,8 @@ GPGPU/long-running job engine. See [§12 Known limitations](#12-known-limitation
 
 ```mermaid
 flowchart LR
-    subgraph Client["Client / SDK (any HTTP client)"]
-        C["curl, web app,\nCI, AI agent"]
+    subgraph Client["Trusted backend service (e.g. a Telegram bot product)"]
+        C["operator-owned frontend\nholds a service key\ncalls on the user's behalf"]
     end
 
     subgraph sandboxd["sandboxd process"]
@@ -844,7 +869,8 @@ sessions:                    # interactive terminal sessions (all defaulted)
   shell: "/bin/sh"           # default shell in the image
   kill_grace_sec: 3          # SIGHUP → SIGKILL grace
   start_probe_ms: 250        # startup reap window → honest failed vs running
-keys:                        # static bearer keys → principal_id (1:N allowed)
+keys:                        # service bearer keys → principal_id (1:N allowed);
+                             # held by the frontend, never by end users
   - { key: "dev-key-please-rotate", principal_id: "user_dev" }
 ```
 
@@ -955,15 +981,16 @@ Deferred to v0.1 (documented, not bugs):
 
 ## 13. Decision index
 
-The 51 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
+The 54 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
 including the isolation model, network default-off, retention (100 runs),
 exec-vs-runs split, disk-quota strategy, caps, path safety, process kill, error
 envelope, ULID IDs, health-probe semantics, the cgroup/rlimit/env/lifecycle
 corrections, run recovery, the workspace control plane (runtime-mutable limits,
 suspend vs stop, run filter/purge, usage accounting), the two-tier package model,
-the conditional resolver mounts, and terminal sessions (the PTY helper vs its
+the conditional resolver mounts, terminal sessions (the PTY helper vs its
 alternatives, stdin-pipe vs `--pass_fd`, signal-vs-stop, idle/lifetime values,
-restart/cleanup, output reuse and injection-proofing).
+restart/cleanup, output reuse and injection-proofing), and the engine/frontend
+product boundary (#54).
 
 ---
 
@@ -976,7 +1003,7 @@ restart/cleanup, output reuse and injection-proofing).
 | **exec** | One synchronous execution (≤60 s), output returned inline |
 | **session** | One interactive terminal with a real PTY; `ses_<ULID>` |
 | **PTY relay helper** | Stdlib-only Python script that allocates the PTY and relays the control protocol inside the sandbox |
-| **principal** | Identity behind an API key; ownership is per-principal |
+| **principal** | Identity behind a service bearer key; ownership is per-principal. The key is held by the frontend, not by an end user |
 | **nsjail** | Linux sandbox tool built on namespaces, cgroups, seccomp, rlimits |
 | **cgroup v2** | Unified Linux resource-control hierarchy |
 | **seccomp** | Syscall filtering; sandboxd KILLs a dangerous denylist |

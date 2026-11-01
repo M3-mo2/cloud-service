@@ -22,6 +22,13 @@ follows the implemented behaviour** and the disagreement is recorded in
 
 ### Authentication model
 
+sandboxd is a **headless sandbox engine**, and these keys are **service
+credentials held by an operator-owned frontend** (for example a separate
+Telegram bot product), not user credentials. End users never see, hold or send
+an API key; the frontend authenticates its own users and then calls sandboxd on
+their behalf as a trusted backend client. Everything below therefore describes
+the caller as a **service principal**, never an end user.
+
 Every `/v1` endpoint requires a static bearer key:
 
 ```

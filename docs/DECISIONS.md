@@ -301,6 +301,41 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     covers any immediate relay death (e.g. a missing interpreter), because the
     helper's non-zero exit arrives within the probe window.
 
+## v0.0.10 — product boundary (engine vs frontend)
+
+54. **sandboxd is a headless sandbox engine; a separate frontend product owns the users.**
+    _Context_: sandboxd authenticates with static bearer keys (`internal/auth/auth.go`:
+    `{key, principal_id}`, constant-time compare, no expiry, no quota, no per-key limits);
+    there is no rate limiting anywhere (`grep -rniE "ratelimit|limiter|throttle" internal/ cmd/`
+    → no matches), no per-principal/per-plan quota (`internal/config/` has only `max_limits`,
+    per-workspace request ceilings), and no user entity (`internal/` has only `owner_id`/
+    `principal_id`). The consumers were previously described only loosely, so a reader could
+    conclude an end user holds a key.
+    _Decision_: the service is a pure sandbox engine and its clients are **trusted backend
+    services**. The bearer keys are **service credentials held by an operator-owned frontend**
+    (for example a **Telegram bot product**, built in its own repo — its internals are **not
+    decided in this document**); end users never see, hold, or send them. The frontend owns
+    accounts, authentication, plans, quotas, rate limiting, billing and credential issuance,
+    and calls sandboxd on the user's behalf. End-user accounts, sign-up, per-user quota, plans,
+    rate limiting, billing and credential issuance are **out of scope for this repo**.
+    _Consequences_:
+    - **The service must not be exposed directly to end users.** With no authenticating frontend
+      in front of it, anyone who can reach the listener and holds a key has a workspace.
+    - **Abuse/quota policy is the frontend's responsibility**, so the operator must treat the
+      frontend as the trust boundary. Stated honestly: **a leaked service key is not
+      rate-limited or quota-limited by this service by design today** — `internal/auth` only maps
+      a key to a `principal_id` and never throttles; the per-workspace `max_limits` are per-
+      workspace ceilings, not per-principal quotas.
+    - **Blast radius of a leaked key is host-level resource consumption.** A leaked key can
+      create workspaces and run workloads up to the per-workspace `max_limits` (and the host's
+      own capacity) with no per-key bound to stop it; the sandbox confines *what* each run may do
+      (no network by default, rlimit/cgroup ceilings) but does not bound *how much* an attacker
+      with a valid key may start. Key rotation and abuse control therefore live in the frontend.
+    _Rationale_: naming the boundary explicitly keeps the two products from depending on each
+    other's internals, and makes the security consequence of a leaked key a documented property
+    rather than a surprise. The alternative — implying each end user holds a key — would misstate
+    the trust model and invite exposing the engine directly.
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.

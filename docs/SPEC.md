@@ -274,6 +274,30 @@ is refused too).
 Middleware `auth.Bearer(cfg.Keys)` extracts `principal_id`. Every workspace
 endpoint checks `workspace.owner_id == principal_id` → else 403 `forbidden`.
 
+#### 2.6.1 Scope boundary (non-goals)
+
+sandboxd is a **headless sandbox engine**; the bearer keys are **service
+credentials held by an operator-owned frontend** (for example a Telegram bot
+product, built separately and not specified here), and end users never see,
+hold, or send them. The auth implementation matches that scope, and the
+following are **explicitly non-goals of this repo** — enforcement belongs to the
+consuming frontend:
+
+- **Static config keys only** — `keys:` in `config.yaml`, each `{key,
+  principal_id}`; no dynamic key store or DB-backed auth.
+- **Identity is only a `principal_id` string** — there is no user entity; a
+  workspace records `owner_id` and nothing else about a person.
+- **No self-sign-up** — the service cannot create accounts, users or keys.
+- **No per-key quota or expiry** — a key never expires and carries no per-key
+  request/usage ceiling (`max_limits` is per-*workspace*, not per-principal).
+- **No rate limiting** — nothing throttles a valid key.
+- **No billing** — the service meters nothing and charges no one.
+
+Accounts, sign-up, per-user quota, plans, rate limiting, billing and credential
+issuance are owned by the frontend, which calls this service as a trusted
+backend client. See [DECISIONS.md](DECISIONS.md) #54 and
+[ARCHITECTURE.md](ARCHITECTURE.md) §1 "Who consumes sandboxd".
+
 ### 2.7 Audit log
 
 Every request logged as JSON to slog: `{ts, principal_id, workspace_id?,
