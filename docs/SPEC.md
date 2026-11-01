@@ -95,10 +95,14 @@ atomically and survives a restart.
 - `POST /v1/workspaces/{id}/resume` → 200 `{"workspace","changed"}`. Sets
   `status:"active"`; idempotent; does not restart stopped runs.
 - `POST /v1/workspaces/{id}/stop` → 200
-  `{"workspace","stopped_run_ids","stopped_run_count","stopped_session_ids","stopped_session_count"}`.
-  Kills every tracked run **and** ends every live terminal session (reason
-  `workspace_stopped`) but leaves the workspace `active` (accepting new work).
-  Idempotent; a no-op success when nothing is running.
+  `{"workspace","stopped_run_ids","stopped_run_count","stopped_session_ids","stopped_session_count","stopped_process_ids","stopped_process_count"}`.
+  Stops **everything**: every tracked run, every live terminal session (reason
+  `workspace_stopped`), and every `detached` process (a process started from a
+  session that carries no run/session attribution) — but leaves the workspace
+  `active` (accepting new work). Idempotent; a no-op success when nothing is
+  running. The original `stopped_run_*`/`stopped_session_*` fields keep their
+  shape; the `stopped_process_*` fields are additive. This is the
+  workspace-level **stop-everything** control (see §2.9).
 
 **Usage.** `GET /v1/workspaces/{id}/usage` → 200 with `workspace_id`, `status`,
 `created_at`, `last_activity_at`, `disk_bytes`, `disk_bytes_complete`, `disk_mb`,
@@ -109,6 +113,33 @@ entries); if the bound is hit, `disk_bytes_complete` is `false` and
 `disk_bytes` is a lower bound. `disk_percent` is
 `disk_bytes / (disk_mb * 1024 * 1024) * 100`. `last_activity_at` is the most
 recent run/mutation (run start/stop, purge, PATCH, suspend/resume/stop).
+
+**Process inventory and stop.** A workspace exposes every live process its
+sandbox is running, including processes started from a session:
+
+- `GET /v1/workspaces/{id}/processes` → 200
+  `{"processes":[{"id","pid","ppid","argv","kind","source_id","started_at"}],"count"}`.
+  `kind` is `run`, `session`, or `detached`; `source_id` is the run/session id
+  it belongs to (empty for `detached`). `id` is a stable opaque id
+  (`proc_<hex>`, a hash of workspace + pid + kernel start time). Attribution
+  uses each run's/session's **cgroup** plus a tag injected into every sandbox; a
+  process inside the workspace with no source tag is reported `detached`, never
+  hidden. An empty inventory is `{"processes":[],"count":0}`, never an error, and
+  a workspace's inventory never includes another workspace's processes.
+- `POST /v1/workspaces/{id}/processes/{processID}/stop` → 200
+  `{"process_id","status","stopped","stopped_at"}` where `status` is `stopped`
+  or `gone` (idempotent). It stops the process **tree** using the process's
+  cgroup — so a workload that called `os.setsid()` and left its process group is
+  still stopped — and returns `404` for an id that does not name a process in
+  this workspace, `403` across principals/workspaces.
+
+**No leaks.** When a run or session ends (any reason) the engine removes the
+cgroup it caused nsjail to create, so `NSJAIL.*` cgroups do not accumulate. On
+**startup**, alongside marking previously-live runs `interrupted` / sessions
+`killed`, the engine **reaps orphaned workloads and their cgroups** left by a
+hard (SIGKILL) daemon death, so an orphan does not keep running for the life of
+its `time_limit` (or forever when unbounded). A graceful `SIGTERM` shutdown
+already leaves nothing.
 
 ### 2.3 Files (per workspace)
 
@@ -379,30 +410,47 @@ the table) is:
 The code is not always a 1:1 mirror of the status: a **405 method not allowed**
 carries `code:"validation"`.
 
-### 2.9 Named long-lived projects/services — NOT IMPLEMENTED
+### 2.9 Named long-lived projects/services — NOT IMPLEMENTED (supervised services)
 
-The engine has **no notion of a named, long-lived "project" or "service"**. There
-is no way to declare a persistent process, no restart-on-crash, no autostart, and
-no lifecycle beyond a **single run** (§2.5) or a **single session** (§2.5.2):
+The engine has **no notion of a named, long-lived "project" or "service"** in
+the *supervised* sense: there is no way to declare a persistent process with a
+**desired state**, no **restart-on-crash**, no **autostart**, and no
+**reconcile loop**. A frontend that wants a "project that stays up" must
+implement that by re-issuing runs/sessions (and retrying on crash) on its side.
 
-- A **run** is one process tree. It runs until it exits, is stopped, or (when
-  bounded) hits its wall-clock limit; then it is finished. It is not restarted.
-- A **session** is one interactive shell. It ends on shell exit, `DELETE`, idle
-  timeout or lifetime; it is not restarted.
-- A **workspace** is a container of files and runs. It has no "start"/"stop my
-  service" state — `suspend`/`stop` stop *current* work, they do not define a
-  service to bring back up.
+What **does** exist natively now (and did not before) is a **workspace-level
+stop-everything**:
+
+- `POST /v1/workspaces/{id}/stop` stops **everything in the workspace** — every
+  run, every live session, and every **detached** process (a process started
+  from a session that carries no run/session attribution). A caller can therefore
+  reliably stop the dev server / bot / worker they launched in their own
+  terminal, which was previously invisible to and unreachable from the API.
+- `GET /v1/workspaces/{id}/processes` lists every live process of the workspace
+  so a caller can see (and count) what is running before stopping it, and
+  `POST /v1/workspaces/{id}/processes/{processID}/stop` stops one process tree
+  (cgroup-scoped, so a `setsid()`-escaping workload is caught too).
+
+What is **still not implemented** (the honest non-goal):
+
+- A **run** or a **session** is one process tree / one shell. It runs until it
+  exits, is stopped, or times out; it is **not restarted**, and there is no
+  record of a *desired* state to reconcile against.
+- A **workspace** has no "start my service" state: `suspend`/`stop` stop
+  *current* work (and `stop` now reaches detached processes too), but they do not
+  define a service to bring back up.
 - There is **no supervisor**: nothing re-launches a crashed workload, nothing
   keeps a workload running across a service restart (a restart moves any
-  queued/running run to `interrupted` and any running session to `killed`), and
-  there is no autostart on workspace resume.
+  queued/running run to `interrupted`, any running session to `killed`, and
+  **reaps any orphaned workload and cgroup left by a hard daemon death** — but
+  does not restart it), and there is no autostart on workspace resume.
 
-This is a **documented non-goal for the current version** (v0.0.5): a
-frontend that wants a "project that stays up" must implement it by re-issuing
-runs/sessions (and retrying on crash) on its side. Where such a capability would
-belong if built — an engine-level supervisor versus the frontend restarting runs
-— is recorded in [DECISIONS.md](DECISIONS.md) #61. **It is deliberately not
-implemented in this version.**
+Stated precisely: **stop-everything for a workspace exists natively now;
+supervision (desired-state restart/autostart) remains a documented non-goal for
+this version** (v0.0.5). Where such a capability would belong if built — an
+engine-level supervisor versus the frontend restarting runs — is recorded in
+[DECISIONS.md](DECISIONS.md) #61. **It is deliberately not implemented in this
+version.**
 
 ## 3. SECURITY / NSJAIL
 

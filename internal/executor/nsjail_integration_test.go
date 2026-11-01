@@ -6,6 +6,7 @@
 package executor
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -197,4 +198,110 @@ func sliceFromOffset(t *testing.T, path string, offset int64) string {
 		offset = int64(len(b))
 	}
 	return string(b[offset:])
+}
+
+// TestIntegrationProcessInventoryAndCgroupKill is the real-nsjail proof of the
+// native process inventory and cgroup-scoped stop: a workspace-tagged process
+// started inside a jail appears in ListJailProcesses, and its cgroup kill stops
+// it even though it was started with setsid() and left its process group.
+//
+// [requires privileged container] It needs a real nsjail and root; it skips when
+// either is absent and is excluded from normal builds by the integration tag.
+func TestIntegrationProcessInventoryAndCgroupKill(t *testing.T) {
+	if _, err := exec.LookPath("nsjail"); err != nil {
+		t.Skip("nsjail not installed")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("real nsjail needs root [requires privileged container]")
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "marker.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	r := NewNsjailRunner(cfg, writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{
+		ID:     "ws_proc_it",
+		Limits: model.Limits{CPUCores: 1, MemoryMB: 256, DiskMB: 10, MaxWallTimeSec: 120, MaxRuns: 4},
+	}
+	out := filepath.Join(t.TempDir(), "o.log")
+	errOut := filepath.Join(t.TempDir(), "e.log")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = r.Run(Request{
+			Workspace:     ws,
+			WorkspaceRoot: root,
+			Argv:          []string{"/bin/sh", "-c", "setsid sleep 120 </dev/null >/dev/null 2>&1 & sleep 120"},
+			Cwd:           "/",
+			Context:       ctx,
+			NoTimeout:     true,
+			RunID:         "run_proc_it",
+			StdoutPath:    out,
+			StderrPath:    errOut,
+			ProcessKind:   KindRun,
+			ProcessSource: "run_proc_it",
+		})
+	}()
+
+	// Poll the host inventory for a process tagged for this workspace whose argv
+	// is a sleep (the setsid child, which left the process group of its shell).
+	var target ProcessInfo
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, p := range ListJailProcesses() {
+			if p.WorkspaceID != ws.ID {
+				continue
+			}
+			if len(p.Argv) > 0 && strings.Contains(p.Argv[0], "sleep") {
+				target = p
+				break
+			}
+		}
+		if target.PID != 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if target.PID == 0 {
+		cancel()
+		<-done
+		t.Fatal("no process tagged for the workspace appeared in the inventory")
+	}
+	if target.Kind != KindRun || target.SourceID != "run_proc_it" {
+		t.Fatalf("attribution = kind %q source %q, want run/run_proc_it", target.Kind, target.SourceID)
+	}
+
+	// The cgroup-scoped kill must stop the setsid-escaping process.
+	if !r.KillProcessTree(target.PID) {
+		t.Fatal("KillProcessTree reported no signal")
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	alive := true
+	for time.Now().Before(deadline) {
+		alive = false
+		for _, p := range ListJailProcesses() {
+			if p.PID == target.PID {
+				alive = true
+				break
+			}
+		}
+		if !alive {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if alive {
+		t.Fatalf("setsid-escaping process %d survived the cgroup kill", target.PID)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
 }

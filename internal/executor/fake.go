@@ -31,6 +31,14 @@ type FakeRunner struct {
 	live     map[int]*fakeLive
 	lastLive *Request
 	nextPID  int
+
+	// Processes, when set, is returned by ListProcesses so the API/service layer
+	// can be tested without a real nsjail. killedPids tracks KillProcessTree;
+	// KilledProcesses records the pids in order.
+	Processes       []ProcessInfo
+	KilledProcesses []int
+	killedPids      map[int]bool
+	reaped          int
 }
 
 // fakeLive is an in-memory LiveProcess for tests.
@@ -196,6 +204,59 @@ func (f *FakeRunner) Kill(runID string) bool {
 	already := f.killed[runID]
 	f.killed[runID] = true
 	return !already
+}
+
+// ListProcesses returns the configured processes, minus any whose pid was
+// stopped through KillProcessTree. It models the real inventory without a jail.
+func (f *FakeRunner) ListProcesses() []ProcessInfo {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]ProcessInfo, 0, len(f.Processes))
+	for _, p := range f.Processes {
+		if f.killedPids[p.PID] {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// KillProcessTree records the pid as stopped and returns true (it models a
+// successful cgroup/process-group kill).
+func (f *FakeRunner) KillProcessTree(pid int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.killedPids == nil {
+		f.killedPids = map[int]bool{}
+	}
+	f.killedPids[pid] = true
+	f.KilledProcesses = append(f.KilledProcesses, pid)
+	return true
+}
+
+// ReapOrphans reports and clears the configured orphan count.
+func (f *FakeRunner) ReapOrphans() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := f.reaped
+	f.reaped = 0
+	return n
+}
+
+// SetOrphans configures how many orphans ReapOrphans reports.
+func (f *FakeRunner) SetOrphans(n int) {
+	f.mu.Lock()
+	f.reaped = n
+	f.mu.Unlock()
+}
+
+// SetProcesses replaces the inventory the fake returns.
+func (f *FakeRunner) SetProcesses(procs []ProcessInfo) {
+	f.mu.Lock()
+	f.Processes = procs
+	f.killedPids = map[int]bool{}
+	f.KilledProcesses = nil
+	f.mu.Unlock()
 }
 
 // Start launches an in-memory interactive process. It writes the configured

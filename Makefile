@@ -2,7 +2,7 @@ BINARY := sandboxd
 PKG := ./...
 GO ?= go
 
-.PHONY: all build test test-race lint fmt vet run clean tidy integration acceptance session-check
+.PHONY: all build test test-race lint fmt vet run clean tidy integration acceptance session-check process-check
 
 all: fmt vet build test
 
@@ -49,6 +49,14 @@ acceptance:
 # the Go toolchain is absent.
 session-check:
 	sudo -E bash scripts/session-nsjail-check.sh
+
+# Native process-control acceptance against REAL nsjail on the host (needs root
+# and the real nsjail binary; no container). It asserts the process inventory,
+# the cgroup-scoped stop (including a setsid()-escaping workload), the workspace
+# stop leaving zero processes, isolation, no cgroup growth, and orphan reaping
+# after a forced daemon death + restart.
+process-check:
+	sudo -E bash scripts/process-stop-check.sh
 
 lint:
 	@if command -v golangci-lint >/dev/null 2>&1; then \

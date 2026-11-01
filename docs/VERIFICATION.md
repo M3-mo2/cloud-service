@@ -48,8 +48,20 @@ ok  	sandboxd/internal/storage
 ok  	sandboxd/internal/workspace
 ```
 
-The `integration`-tagged tests invoke real nsjail and are run inside the same
-privileged container against a compiled test binary:
+The `integration`-tagged tests invoke real nsjail. They were re-run **directly on
+this host** (real nsjail at `/usr/local/bin/nsjail`, root, cgroup v2 writable) —
+the host is the privileged environment, so no container is needed:
+
+```
+$ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" HOME=/root \
+    go test -tags integration -count=1 ./internal/executor/
+ok  	sandboxd/internal/executor	4.660s
+```
+
+The four `integration` tests are `TestIntegrationPythonHello`,
+`TestIntegrationTimeout`, `TestIntegrationSessionRealPTY` and the new
+`TestIntegrationProcessInventoryAndCgroupKill` (native process control; see §9f).
+The historical container transcript is retained for the first three:
 
 ```
 $ docker run --rm --privileged --cgroupns=host \
@@ -71,7 +83,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **273** (270 unit + 3 `integration`-tagged), including regression
+Test functions: **288** (284 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -107,7 +119,7 @@ file (the same measure `scripts/docs-consistency.sh` asserts against):
 
 ```
 $ find . -name '*_test.go' -exec grep -hE '^func Test' {} + | wc -l
-273
+288
 ```
 
 ## 2. Probes
@@ -1020,13 +1032,138 @@ path leaves nothing behind — no known limitation remains. Unit coverage:
 `TestStopWorkspaceStopsRunsAndSessions` (and the existing
 `TestStopWorkspaceKillsRuns`/`TestSuspendStopsRunningRuns`).
 
+## 9f. Native process control: inventory, stop, no leaks (acceptance)
+
+The measured defect (see [DECISIONS.md](DECISIONS.md) #63): a process started
+inside a session was invisible to and unreachable from the API. `DELETE` of the
+session returned `200` and the process survived; `POST .../stop` left it alive;
+`GET .../runs` and `GET .../usage` reported zero; and `grep -c processes
+api/openapi.yaml` was `0`. There was **no API that could stop it**.
+
+The change adds `GET /v1/workspaces/{id}/processes`,
+`POST /v1/workspaces/{id}/processes/{processID}/stop`, extends
+`POST /v1/workspaces/{id}/stop` with the process fields, removes a run's/session's
+cgroup when it ends, and reaps orphaned workloads and cgroups on startup.
+
+### 9f.1 The measured mechanism (real nsjail, on this host)
+
+Every claim below was measured on the host with the real nsjail and cgroup v2
+before it was written into the code:
+
+- **A jail's cgroup is named after its workload.** A jail's workload (PID 1 of
+  its own PID namespace) is the first child of the nsjail process, and nsjail
+  names the cgroup `NSJAIL.<that host pid>`. Measured:
+  `/proc/<workload>/cgroup → 0::/NSJAIL.<workload>` and
+  `/proc/<workload>/status → NSpid: <host-pid> 1`.
+- **The cgroup is the only reliable handle.** A workload started with
+  `/usr/bin/setsid` leaves its process group, so `kill(-pgid)` misses it, but its
+  `/proc/<pid>/cgroup` still points at the jail's cgroup. `cgroup.kill` (writing
+  `1` to `<dir>/cgroup.kill`) SIGKILLs every member regardless. Measured: after
+  `echo 1 > NSJAIL.<n>/cgroup.kill` the setsid'd process was gone; the base
+  binary's pgid-only kill leaves it alive.
+- **The attribution tag is inherited.** `SANDBOXD_WORKSPACE`/`SANDBOXD_KIND`/
+  `SANDBOXD_SOURCE` rendered as nsjail `envar:` entries are present in the
+  `/proc/<pid>/environ` of the jailed process **and of a descendant** (a
+  `setsid`'d child), which is what lets the inventory map a detached process back
+  to its workspace/session.
+- **nsjail cleans up its own cgroup on a clean exit, but not after a SIGKILL.**
+  A quick `true` jail and a `SIGTERM` to nsjail both removed the cgroup and left
+  no surviving workload; a `SIGKILL` to nsjail left the cgroup **and** the
+  reparented workload alive (this is exactly why the startup reap is required).
+
+### 9f.2 The real-nsjail integration test
+
+`TestIntegrationProcessInventoryAndCgroupKill` (`//go:build integration`,
+[requires privileged container]) is the in-repo proof: it starts a run whose
+entry shell launches a `setsid sleep`, finds it in `ListJailProcesses` with
+`kind=run` and the right `source_id`, and asserts `KillProcessTree` stops it.
+
+```
+$ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" HOME=/root \
+    go test -tags integration -count=1 -run TestIntegrationProcessInventoryAndCgroupKill -v ./internal/executor/
+=== RUN   TestIntegrationProcessInventoryAndCgroupKill
+--- PASS: TestIntegrationProcessInventoryAndCgroupKill (0.13s)
+PASS
+ok  	sandboxd/internal/executor	0.131s
+```
+
+### 9f.3 The self-test script
+
+`scripts/process-stop-check.sh` is the purpose-built real-nsjail acceptance
+harness (Deliverable D). It hosts the service against the host's real nsjail,
+uses **two principals** (`dev-key-please-rotate`→`user_dev` and `other-key`→
+`user_other`, so the cross-owner check expects `403`), writes a config in which
+`allow_unlimited_runs: true` appears in **both** `limits` and `max_limits`
+(explicitly, never regex-patched — a substitution would produce a duplicate YAML
+key and read as a broken binary), puts `data_dir` outside the repo, and uses port
+`8099`. It stops its own workloads by exact pid / exact cgroup and never touches
+another tenant's.
+
+```
+$ sudo -E bash scripts/process-stop-check.sh
+=== building ===
+=== starting the service under real nsjail ===
+  service ready: {"cgroups":true,"data_dir":true,"nsjail":true,"status":"ready"}
+=== 1) a session-started detached process is listed with kind/source_id ===
+  PASS  detached process listed (yes)
+  PASS  detached process kind (session)
+  PASS  detached process source_id (ses_…)
+=== 2) DELETE of the session ends its whole process tree (the contract) ===
+  PASS  session delete (200)
+  PASS  session delete leaves zero processes (0)
+  PASS  no surviving marked process (bracketed pgrep) (0)
+=== 3) POST /workspaces/{id}/stop leaves zero processes for the workspace ===
+  PASS  workspace has live processes before stop (yes)
+  PASS  workspace stop returned 200 (200)
+  PASS  workspace stop leaves zero processes (0)
+  PASS  workspace stop: no marked survivor (0)
+=== 4) a setsid()-escaping workload is stopped by the single-process stop ===
+  PASS  setsid-escaped process listed (yes)
+  PASS  single-process stop status (200)
+  PASS  setsid-escaped process stopped (gone)
+  PASS  workspace empty after the single stop + cleanup (0)
+=== 5) isolation: workspace A's processes are not visible from workspace B ===
+  PASS  foreign inventory refused (403)
+  PASS  foreign process stop refused (403)
+  PASS  workspace A sees its own process (yes)
+  PASS  workspace B inventory empty (0)
+=== 6) NSJAIL cgroup count returns to its pre-run value ===
+  PASS  cgroups did not grow past baseline (no)
+  PASS  cgroups back to pre-run value (0)
+=== 7) a forced daemon death + restart reaps the orphan ===
+  PASS  marked workload alive before the kill (yes)
+  PASS  nsjail survived the hard daemon death (1)
+  PASS  nsjail reaped on restart (0)
+  PASS  orphan workload reaped on restart (0)
+  PASS  orphan cgroup removed on restart (0)
+
+================ process-stop acceptance: 25 passed / 0 failed ================
+```
+
+**Session-DELETE contract, stated and asserted.** `DELETE` of a session ends the
+session **and its process tree**: the executor reaps the session's cgroup when the
+session ends (any reason), so a process the session started cannot outlive it.
+The harness asserts exactly that (checks in §2 above): after `DELETE`, the
+inventory for the workspace is empty and no marked process survives. This is the
+stronger of the two contracts the task allowed ("does not leave it", or "still
+listed and stoppable"); the harness asserts the stronger one.
+
+**This is the check that catches the gap where unit tests stay green.** A stub
+runner cannot observe that a jailed, `setsid()`-escaped process survives a
+process-group kill; only the real nsjail + cgroup v2 can. The unprivileged suite
+covers the contract at the handler level (`TestListProcesses*`,
+`TestStopProcess*`, `TestStopWorkspaceStopsDetachedProcesses`,
+`TestProcessesCrossOwnerForbidden`) and the executor renders/parses the tag and
+`/proc` inputs (`TestTagEnvRenderedIntoConfig`, `TestParseStatPPIDAndStart`,
+`TestCgroupDirOfPIDSelf`); the harness proves the real behaviour.
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **62** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **63** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
-frontend product boundary, #55–58, the file browsing/viewing contract, and
+frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
-service non-goal).
+service non-goal, and #63, native process control).
 
 ## 11. OpenAPI
 

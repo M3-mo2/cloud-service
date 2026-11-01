@@ -205,6 +205,8 @@ func (s *Service) DeleteWorkspace(id, principalID string) error {
 	}
 	s.StopAllRuns(w.ID)
 	s.StopWorkspaceSessions(w.ID, model.SessionReasonWorkspaceDeleted)
+	// A detached process started from a session must not outlive the workspace.
+	s.StopDetachedProcesses(w)
 	if err := s.store.DeleteWorkspace(w.ID); err != nil {
 		return err
 	}

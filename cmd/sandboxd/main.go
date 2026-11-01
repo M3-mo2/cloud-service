@@ -54,6 +54,14 @@ func main() {
 	} else if n > 0 {
 		logger.Info("recovered orphaned sessions", "count", n)
 	}
+	// A run or session never survives a daemon restart, so any sandbox cgroup
+	// still present at startup is an orphan from a hard (SIGKILL) death: its
+	// workload keeps running (for the life of its time_limit, or forever when
+	// unbounded) and its NSJAIL.<pid> cgroup directory accumulates. Reap both
+	// before serving, so the "on the way in" half of the no-leak guarantee holds.
+	if n := svc.ReapOrphans(); n > 0 {
+		logger.Info("reaped orphaned sandbox cgroups", "count", n)
+	}
 	authn := auth.New(cfg.Keys)
 	server := api.NewServer(svc, authn, logger)
 

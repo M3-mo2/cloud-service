@@ -404,8 +404,8 @@ curl -s -X POST -H "Authorization: Bearer $KEY" \
 
 ### POST /v1/workspaces/{workspaceID}/stop
 
-Stop every running/queued run **and** every live terminal session of the
-workspace, and leave it `active`.
+Stop **everything** in the workspace — every running/queued run, every live
+terminal session, and every detached process — and leave it `active`.
 
 - **Path parameter:** `workspaceID`.
 - **Response 200:**
@@ -413,24 +413,113 @@ workspace, and leave it `active`.
   ```json
   {"workspace": <workspace with status "active">,
    "stopped_run_ids": ["run_..."], "stopped_run_count": 1,
-   "stopped_session_ids": ["ses_..."], "stopped_session_count": 1}
+   "stopped_session_ids": ["ses_..."], "stopped_session_count": 1,
+   "stopped_process_ids": ["proc_..."], "stopped_process_count": 2}
   ```
 
 - **Errors:** 401, 403, 404.
-- **Semantics:** this is the "stop its operations" control. It kills every
-  tracked run (SIGTERM→SIGKILL process group) **and** ends every live terminal
-  session (reason `workspace_stopped`), and reports what was stopped via both
-  counts and both id lists. The workspace keeps `status: active`, so new work is
-  still accepted. **Idempotent and a no-op success**
-  (`stopped_run_count: 0`, `stopped_session_count: 0`) when nothing is running.
-  It differs from `suspend` only in that it does **not** block future work.
-  Before the file-execution change this endpoint stopped runs only and left
-  sessions running; it now stops both (see
-  [DECISIONS.md](DECISIONS.md) #59 and [VERIFICATION.md §9d](VERIFICATION.md)).
+- **Semantics:** this is the "stop my thing" control. It kills every tracked run
+  (SIGTERM→SIGKILL process group) **and** ends every live terminal session
+  (reason `workspace_stopped`) **and** stops every `detached` process — a process
+  started from a session that carries no run/session attribution (see
+  [process inventory](#get-v1workspacesworkspaceidprocesses)); it reports what
+  was stopped via all three counts and all three id lists. The workspace keeps
+  `status: active`, so new work is still accepted. **Idempotent and a no-op
+  success** (`*_count: 0`) when nothing is running. It differs from `suspend`
+  only in that it does **not** block future work.
+  - The existing `stopped_run_*` and `stopped_session_*` fields keep their exact
+    shape (the frontend and `scripts/acceptance.sh` read them); the
+    `stopped_process_*` fields are additive.
+  - Before this change the endpoint stopped runs only and left sessions (and any
+    process a session had started) running; it now stops both, and the detached
+    processes too (see [DECISIONS.md](DECISIONS.md) #59 and #63, and
+    [VERIFICATION.md §9f](VERIFICATION.md)).
 
 ```sh
 curl -s -X POST -H "Authorization: Bearer $KEY" \
   localhost:8080/v1/workspaces/$WS/stop
+```
+
+### GET /v1/workspaces/{workspaceID}/processes
+
+List **every live process** belonging to the workspace, including processes
+started from a terminal session. This is the process inventory.
+
+- **Path parameter:** `workspaceID`.
+- **Response 200:**
+
+  ```json
+  {"processes":[
+     {"id":"proc_0123...","pid":179173,"ppid":179172,
+      "argv":["python3","bot.py"],"kind":"session",
+      "source_id":"ses_01J...","started_at":"2026-01-02T15:04:05Z"},
+     {"id":"proc_abcd...","pid":179200,"ppid":1,
+      "argv":["sleep","600"],"kind":"detached",
+      "source_id":"","started_at":"2026-01-02T15:04:06Z"}],
+   "count":2}
+  ```
+
+  | Field | Meaning |
+  |-------|---------|
+  | `id` | Stable opaque id, a hash of `(workspace, pid, kernel start time)`. It is what the single-process stop accepts and stays stable for the process's life. |
+  | `pid` | Host-side process id. |
+  | `ppid` | Host-side parent pid. |
+  | `argv` | The command line. |
+  | `kind` | `run`, `session`, or `detached`. |
+  | `source_id` | The run id / session id it belongs to; empty for `detached`. |
+  | `started_at` | When the process appeared. |
+
+- **Errors:** 401 `unauthorized`, 403 `forbidden`, 404 `not_found`.
+- **Semantics (attribution is the point):** the inventory enumerates the members
+  of each per-run / per-session **cgroup** and maps each host pid back to its
+  owning run/session using a tag the engine injects into every sandbox
+  (`SANDBOXD_WORKSPACE`/`SANDBOXD_KIND`/`SANDBOXD_SOURCE`). A process inside a
+  workspace's sandbox that carries no source tag is reported as **`detached`** —
+  it is **never hidden**; an inventory that silently omitted a process would be
+  worse than one that reports it. A workload that called `os.setsid()` and left
+  its process group is still found, because the cgroup (not the process group)
+  is the primitive.
+- **Isolation:** a workspace's inventory **never** lists another workspace's
+  processes, and a foreign principal gets **403** (the existing ownership
+  contract). An empty inventory is an honest `{"processes":[],"count":0}`, never
+  an error and never `null`.
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" \
+  localhost:8080/v1/workspaces/$WS/processes
+```
+
+### POST /v1/workspaces/{workspaceID}/processes/{processID}/stop
+
+Stop the **process tree** of one process, addressed by its stable `id` from the
+inventory.
+
+- **Path parameters:** `workspaceID`, `processID` (a `proc_<hex>` id).
+- **Response 200:**
+
+  ```json
+  {"process_id":"proc_0123...","status":"stopped","stopped":true,
+   "stopped_at":"2026-01-02T15:04:07Z"}
+  ```
+
+  `status` is `stopped` when a live tree was signalled, or `gone` when the
+  process had already exited (idempotent) — in that case `stopped` is `false`.
+- **Errors:** 401 `unauthorized`, 403 `forbidden` (foreign principal or a
+  workspace the caller does not own), 404 `not_found` (an id that does not name
+  a process in this workspace).
+- **Semantics:** **killing does not rely on the process group.** The stop uses
+  the process's sandbox **cgroup** (`cgroup.kill`, or an equivalent that signals
+  every member), so a workload that called `os.setsid()` and left its process
+  group is still stopped. The call is idempotent: a process that has already
+  exited is reported `gone` rather than an error, and a repeated stop is a 404
+  because the process is no longer in the inventory.
+
+```sh
+PID=$(curl -s -H "Authorization: Bearer $KEY" \
+  localhost:8080/v1/workspaces/$WS/processes | \
+  python3 -c 'import json,sys;print(json.load(sys.stdin)["processes"][0]["id"])')
+curl -s -X POST -H "Authorization: Bearer $KEY" \
+  localhost:8080/v1/workspaces/$WS/processes/$PID/stop
 ```
 
 ### GET /v1/workspaces/{workspaceID}/usage

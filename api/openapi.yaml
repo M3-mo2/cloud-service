@@ -15,6 +15,7 @@ tags:
   - name: Runs
   - name: Sessions
   - name: Packages
+  - name: Processes
 
 security:
   - bearerAuth: []
@@ -207,13 +208,67 @@ paths:
     post:
       operationId: postv1_workspaces_workspaceId_stop
       tags: [Workspaces]
-      summary: Stop every running/queued run, leaving the workspace active
+      summary: Stop everything in the workspace (runs, sessions and detached processes)
+      description: >
+        Stops every running/queued run, every live terminal session, and every
+        detached process (a process started from a session that carries no
+        run/session attribution), leaving the workspace `active`. Idempotent.
+        The existing `stopped_run_*` / `stopped_session_*` fields are unchanged;
+        `stopped_process_*` reports detached processes that were stopped.
       responses:
         "200":
           description: Stopped
           content:
             application/json:
               schema: { $ref: "#/components/schemas/WorkspaceAction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/workspaces/{workspaceId}/processes:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getv1_workspaces_workspaceId_processes
+      tags: [Processes]
+      summary: List every live process belonging to the workspace
+      description: >
+        Every live process in the workspace's sandbox, including processes
+        started from a terminal session. Attribution uses the per-jail cgroup
+        plus a tag the engine injects into every sandbox; a process inside the
+        workspace with no run/session attribution is reported as `detached`,
+        never hidden. An empty inventory is an honest empty list (`count: 0`),
+        never an error. A workspace's inventory never lists another workspace's
+        processes.
+      responses:
+        "200":
+          description: The workspace's live processes
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProcessList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/workspaces/{workspaceId}/processes/{processId}/stop:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/ProcessId"
+    post:
+      operationId: postv1_workspaces_workspaceId_processes_processId_stop
+      tags: [Processes]
+      summary: Stop one process tree by its stable id
+      description: >
+        Stops the process tree of one process, addressed by its stable `id` from
+        the process inventory. The stop is cgroup-scoped, so it also stops a
+        process that escaped its process group with `setsid()`. Idempotent: a
+        process that has already exited is reported with `stopped: false` and
+        status `gone`; an id that does not name a process in this workspace is
+        `404`.
+      responses:
+        "200":
+          description: Stop result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProcessStop" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -959,6 +1014,12 @@ components:
       in: path
       required: true
       schema: { type: string, pattern: "^ses_[0-9A-HJKMNP-TV-Z]{26}$" }
+    ProcessId:
+      name: processId
+      in: path
+      required: true
+      description: "A stable process id from the process inventory (`proc_<hex>`)."
+      schema: { type: string, pattern: "^proc_[0-9a-f]{24}$" }
   responses:
     Unauthorized:
       description: Missing or invalid credentials
@@ -1148,6 +1209,11 @@ components:
           description: "Live terminal sessions ended by this action (stop; also suspend)."
           items: { type: string }
         stopped_session_count: { type: integer }
+        stopped_process_ids:
+          type: array
+          description: "Detached processes stopped by this action (stop). Empty when there were none."
+          items: { type: string }
+        stopped_process_count: { type: integer }
     WorkspaceUsage:
       type: object
       required: [workspace_id, status, disk_bytes, disk_mb, runs_total, active_runs, max_runs, limits]
@@ -1169,6 +1235,56 @@ components:
         active_runs: { type: integer }
         max_runs: { type: integer }
         limits: { $ref: "#/components/schemas/Limits" }
+    Process:
+      type: object
+      required: [id, pid, ppid, argv, kind, source_id, started_at]
+      properties:
+        id:
+          type: string
+          description: >
+            Stable opaque identifier for the process, derived from
+            (workspace, host pid, kernel start time). It is what the
+            single-process stop endpoint accepts, and it stays stable for the
+            life of the process.
+          examples: ["proc_0123456789abcdef01234567"]
+        pid: { type: integer, description: "Host-side process id." }
+        ppid: { type: integer, description: "Host-side parent pid." }
+        argv:
+          type: array
+          items: { type: string }
+          description: "Command line."
+        kind:
+          type: string
+          enum: [run, session, detached]
+          description: >
+            `run`/`session` when the process is attributed to a run or terminal
+            session; `detached` when it is inside the workspace's sandbox but
+            belongs to neither (e.g. a process started from a session that left
+            the process group, or an exec child). A detached process is reported,
+            never hidden.
+        source_id:
+          type: string
+          description: "The run id / session id the process belongs to; empty for `detached`."
+        started_at: { type: string, format: date-time }
+    ProcessList:
+      type: object
+      required: [processes, count]
+      properties:
+        processes:
+          type: array
+          items: { $ref: "#/components/schemas/Process" }
+        count: { type: integer, description: "Number of processes in this list (0 is an honest empty inventory)." }
+    ProcessStop:
+      type: object
+      required: [process_id, status, stopped]
+      properties:
+        process_id: { type: string }
+        status:
+          type: string
+          enum: [stopped, gone]
+          description: "`stopped` when a live tree was signalled; `gone` when the process had already exited (idempotent)."
+        stopped: { type: boolean }
+        stopped_at: { type: string, format: date-time }
     Entry:
       type: object
       required: [name, path, type, size, mode, mod_time]

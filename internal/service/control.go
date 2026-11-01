@@ -200,6 +200,12 @@ func (s *Service) SuspendWorkspace(id string) (*model.Workspace, []string, bool,
 	}
 	s.StopAllRuns(id)
 	s.StopWorkspaceSessions(id, model.SessionReasonWorkspaceSuspended)
+	// A detached process started from a session is part of the workspace's work
+	// too; suspending must not leave it running. Its ids are not part of the
+	// suspend response (whose shape is fixed), but the processes are stopped.
+	if w != nil {
+		s.StopDetachedProcesses(w)
+	}
 	return w, stopped, changed, nil
 }
 
@@ -209,19 +215,41 @@ func (s *Service) ResumeWorkspace(id string) (*model.Workspace, bool, error) {
 	return s.SetSuspended(id, false)
 }
 
-// StopWorkspace stops every running/queued run of the workspace **and** every
-// live terminal session, leaving the workspace active. It returns the IDs of
-// the runs and the sessions that were signalled. It is idempotent and a no-op
-// success when nothing is running.
+// StopSummary reports what a workspace "stop everything" control stopped.
+type StopSummary struct {
+	RunIDs     []string
+	SessionIDs []string
+	ProcessIDs []string
+}
+
+// StopWorkspace stops **everything** in the workspace: every running/queued run,
+// every live terminal session, and every detached process (a process started
+// from a session that carries no run/session attribution). It returns the ids of
+// each that were signalled and leaves the workspace active. It is idempotent and
+// a no-op success when nothing is running.
 //
-// Stopping sessions here closes a gap: a workspace "stop its operations"
-// control that left terminal sessions running would not actually stop the
-// workspace's work (see docs/VERIFICATION.md §9d and docs/DECISIONS.md).
-func (s *Service) StopWorkspace(id string) ([]string, []string, error) {
+// This closes the gap that made "stop my thing" impossible: a process a user
+// started in their own terminal was invisible and unreachable, so stopping the
+// workspace left it running. Detached processes are stopped last, after runs and
+// sessions, so a descendant that reappears is still caught.
+func (s *Service) StopWorkspace(id string) (StopSummary, error) {
 	stoppedRuns := s.runningRunIDs(id)
 	s.StopAllRuns(id)
 	stoppedSessions := s.StopWorkspaceSessions(id, model.SessionReasonWorkspaceStopped)
-	return stoppedRuns, stoppedSessions, nil
+	stoppedProcs := s.stopAllProcesses(id)
+	return StopSummary{RunIDs: stoppedRuns, SessionIDs: stoppedSessions, ProcessIDs: stoppedProcs}, nil
+}
+
+// stopAllProcesses stops every live process tagged for the workspace, returning
+// the stopped process ids. Runs and sessions are stopped through their own
+// paths (which also remove their cgroups); anything still present here is a
+// detached process, but every current member is addressed so nothing is missed.
+func (s *Service) stopAllProcesses(id string) []string {
+	w, err := s.store.GetWorkspace(id)
+	if err != nil {
+		return nil
+	}
+	return s.StopDetachedProcesses(w)
 }
 
 // runningRunIDs returns the IDs of runs currently tracked for a workspace.

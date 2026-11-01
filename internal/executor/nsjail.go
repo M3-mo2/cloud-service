@@ -27,24 +27,26 @@ type NsjailRunner struct {
 	tmpDir   string
 	identity Identity
 
-	mu      sync.Mutex
-	procs   map[string]*os.Process // runID -> direct child (nsjail) process
-	avail   bool
-	availMu sync.Once
+	mu         sync.Mutex
+	procs      map[string]*os.Process // runID -> direct child (nsjail) process
+	cgroupDirs map[string]string      // runID -> NSJAIL cgroup directory
+	avail      bool
+	availMu    sync.Once
 
 	cgroupOnce sync.Once
-	cgroups    bool
+	cgUsable   bool
 }
 
 // NewNsjailRunner constructs a runner. tmplPath points at the nsjail config
 // template; tmpDir is where per-run configs are written.
 func NewNsjailRunner(cfg config.Config, tmplPath, tmpDir string) *NsjailRunner {
 	return &NsjailRunner{
-		cfg:      cfg,
-		tmplPath: tmplPath,
-		tmpDir:   tmpDir,
-		identity: ResolveIdentity(cfg),
-		procs:    make(map[string]*os.Process),
+		cfg:        cfg,
+		tmplPath:   tmplPath,
+		tmpDir:     tmpDir,
+		identity:   ResolveIdentity(cfg),
+		procs:      make(map[string]*os.Process),
+		cgroupDirs: make(map[string]string),
 	}
 }
 
@@ -62,13 +64,13 @@ func (r *NsjailRunner) CgroupsUsable() bool {
 	r.cgroupOnce.Do(func() {
 		dir, err := os.MkdirTemp(CgroupMount, "sandboxd-probe-*")
 		if err != nil {
-			r.cgroups = false
+			r.cgUsable = false
 			return
 		}
 		_ = os.Remove(dir)
-		r.cgroups = true
+		r.cgUsable = true
 	})
-	return r.cgroups
+	return r.cgUsable
 }
 
 // Available reports whether the nsjail binary exists and is executable.
@@ -247,7 +249,14 @@ func (r *NsjailRunner) runCapture(ctx context.Context, cmd *exec.Cmd, req Reques
 		closeWriteEnd(cmd)
 		if req.RunID != "" {
 			r.track(req.RunID, cmd.Process)
+			r.trackCgroup(req.RunID, resolveCgroup(cmd.Process.Pid))
 			defer r.untrack(req.RunID)
+			// On completion, reap the run's cgroup: nsjail normally removes it on
+			// a clean exit, but a workload that left a detached descendant (or
+			// that escaped its process group with setsid()) would otherwise keep
+			// the cgroup populated. Killing the cgroup tree and removing the
+			// directory is what makes "a run leaves nothing behind" true.
+			defer r.reapTrackedCgroup(req.RunID)
 		}
 		waitErr := cmd.Wait()
 		diagnostic := waitDiagnostic(diagDone)
@@ -431,21 +440,103 @@ func (r *NsjailRunner) track(runID string, p *os.Process) {
 	r.mu.Unlock()
 }
 
-func (r *NsjailRunner) untrack(runID string) {
+// KillProcessTree stops the process tree a host pid belongs to. When the pid is
+// inside a sandbox cgroup the whole cgroup is killed (so a process that escaped
+// its process group with setsid() is caught); otherwise the pid's process group
+// is signalled. It returns true when a signal was sent.
+func (r *NsjailRunner) KillProcessTree(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	if dir := CgroupDirOfPID(pid); dir != "" {
+		KillCgroupTree(dir)
+		return true
+	}
+	// Not in a sandbox cgroup: fall back to the process group.
+	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	}
+	deadline := time.Now().Add(r.cfg.Sandbox.KillGrace())
+	for time.Now().Before(deadline) {
+		if !processAlive(pid) {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	return true
+}
+
+// ListProcesses returns every live process currently inside a sandbox cgroup.
+func (r *NsjailRunner) ListProcesses() []ProcessInfo { return ListJailProcesses() }
+
+// ReapOrphans kills and removes every orphaned sandbox cgroup on the host.
+func (r *NsjailRunner) ReapOrphans() int { return ReapOrphans() }
+
+// trackCgroup records the NSJAIL cgroup directory for a run so a later stop can
+// kill the whole cgroup (not just the process group) and the completion path can
+// remove it.
+func (r *NsjailRunner) trackCgroup(runID, dir string) {
+	if runID == "" || dir == "" {
+		return
+	}
 	r.mu.Lock()
-	delete(r.procs, runID)
+	r.cgroupDirs[runID] = dir
 	r.mu.Unlock()
 }
 
-// Kill terminates the process group of a running run: SIGTERM, grace, SIGKILL.
+// resolveCgroup resolves the cgroup directory nsjail created for a jail it just
+// launched. It is best-effort: an empty result means the cgroup could not be
+// located (the workload already exited, or /proc is restricted); nsjail still
+// cleans up its own cgroup on a clean exit.
+func resolveCgroup(nsjailPID int) string {
+	return CgroupForNsjailPID(nsjailPID)
+}
+
+// reapTrackedCgroup kills the process tree of a run and removes its cgroup once
+// the run has ended, so a detached descendant cannot survive the run.
+func (r *NsjailRunner) reapTrackedCgroup(runID string) {
+	r.mu.Lock()
+	dir := r.cgroupDirs[runID]
+	r.mu.Unlock()
+	if dir != "" {
+		ReapCgroup(dir)
+	}
+}
+
+func (r *NsjailRunner) untrack(runID string) {
+	r.mu.Lock()
+	delete(r.procs, runID)
+	delete(r.cgroupDirs, runID)
+	r.mu.Unlock()
+}
+
+// Kill terminates the process tree of a running run. It prefers the run's
+// cgroup (killing every member, including a process that escaped its process
+// group with setsid()), falling back to the process group when no cgroup is
+// known. It then removes the cgroup it caused to be created.
 func (r *NsjailRunner) Kill(runID string) bool {
 	r.mu.Lock()
 	p, ok := r.procs[runID]
+	dir := r.cgroupDirs[runID]
 	r.mu.Unlock()
-	if !ok || p == nil {
-		return false
+
+	signalled := false
+	if dir != "" && killCgroup(dir) {
+		signalled = true
 	}
-	return killProcessGroup(p.Pid, r.cfg.Sandbox.KillGrace())
+	if ok && p != nil {
+		if killProcessGroup(p.Pid, r.cfg.Sandbox.KillGrace()) {
+			signalled = true
+		}
+	}
+	// Always try to remove a cgroup we created, bounded so a busy cgroup cannot
+	// hang a stop request.
+	if dir != "" {
+		waitCgroupGone(dir, r.cfg.Sandbox.KillGrace()+time.Second)
+	}
+	return signalled
 }
 
 // killProcessGroup sends SIGTERM to -pgid, waits graceSec, then SIGKILL.
@@ -564,6 +655,11 @@ type tmplData struct {
 	// PackagesPathEnv is the interpreter search-path value passed via the
 	// allowlisted PYTHONPATH variable (empty when no tier is mounted).
 	PackagesPathEnv string
+
+	// TagEnv carries the process-attribution tags (workspace + kind + source)
+	// as `KEY=VALUE` entries, injected into every sandbox so a process can be
+	// mapped back to its owning run/session in the inventory.
+	TagEnv []string
 }
 
 // Paths at which the package tiers are mounted inside the sandbox.
@@ -687,6 +783,8 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		SharedPackagesDir:  sharedDir,
 		PrivatePackagesDir: privateDir,
 		PackagesPathEnv:    pkgPath,
+
+		TagEnv: tagEnv(req),
 	}
 	if data.PidsMax <= 0 {
 		data.PidsMax = 64
@@ -796,6 +894,29 @@ func sortStrings(s []string) {
 			s[j-1], s[j] = s[j], s[j-1]
 		}
 	}
+}
+
+// tagEnv builds the process-attribution environment entries injected into the
+// sandbox. The workspace id is always available (from the request's workspace);
+// the kind/source are set for a run or a session. The values are service-chosen
+// (a workspace id, a run/session id, a fixed kind word) and are rendered as
+// quoted nsjail envar values, so no caller-supplied data reaches them.
+func tagEnv(req Request) []string {
+	wsID := ""
+	if req.Workspace != nil {
+		wsID = req.Workspace.ID
+	}
+	if wsID == "" {
+		return nil
+	}
+	out := []string{TagEnvWorkspace + "=" + wsID}
+	if req.ProcessKind != "" {
+		out = append(out, TagEnvKind+"="+req.ProcessKind)
+	}
+	if req.ProcessSource != "" {
+		out = append(out, TagEnvSource+"="+req.ProcessSource)
+	}
+	return out
 }
 
 // seccompPolicy returns the baseline syscall deny list applied to sandboxes.

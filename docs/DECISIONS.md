@@ -401,7 +401,9 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     _Rationale_: a single control that claims to stop a workspace's work must not
     leave half of it running; surfacing both counts lets a client report exactly
     what it stopped. Verified by the acceptance suite (`stop.*` checks) which
-    leaves zero processes of the workspace's tree.
+    leaves zero processes of the workspace's tree. **Extended in v0.0.13** (#63):
+    `stop` now also stops **detached** processes (a process started from a session
+    that carries no run/session attribution), which were previously unreachable.
 
 60. **Unbounded runs are opt-in twice, default deny, and recorded honestly.**
     _Context_: the product owner wants a user's file to run until the user stops
@@ -443,7 +445,10 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     engine-level supervisor is the more faithful place (the engine already owns
     `RecoverRuns`/`RecoverSessions`), but it is a new subsystem with its own
     decisions (restart backoff, crash-loop caps, desired-state storage), so it is
-    deliberately deferred. Stated honestly: **neither exists today.**
+    deliberately deferred. Stated honestly: **neither exists today.** **Nuance
+    added in v0.0.13** (#63): a workspace-level **stop-everything** *does* now
+    exist natively (see SPEC.md §2.2/§2.9); only the *supervised* named service
+    (desired-state, restart-on-crash, autostart) remains the non-goal.
 
 62. **A run's `cwd` is validated at request time; a bad `cwd` is 422, not 503
     (defect N-1).** _Context_: `cwd` was not carried on a bad path, so a missing
@@ -457,6 +462,61 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     _Rationale_: `cwd` is caller-controlled, so a typo must read as a bad request
     and never as a broken sandbox; the distinction is exactly the difference
     between "fix your request" and "page an operator".
+
+## v0.0.13 — native process control (enumerate and stop anything in a workspace)
+
+63. **A workspace can enumerate and stop every process it is running — including
+    one started from a session — using the per-jail cgroup, not the process
+    group.**
+    _Context_ (measured against the live service): a process started inside a
+    session (`nohup python3 probe.py &`) was invisible to and unreachable from the
+    API. `DELETE` of the session returned `200` and the process survived; `POST
+    /workspaces/{id}/stop` also left it alive; it appeared in **no** API surface
+    (`GET .../runs` → `0`, `GET .../usage` → `{"active_runs":0}`, and
+    `grep -c processes api/openapi.yaml` → `0`), so there was **no API that could
+    stop it at all**. Yet it belongs to a workspace: it is a child of that
+    workspace's sandbox and its cgroup (`/sys/fs/cgroup/NSJAIL.<pid>`) contains
+    it. The single most common "stop my thing" action — stopping the dev server /
+    bot / worker launched in one's own terminal — was therefore impossible.
+    _Decision_: (a) every sandbox is tagged with the workspace and (for a run or
+    session) its kind/source via environment variables
+    (`SANDBOXD_WORKSPACE`/`SANDBOXD_KIND`/`SANDBOXD_SOURCE`), which every
+    descendant inherits; (b) `GET /v1/workspaces/{id}/processes` enumerates the
+    members of each `NSJAIL.*` cgroup and maps each host pid back to its owning
+    workspace/run/session by that tag, reporting an unattributable member honestly
+    as `detached` (never hidden); (c) `POST /v1/workspaces/{id}/processes/{id}/stop`
+    and the extended `POST /v1/workspaces/{id}/stop` kill through the **cgroup**
+    (`cgroup.kill`), so a process that called `setsid()` and left its process
+    group is still caught; (d) when a run/session ends the engine **removes its
+    cgroup**, and on **startup** it **reaps orphaned workloads and cgroups** left
+    by a hard `SIGKILL` daemon death.
+    _Rationale_: **you cannot stop what you cannot see**, so enumeration and kill
+    share one primitive. The process group is insufficient by construction — a
+    workload that calls `setsid()`/`setpgid()` escapes `kill(-pgid)` but cannot
+    escape its cgroup — so `pgid`-only killing (decision #11) is kept as a
+    fallback but is not the mechanism for enumeration or for a guaranteed stop.
+    The `id` is a hash of `(workspace, pid, kernel start time)` because a bare host
+    pid is not stable across a restart (pids are recycled); the hash distinguishes
+    two processes that reuse a pid and stays stable for the process's life. The
+    rejected alternative — killing by `pgid` and accepting that a `setsid()`
+    workload survives — would report success while a process lived, which the
+    house rule forbids ("a stop that reports success while a process survives is
+    worse than a `500`"). The tag is an environment variable rather than a mount or
+    a name because it is inherited by every descendant with no extra plumbing.
+    Stated honestly: sandboxed code can re-write its own environment before
+    exec'ing a child, so the tag is not cryptographically bound — **but** a
+    workspace id (`ws_<ULID>`) is opaque and unguessable from inside a sandbox
+    (there is no `/proc` of the host, no workspace enumeration, and the id is not
+    derived from anything the workload can see), so a workload cannot learn
+    another principal's workspace id to mis-tag itself, and the **stop is
+    cgroup-scoped** so a kill can only ever affect the jail the addressed process
+    is actually in. Cross-*principal* steering is therefore infeasible; within one
+    principal's own workspaces there is no privilege boundary to cross. Verified
+    end-to-end under real nsjail by `scripts/process-stop-check.sh` (25
+    assertions), which includes a `setsid()`-escaping workload stopped by the
+    single-process stop, zero survivors after a workspace stop, a cgroup count that
+    returns to baseline, and an orphan reaped by a second start after a forced
+    daemon death.
 
 ## Additional defaults chosen during implementation
 

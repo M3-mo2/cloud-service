@@ -184,6 +184,7 @@ func (r *NsjailRunner) Start(req Request) (LiveProcess, error) {
 		diagDone:   diagDone,
 		helperTail: helperTail,
 		killGrace:  r.cfg.Sandbox.KillGrace(),
+		nsjailPID:  cmd.Process.Pid,
 	}
 	return lp, nil
 }
@@ -206,6 +207,20 @@ type liveProcess struct {
 
 	runTmp  string
 	cfgPath string
+
+	// nsjailPID is the direct child (nsjail) process id. The session's cgroup
+	// directory (NSJAIL.<leader>) is resolved lazily from it on first Kill/Wait,
+	// because nsjail creates the directory just after clone and a very short
+	// session would otherwise race the resolution.
+	nsjailPID int
+
+	// cgroupDir is the resolved NSJAIL cgroup the session runs in (cache; 0 when
+	// not yet resolved). It is the cgroup-scoped handle used to kill the whole
+	// session tree (including a process that escaped its process group with
+	// setsid()) and to remove the cgroup when the session ends.
+	cgroupMu  sync.Mutex
+	cgroupDir string
+	cgroupOK  bool
 
 	// helperTail mirrors the tail of the helper's stderr for a PTY session so
 	// an early PTY-allocation failure (PTYErrorMarker) is recognisable without
@@ -242,12 +257,37 @@ func (p *liveProcess) Pid() int {
 	return p.cmd.Process.Pid
 }
 
-// Kill terminates the process group.
-func (p *liveProcess) Kill() bool {
-	if p.cmd.Process == nil {
-		return false
+// cgroup resolves (once) the NSJAIL cgroup directory of the session's jail. It
+// returns "" when the cgroup cannot be located (the process already exited, or
+// /proc is restricted); Kill then falls back to the process group.
+func (p *liveProcess) cgroup() string {
+	p.cgroupMu.Lock()
+	defer p.cgroupMu.Unlock()
+	if p.cgroupOK {
+		return p.cgroupDir
 	}
-	return killProcessGroup(p.cmd.Process.Pid, p.killGrace)
+	p.cgroupDir = CgroupForNsjailPID(p.nsjailPID)
+	p.cgroupOK = true
+	return p.cgroupDir
+}
+
+// Kill terminates the session's process tree. It prefers the session's cgroup
+// (killing every member, including a process that escaped its process group with
+// setsid()), falling back to the process group. It then removes the cgroup.
+func (p *liveProcess) Kill() bool {
+	signalled := false
+	if dir := p.cgroup(); dir != "" {
+		if _, err := os.Stat(dir); err == nil {
+			KillCgroupTree(dir)
+			signalled = true
+		}
+	}
+	if p.cmd.Process != nil {
+		if killProcessGroup(p.cmd.Process.Pid, p.killGrace) {
+			signalled = true
+		}
+	}
+	return signalled
 }
 
 // Wait blocks for the process to exit and classifies the outcome. Artifacts
@@ -258,6 +298,13 @@ func (p *liveProcess) Wait() (Result, error) {
 	diagnostic := waitDiagnostic(p.diagDone)
 	_ = p.stdoutClose()
 	cleanupSessionArtifacts(p.cfgPath, p.runTmp)
+
+	// Reap the session's cgroup so a workload that outlived the shell (a
+	// detached process, or one that escaped its process group) cannot survive
+	// the session, and the cgroup directory does not accumulate.
+	if dir := p.cgroup(); dir != "" {
+		ReapCgroup(dir)
+	}
 
 	res := Result{Streamed: true, Truncated: p.out.truncated}
 	// Reuse Run's classification: a signalled exit is a kill, an nsjail exit

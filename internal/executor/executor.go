@@ -89,6 +89,14 @@ type Request struct {
 	Shell string
 	Cols  int
 	Rows  int
+
+	// ProcessKind / ProcessSource tag the sandbox with the identity of the work
+	// it belongs to ("run"/"session"/"exec" and the run/session id). The tag is
+	// inherited by every descendant, so the process inventory can attribute a
+	// detached process back to its owning workspace and source even when it left
+	// its process group. Empty values render no tag.
+	ProcessKind   string
+	ProcessSource string
 	// SessionOutputCap bounds the persisted PTY output log. It overrides the
 	// default run-log cap for a session.
 	SessionOutputCap int64
@@ -122,4 +130,16 @@ type Runner interface {
 	// Kill terminates a running process tree by run ID. It returns true if a
 	// live process was signalled.
 	Kill(runID string) bool
+	// ListProcesses returns every live process currently inside a sandbox
+	// (nsjail) cgroup on the host, with its attribution tags. The service
+	// filters by workspace. An unreadable process is omitted, never guessed.
+	ListProcesses() []ProcessInfo
+	// KillProcessTree stops the process tree a host pid belongs to: the pid's
+	// sandbox cgroup when it is jailed (so a process that escaped its process
+	// group with setsid() is still caught), else its process group. It returns
+	// true when something was signalled.
+	KillProcessTree(pid int) bool
+	// ReapOrphans kills and removes every orphaned sandbox cgroup left by a hard
+	// (SIGKILL) daemon death, and reports how many it reaped.
+	ReapOrphans() int
 }

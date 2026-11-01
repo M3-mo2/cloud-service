@@ -56,6 +56,11 @@ func (s *Service) Exec(w *model.Workspace, spec ExecSpec) (ExecOutcome, error) {
 		StdoutCap:     caps.ExecStdoutBytes(),
 		StderrCap:     caps.ExecStderrBytes(),
 
+		// Tag the sandbox so a process a synchronous exec leaves behind (a
+		// detached child) is still attributed to this workspace. Exec has no
+		// run/session id, so such a process is reported as "detached".
+		ProcessKind: executor.KindExec,
+
 		SharedPackagesDir:  sharedHost,
 		PrivatePackagesDir: privateHost,
 	}

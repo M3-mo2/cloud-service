@@ -149,7 +149,7 @@ func (s *Server) handleStopWorkspace(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	stoppedRuns, stoppedSessions, err := s.svc.StopWorkspace(ws.ID)
+	summary, err := s.svc.StopWorkspace(ws.ID)
 	if err != nil {
 		writeErrorWithCode(w, err)
 		return
@@ -162,10 +162,12 @@ func (s *Server) handleStopWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"workspace":             toWorkspaceJSON(updated),
-		"stopped_run_ids":       stoppedRuns,
-		"stopped_run_count":     len(stoppedRuns),
-		"stopped_session_ids":   stoppedSessions,
-		"stopped_session_count": len(stoppedSessions),
+		"stopped_run_ids":       summary.RunIDs,
+		"stopped_run_count":     len(summary.RunIDs),
+		"stopped_session_ids":   summary.SessionIDs,
+		"stopped_session_count": len(summary.SessionIDs),
+		"stopped_process_ids":   summary.ProcessIDs,
+		"stopped_process_count": len(summary.ProcessIDs),
 	})
 }
 

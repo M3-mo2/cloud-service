@@ -250,6 +250,11 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		StdoutCap:     caps.RunLogBytes(),
 		StderrCap:     caps.RunLogBytes(),
 
+		// Tag the sandbox so the process inventory can attribute every process
+		// (including a descendant that left the process group) to this run.
+		ProcessKind:   executor.KindRun,
+		ProcessSource: run.ID,
+
 		SharedPackagesDir:  sharedHost,
 		PrivatePackagesDir: privateHost,
 	}

@@ -103,6 +103,8 @@ NEW_PATHS=(
   "/v1/workspaces/{id}/sessions/{sessionID}/signal"
   "/v1/workspaces/{id}/sessions/{sessionID}/resize"
   "/v1/workspaces/{id}/sessions/{sessionID}/output"
+  "/v1/workspaces/{id}/processes"
+  "/v1/workspaces/{id}/processes/{processID}/stop"
 )
 for p in "${NEW_PATHS[@]}"; do
   # SPEC.md uses the {id} spelling; accept the {workspaceID} spelling too.
@@ -115,7 +117,7 @@ for p in "${NEW_PATHS[@]}"; do
 done
 
 # SPEC.md must mention the new features explicitly.
-for term in suspend resume usage package run session; do
+for term in suspend resume usage package run session process; do
   if grep -qi "$term" docs/SPEC.md; then
     ok "spec.md.term $term"
   else
@@ -162,6 +164,27 @@ else
   fail "session-harness.documented" "docs/VERIFICATION.md does not mention scripts/session-nsjail-check.sh"
 fi
 
+# --- 4c. the native process-control acceptance harness exists and is documented
+# The real-nsjail process-stop harness is the only check that catches a jailed,
+# setsid()-escaped process surviving a process-group kill, so it must exist, be
+# executable, and be named in VERIFICATION.md -- it cannot silently rot.
+
+if [ -f scripts/process-stop-check.sh ]; then
+  ok "process-harness.exists"
+else
+  fail "process-harness.exists" "scripts/process-stop-check.sh is missing"
+fi
+if [ -x scripts/process-stop-check.sh ]; then
+  ok "process-harness.executable"
+else
+  fail "process-harness.executable" "scripts/process-stop-check.sh is not executable"
+fi
+if grep -qF 'process-stop-check.sh' docs/VERIFICATION.md; then
+  ok "process-harness.documented"
+else
+  fail "process-harness.documented" "docs/VERIFICATION.md does not mention scripts/process-stop-check.sh"
+fi
+
 # --- 5. stated test count equals the real test count -----------------------
 
 STATED="$(grep -oE 'Test functions:[^0-9]*[0-9]+' docs/VERIFICATION.md | grep -oE '[0-9]+' | head -1)"
@@ -193,6 +216,8 @@ REQUIRED_TERMS=(
   "lifetime"
   "stdin"
   "diagnostic"
+  "cgroup"
+  "detached"
 )
 for term in "${REQUIRED_TERMS[@]}"; do
   if grep -qi -- "$term" docs/DECISIONS.md; then

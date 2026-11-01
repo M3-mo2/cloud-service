@@ -292,6 +292,9 @@ envar: "PATH=/usr/local/bin:/usr/bin:/bin"
 envar: "HOME=/tmp"
 envar: "LANG=C.UTF-8"
 envar: "PYTHONUNBUFFERED=1"
+{{- range .TagEnv }}
+envar: {{ printf "%q" . }}
+{{- end }}
 {{- range .Env }}
 envar: {{ printf "%q" . }}
 {{- end }}

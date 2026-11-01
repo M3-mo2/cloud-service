@@ -151,6 +151,11 @@ func (s *Service) StartSession(w *model.Workspace, spec StartSessionSpec) (*mode
 		SessionOutputCap:   s.cfg.Sessions.OutputBytes(),
 		SharedPackagesDir:  sharedHost,
 		PrivatePackagesDir: privateHost,
+		// Tag the sandbox so a process started from this session (even a
+		// detached one that left the process group) is attributed back to the
+		// session in the process inventory.
+		ProcessKind:   executor.KindSession,
+		ProcessSource: sess.ID,
 	}
 
 	lp, err := s.runner.Start(req)
