@@ -13,6 +13,7 @@ tags:
   - name: Files
   - name: Exec
   - name: Runs
+  - name: Sessions
   - name: Packages
 
 security:
@@ -664,6 +665,213 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /v1/workspaces/{workspaceId}/sessions:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: postv1_workspaces_workspaceId_sessions
+      tags: [Sessions]
+      summary: Start an interactive terminal session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSessionRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session]
+                properties:
+                  session: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/SessionConflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    get:
+      operationId: getv1_workspaces_workspaceId_sessions
+      tags: [Sessions]
+      summary: List sessions (filter and paginate)
+      parameters:
+        - name: status
+          in: query
+          description: Repeatable or comma-separated session statuses to keep.
+          schema: { type: string }
+        - name: limit
+          in: query
+          description: Maximum sessions to return; 0 means all remaining.
+          schema: { type: integer, default: 0 }
+        - name: offset
+          in: query
+          description: Number of matching sessions to skip.
+          schema: { type: integer, default: 0 }
+      responses:
+        "200":
+          description: List
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions, total]
+                properties:
+                  sessions:
+                    type: array
+                    items: { $ref: "#/components/schemas/Session" }
+                  total: { type: integer, description: matches before pagination }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/workspaces/{workspaceId}/sessions/{sessionId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getv1_workspaces_workspaceId_sessions_sessionId
+      tags: [Sessions]
+      summary: Get a session
+      responses:
+        "200":
+          description: Session
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session]
+                properties:
+                  session: { $ref: "#/components/schemas/Session" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: deletev1_workspaces_workspaceId_sessions_sessionId
+      tags: [Sessions]
+      summary: Close a session gracefully (idempotent)
+      responses:
+        "200":
+          description: Closed (changed=false when it was already terminal)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionAction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/workspaces/{workspaceId}/sessions/{sessionId}/input:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: postv1_workspaces_workspaceId_sessions_sessionId_input
+      tags: [Sessions]
+      summary: Write raw bytes to the session PTY
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [data]
+              properties:
+                data: { type: string, description: "Raw bytes written to the PTY; never interpreted as a control message." }
+      responses:
+        "204": { description: Written }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/SessionConflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+
+  /v1/workspaces/{workspaceId}/sessions/{sessionId}/signal:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: postv1_workspaces_workspaceId_sessions_sessionId_signal
+      tags: [Sessions]
+      summary: Signal the session foreground process group
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [signal]
+              properties:
+                signal: { type: string, enum: [INT, TERM, QUIT, HUP] }
+      responses:
+        "204": { description: Signalled }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/SessionConflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  /v1/workspaces/{workspaceId}/sessions/{sessionId}/resize:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    post:
+      operationId: postv1_workspaces_workspaceId_sessions_sessionId_resize
+      tags: [Sessions]
+      summary: Resize the session PTY (TIOCSWINSZ)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cols, rows]
+              properties:
+                cols: { type: integer, minimum: 1, maximum: 1000 }
+                rows: { type: integer, minimum: 1, maximum: 1000 }
+      responses:
+        "204": { description: Resized }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/SessionConflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  /v1/workspaces/{workspaceId}/sessions/{sessionId}/output:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+      - $ref: "#/components/parameters/SessionId"
+    get:
+      operationId: getv1_workspaces_workspaceId_sessions_sessionId_output
+      tags: [Sessions]
+      summary: Poll session PTY output by byte offset
+      parameters:
+        - name: offset
+          in: query
+          schema: { type: integer, format: int64, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, format: int64, default: 65536 }
+      responses:
+        "200":
+          description: Output chunk (same shape as run logs)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LogChunk" }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/SessionConflict" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -680,6 +888,11 @@ components:
       in: path
       required: true
       schema: { type: string, pattern: "^run_[0-9A-HJKMNP-TV-Z]{26}$" }
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema: { type: string, pattern: "^ses_[0-9A-HJKMNP-TV-Z]{26}$" }
   responses:
     Unauthorized:
       description: Missing or invalid credentials
@@ -731,6 +944,14 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    SessionConflict:
+      description: >
+        A 409 for a session route: `workspace_suspended` (the workspace is
+        suspended), `too_many_sessions` (the per-workspace cap is reached), or
+        `session_ended` (the session is already terminal).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
   schemas:
     ErrorCode:
       type: string
@@ -740,6 +961,8 @@ components:
         - not_found
         - conflict
         - workspace_suspended
+        - too_many_sessions
+        - session_ended
         - validation
         - unprocessable
         - payload_too_large
@@ -1027,3 +1250,46 @@ components:
         truncated: { type: boolean }
         duration_ms: { type: integer, format: int64 }
         target: { type: string, description: "Always /opt/python/private." }
+    CreateSessionRequest:
+      type: object
+      properties:
+        shell: { type: string, description: "Absolute shell path in the sandbox image; defaults to sessions.shell." }
+        cwd: { type: string, description: "Working directory inside the sandbox, relative to the workspace root; must exist and must not escape." }
+        cols: { type: integer, minimum: 1, maximum: 1000, default: 80 }
+        rows: { type: integer, minimum: 1, maximum: 1000, default: 24 }
+        env:
+          type: object
+          description: "User environment variables; only the allowlist is passed through (see ExecRequest)."
+          additionalProperties: { type: string }
+        timeout_sec: { type: integer, description: "Optional absolute-lifetime ceiling; clamped to sessions.lifetime_sec." }
+    Session:
+      type: object
+      required: [id, workspace_id, shell, cwd, cols, rows, status, created_at, last_activity_at, output_bytes, output_truncated]
+      properties:
+        id: { type: string, examples: ["ses_01H..."] }
+        workspace_id: { type: string }
+        shell: { type: string }
+        cwd: { type: string }
+        cols: { type: integer }
+        rows: { type: integer }
+        status:
+          type: string
+          enum: [running, exited, killed, timed_out]
+        created_at: { type: string, format: date-time }
+        last_activity_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time }
+        exit_code: { type: [integer, "null"] }
+        reason:
+          type: string
+          description: "Terminal reason: shell_exited, user_closed, idle_timeout, lifetime, workspace_deleted, workspace_suspended, service_shutdown, interrupted."
+        output_bytes: { type: integer, format: int64 }
+        output_truncated: { type: boolean, description: "true when the output cap (sessions.output_kb) was reached." }
+    SessionAction:
+      type: object
+      required: [session]
+      properties:
+        session: { $ref: "#/components/schemas/Session" }
+        changed:
+          type: boolean
+          description: "false when the session was already terminal (idempotency signal)."

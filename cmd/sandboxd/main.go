@@ -49,6 +49,11 @@ func main() {
 	} else if n > 0 {
 		logger.Info("recovered orphaned runs", "count", n)
 	}
+	if n, err := svc.RecoverSessions(); err != nil {
+		logger.Error("session recovery failed", "error", err)
+	} else if n > 0 {
+		logger.Info("recovered orphaned sessions", "count", n)
+	}
 	authn := auth.New(cfg.Keys)
 	server := api.NewServer(svc, authn, logger)
 
@@ -95,6 +100,9 @@ func main() {
 	}
 	if !svc.Shutdown(5 * time.Second) {
 		logger.Warn("run drain deadline exceeded; some runs may not have terminated")
+	}
+	if !svc.ShutdownSessions(5 * time.Second) {
+		logger.Warn("session drain deadline exceeded; some sessions may not have terminated")
 	}
 	logger.Info("stopped")
 }

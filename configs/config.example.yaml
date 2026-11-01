@@ -64,6 +64,32 @@ packages:
   install_timeout_sec: 120
   install_output_kb: 256
 
+# Server-side interactive terminal sessions.
+#
+# A session runs a real PTY inside the workspace's nsjail sandbox. The service
+# relays input/signal/resize through a line-delimited JSON control protocol to
+# a PTY helper and streams the PTY's output to a capped log file (reusing the
+# run-log mechanism). Every key below has a safe default, so the service starts
+# with none of them set.
+sessions:
+  # Maximum concurrent sessions (running or still-recorded) per workspace.
+  max_per_workspace: 4
+  # End a session after this many seconds without activity (input, signal,
+  # resize or output). Terminal status timed_out, reason idle_timeout.
+  idle_timeout_sec: 900
+  # Absolute wall-clock lifetime in seconds; ends with status timed_out and
+  # reason lifetime regardless of activity.
+  lifetime_sec: 3600
+  # Cap on the persisted PTY output log per session. Past it bytes are dropped
+  # and the session is marked output_truncated.
+  output_kb: 1024
+  # Maximum input payload accepted by a single input request.
+  max_input_kb: 64
+  # Default shell run inside the sandbox when a create request omits one.
+  shell: "/bin/sh"
+  # SIGHUP -> SIGKILL grace applied when a session is closed or times out.
+  kill_grace_sec: 3
+
 # Static API keys. Each entry maps a key to a principal_id.
 # Multiple keys may share a principal_id.
 keys:

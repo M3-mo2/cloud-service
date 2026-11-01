@@ -74,7 +74,9 @@ additional code the router emits:
 | `forbidden` | 403 | Resource belongs to another principal | Valid key, `owner_id` mismatch. |
 | `not_found` | 404 | Resource missing | Unknown workspace/run/file, unknown route. |
 | `conflict` | 409 | Operation conflicts with current state | Purging run history (or deleting one run) while a run is still queued/running. |
-| `workspace_suspended` | 409 | Work refused because the workspace is suspended | `POST .../exec` or `POST .../runs` on a `suspended` workspace. |
+| `workspace_suspended` | 409 | Work refused because the workspace is suspended | `POST .../exec`, `POST .../runs`, `POST .../sessions` or a session sub-resource on a `suspended` workspace. |
+| `too_many_sessions` | 409 | Per-workspace concurrent-session cap reached | `POST .../sessions` when `sessions.max_per_workspace` is already in use. |
+| `session_ended` | 409 | Operation on a terminal session | `input`/`signal`/`resize` (or `output` after `DELETE`) on a session that has ended; the workspace check wins while suspended. |
 | `validation` | 400 | Malformed or invalid request | Bad JSON, unknown JSON field, failing `validate` tag, missing query/body field, bad `stream`/`status`/`kind` filter, unknown route body. Also carries the **405** status for method-not-allowed. |
 | `unprocessable` | 422 | Unsafe path or invalid limit/target | Path traversal / symlink escape, `cwd` escape, command not found, deleting the workspace root, file-run target that is a directory, a limit `<= 0` or **above the server maximum**. |
 | `payload_too_large` | 413 | Body or file over a hard cap | JSON body > `json_body_mb`, upload > `upload_mb`, file write > `file_write_mb`. |
@@ -103,6 +105,8 @@ Hard caps, all from `internal/config` (never raisable per request):
 | `caps.exec_stdout_kb` | 256 | Sync exec stdout | `truncated:true` |
 | `caps.exec_stderr_kb` | 256 | Sync exec stderr | `truncated:true` |
 | `caps.run_log_mb` | 10 | Each async run log stream | `truncated:true` on the run |
+| `sessions.output_kb` | 1024 | Session PTY output log | `output_truncated:true` on the session |
+| `sessions.max_input_kb` | 64 | A single session input request | `413 payload_too_large` |
 
 Because `PUT /files/content` always travels in a JSON body, `json_body_mb`
 (1 MiB) is the effective ceiling for a single write; `file_write_mb` only bites
@@ -887,6 +891,319 @@ curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 # {"duration_ms":37,"exit_code":0,"stderr":"","stdout":"hi\n","truncated":false}
 ```
 
+### Sessions (interactive terminals)
+
+A **session** is a first-class, server-side interactive terminal. Unlike `exec`
+(one-shot, 60 s cap) and `runs` (async, no input channel), a session hosts a real
+PTY inside the workspace sandbox: a client can send input, read incremental
+output, change the window size, send a signal to the running command, and close
+it — all over the HTTP API. Session ids are `ses_<ULID>` and are unrelated to
+`run_` ids.
+
+Sessions are managed by the service, not re-implemented by each client. The
+interactive shell runs under the **same nsjail sandbox** as any other workload:
+same uid/gid, same seccomp policy, same mounts, no new privileges, and no host
+filesystem access. Network is available only when the workspace sets
+`allow_net:true`.
+
+#### How output, input, signals and resize work
+
+- **Output** reuses the run-log mechanism. The PTY relay helper copies the PTY's
+  byte stream to its stdout; the service writes that to
+  `{data}/workspaces/{ws}/sessions/{ses}/output.log`, capped at
+  `sessions.output_kb`. Clients poll it exactly like a run log, with
+  `offset`/`limit`, so a client can tail by passing the returned `next` back.
+- **Input** is relayed as a line-delimited JSON control message to the helper's
+  stdin. The client's `data` is written to the PTY as raw bytes and is **never**
+  interpreted as a command: a payload containing `{"type":"close"}` arrives as
+  literal text.
+- **Signals** are delivered to the session's **foreground process group**, so
+  `INT` interrupts the running command (Ctrl-C) **without ending the session**.
+  This is the difference from `POST .../runs/{id}/stop`, which kills the whole
+  run.
+- **Resize** issues `TIOCSWINSZ` on the PTY, so `stty size` inside the shell
+  reports the new size.
+
+#### Session statuses
+
+```
+running ──┬──► exited     (shell exited on its own; exit_code recorded)
+          ├──► killed     (DELETE, workspace delete, suspend, shutdown)
+          └──► timed_out  (idle timeout or absolute lifetime)
+```
+
+`running, exited, killed, timed_out` are the four values of `status`. A session
+also carries a `reason` for its terminal transition (`shell_exited`,
+`user_closed`, `idle_timeout`, `lifetime`, `workspace_deleted`,
+`workspace_suspended`, `service_shutdown`, `interrupted`,
+`sandbox_unavailable`). All terminal states are final.
+
+#### Session limits and config (`sessions:` in config)
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `sessions.max_per_workspace` | 4 | Concurrent sessions per workspace; over it is `409 too_many_sessions`. |
+| `sessions.idle_timeout_sec` | 900 | No activity for this long ends the session (`timed_out` / `idle_timeout`). Activity is any input, signal, resize or output. |
+| `sessions.lifetime_sec` | 3600 | Absolute wall-clock ceiling (`timed_out` / `lifetime`), regardless of activity. A create's `timeout_sec` may shorten it, never lengthen it. |
+| `sessions.output_kb` | 1024 | Cap on the persisted output log; past it bytes are dropped and `output_truncated` is set. |
+| `sessions.max_input_kb` | 64 | Cap on a single input request's `data`. |
+| `sessions.shell` | `/bin/sh` | Default shell (an absolute path in the sandbox image). |
+| `sessions.kill_grace_sec` | 3 | SIGHUP→SIGKILL grace when a session is closed or times out. |
+
+The service starts with none of these set (all have defaults).
+
+### POST /v1/workspaces/{workspaceID}/sessions
+
+Start an interactive terminal session.
+
+- **Path parameter:** `workspaceID`.
+- **Request body (`createSessionRequest`):**
+
+  | Field | Go type | JSON | Required | Validation | Default |
+  |-------|---------|------|----------|------------|---------|
+  | `shell` | `string` | `shell` | no | absolute path available in the image | `sessions.shell` |
+  | `cwd` | `string` | `cwd` | no | resolved against the workspace root; must exist and be a directory; must not escape | workspace root |
+  | `cols` | `int` | `cols` | no | `1..1000` | 80 |
+  | `rows` | `int` | `rows` | no | `1..1000` | 24 |
+  | `env` | `map[string]string` | `env` | no | same allowlist as `exec` | none |
+  | `timeout_sec` | `int` | `timeout_sec` | no | clamped to `sessions.lifetime_sec` | `sessions.lifetime_sec` |
+
+- **Response 201:**
+
+  ```json
+  {"session":{"id":"ses_01J...","workspace_id":"ws_01J...","shell":"/bin/sh",
+    "cwd":"/","cols":80,"rows":24,"status":"running",
+    "created_at":"2026-01-02T15:04:05Z","last_activity_at":"2026-01-02T15:04:05Z",
+    "started_at":"2026-01-02T15:04:05Z","ended_at":"","exit_code":null,
+    "output_bytes":0,"output_truncated":false}}
+  ```
+- **Errors:** 400 `validation`, 401 `unauthorized`, 403 `forbidden`, 404
+  `not_found` (workspace), 409 `workspace_suspended`, **409
+  `too_many_sessions`** (the per-workspace cap is reached), 413
+  `payload_too_large`, 422 `unprocessable` (`cwd` escapes / missing / not a
+  directory, `shell` not absolute, `cols`/`rows` out of range), 503
+  `unavailable` (nsjail missing or a sandbox launch failure).
+- **Semantics:** the shell runs as a session leader on a freshly allocated PTY,
+  in the workspace's sandbox. A session is refused while the workspace is
+  suspended (`409 workspace_suspended`), exactly like `exec` and `runs`.
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"shell":"/bin/sh","cols":80,"rows":24}' \
+  localhost:8080/v1/workspaces/$WS/sessions
+```
+
+### GET /v1/workspaces/{workspaceID}/sessions
+
+List the workspace's sessions, newest first, with the same filter/pagination
+shape as the runs list.
+
+- **Path parameter:** `workspaceID`.
+- **Query parameters:**
+  - `status` (string, repeatable or comma-separated) — one or more of
+    `running,exited,killed,timed_out`; an unknown value is `400`.
+  - `limit` (int) — max sessions to return; `0`/absent means all remaining.
+  - `offset` (int) — sessions to skip (default 0).
+- **Response 200:** `{"sessions":[ <session>, ... ], "total": N, "limit": L, "offset": O}`.
+  `total` counts matches before pagination.
+- **Errors:** 400 `validation`, 401, 403.
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" \
+  "localhost:8080/v1/workspaces/$WS/sessions?status=running"
+```
+
+### GET /v1/workspaces/{workspaceID}/sessions/{sessionID}
+
+Fetch one session (the same object returned everywhere).
+
+- **Path parameters:** `workspaceID`, `sessionID` (`ses_<ULID>`).
+- **Response 200:** `{"session": <session>}`.
+- **Errors:** 401, 403, 404.
+
+### POST /v1/workspaces/{workspaceID}/sessions/{sessionID}/input
+
+Append raw bytes to the session's PTY.
+
+- **Path parameters:** `workspaceID`, `sessionID`.
+- **Request body:** `{"data":"<raw string>"}` — `data` is required and non-empty.
+- **Response 204:** empty body.
+- **Errors:** 400 `validation` (missing `data`), 401, 403, 404, 409
+  `workspace_suspended` (workspace check wins), **409 `session_ended`** (the
+  session is a terminal tombstone — see below), 413 `payload_too_large` (over
+  `sessions.max_input_kb`).
+- **Semantics:** the value is relayed to the helper, which writes it to the PTY
+  verbatim. Input bytes are never interpreted as helper commands.
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"data":"make test\n"}' \
+  localhost:8080/v1/workspaces/$WS/sessions/$SES/input
+```
+
+### POST /v1/workspaces/{workspaceID}/sessions/{sessionID}/signal
+
+Deliver a signal to the session's **foreground process group**.
+
+- **Path parameters:** `workspaceID`, `sessionID`.
+- **Request body:** `{"signal":"INT"|"TERM"|"QUIT"|"HUP"}`.
+- **Response 204:** empty body.
+- **Errors:** 400 `validation`, 401, 403, 404, 409 `workspace_suspended`, 409
+  `session_ended`, 422 `unprocessable` (a signal outside the allowed set).
+- **Semantics:** a signal interrupts the running command **without ending the
+  session**, so the same session can run another command afterwards. This is the
+  key distinction from `POST .../runs/{id}/stop`, which terminates the run.
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"signal":"INT"}' \
+  localhost:8080/v1/workspaces/$WS/sessions/$SES/signal
+```
+
+### POST /v1/workspaces/{workspaceID}/sessions/{sessionID}/resize
+
+Change the PTY window size.
+
+- **Path parameters:** `workspaceID`, `sessionID`.
+- **Request body:** `{"cols":N,"rows":M}`.
+- **Response 204:** empty body.
+- **Errors:** 400 `validation`, 401, 403, 404, 409 `workspace_suspended`, 409
+  `session_ended`, 422 `unprocessable` (`cols`/`rows` out of range).
+- **Semantics:** issues `TIOCSWINSZ` on the PTY, so `stty size` inside the shell
+  reports the new dimensions.
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"cols":120,"rows":40}' \
+  localhost:8080/v1/workspaces/$WS/sessions/$SES/resize
+```
+
+### GET /v1/workspaces/{workspaceID}/sessions/{sessionID}/output
+
+Poll the session's PTY output by byte offset. Same semantics as the run-log
+endpoint.
+
+- **Path parameters:** `workspaceID`, `sessionID`.
+- **Query parameters:**
+  - `offset` (int64) — start byte offset; default and negative → 0; beyond the
+    current size → clamped to the size.
+  - `limit` (int64) — max bytes to return; default and `<=0` → 65536.
+- **Response 200:**
+
+  ```json
+  {"data":"$ ","offset":0,"next":2,"eof":true,"truncated":false}
+  ```
+
+  `truncated` mirrors the session's `output_truncated` (the write cap was hit);
+  for a long-running session it stays `false` until the output cap is reached.
+- **Errors:** 400 `validation`, 401, 403, 404, **409 `session_ended`** (session
+  ended by `DELETE`), 409 `workspace_suspended`.
+- **Tailing recipe (identical to run logs):**
+  1. `GET` with `offset=0`; write `data`; set `offset = next`.
+  2. While `eof` is `false`, repeat step 1.
+  3. If the session is still `running`, sleep briefly and repeat from step 1 (a
+     live session may append between polls, flipping `eof` back to `false`).
+  4. Stop when the session is terminal and a final poll returns `eof:true`.
+
+```sh
+OFFSET=0
+while :; do
+  CHUNK=$(curl -s -H "Authorization: Bearer $KEY" \
+    "localhost:8080/v1/workspaces/$WS/sessions/$SES/output?offset=$OFFSET&limit=65536")
+  printf '%s' "$CHUNK" | python3 -c 'import json,sys;d=json.load(sys.stdin);sys.stdout.write(d["data"])'
+  OFFSET=$(printf '%s' "$CHUNK" | python3 -c 'import json,sys;print(json.load(sys.stdin)["next"])')
+  EOF=$(printf '%s' "$CHUNK" | python3 -c 'import json,sys;print(json.load(sys.stdin)["eof"])')
+  STATUS=$(curl -s -H "Authorization: Bearer $KEY" \
+    "localhost:8080/v1/workspaces/$WS/sessions/$SES" | python3 -c 'import json,sys;print(json.load(sys.stdin)["session"]["status"])')
+  [ "$EOF" = "True" ] && [ "$STATUS" != "running" ] && break
+  sleep 1
+done
+```
+
+### DELETE /v1/workspaces/{workspaceID}/sessions/{sessionID}
+
+End a session gracefully: SIGHUP the shell, then SIGKILL its process group after
+`sessions.kill_grace_sec`.
+
+- **Path parameters:** `workspaceID`, `sessionID`.
+- **Response 200:**
+
+  ```json
+  {"session": <session with status "killed" and reason "user_closed">, "changed": true}
+  ```
+
+  `changed` is `true` when this call ended a live session and `false` on a
+  repeat (the session was already terminal).
+- **Errors:** 401, 403, 404 `not_found` (a session id that never existed).
+- **Semantics:** idempotent. The terminal record and its output log are
+  **retained** (so the session stays inspectable), and later `input`/`output`
+  calls report **409 `session_ended`** rather than `not_found`. The record is
+  removed with the workspace. **Ended-session rule:** input, signal, resize and
+  output on a session ended by `DELETE` return `409 session_ended`; on a session
+  that ended on its own (shell exit, idle/lifetime timeout) `output` stays
+  readable while `input`/`signal`/`resize` return `409 session_ended`.
+
+```sh
+curl -s -X DELETE -H "Authorization: Bearer $KEY" \
+  localhost:8080/v1/workspaces/$WS/sessions/$SES
+# {"changed":true,"session":{"id":"ses_...","status":"killed","reason":"user_closed",...}}
+```
+
+#### Worked session example (create → input → output → signal → resize → delete)
+
+```sh
+KEY=dev-key-please-rotate
+AUTH="Authorization: Bearer $KEY"
+JSON="Content-Type: application/json"
+BASE=http://127.0.0.1:8080
+
+WS=$(curl -s -H "$AUTH" -H "$JSON" -d '{"name":"terminal"}' \
+      $BASE/v1/workspaces | python3 -c 'import json,sys;print(json.load(sys.stdin)["workspace"]["id"])')
+
+# 1. create
+SES=$(curl -s -H "$AUTH" -H "$JSON" -d '{"cols":80,"rows":24}' \
+      $BASE/v1/workspaces/$WS/sessions \
+      | python3 -c 'import json,sys;print(json.load(sys.stdin)["session"]["id"])')
+
+# 2. run a command through the PTY
+curl -s -o /dev/null -H "$AUTH" -H "$JSON" \
+  -d '{"data":"test -t 1 && echo REAL_TTY\n"}' \
+  $BASE/v1/workspaces/$WS/sessions/$SES/input
+
+# 3. read the output incrementally
+OFFSET=0
+while :; do
+  C=$(curl -s -H "$AUTH" "$BASE/v1/workspaces/$WS/sessions/$SES/output?offset=$OFFSET")
+  printf '%s' "$C" | python3 -c 'import json,sys;sys.stdout.write(json.load(sys.stdin)["data"])'
+  OFFSET=$(printf '%s' "$C" | python3 -c 'import json,sys;print(json.load(sys.stdin)["next"])')
+  [ "$(printf '%s' "$C" | python3 -c 'import json,sys;print(json.load(sys.stdin)["eof"])')" = "True" ] && break
+done
+# $ test -t 1 && echo REAL_TTY
+# REAL_TTY
+
+# 4. interrupt a long command (session survives)
+curl -s -o /dev/null -H "$AUTH" -H "$JSON" -d '{"data":"sleep 30\n"}' \
+  $BASE/v1/workspaces/$WS/sessions/$SES/input
+curl -s -o /dev/null -H "$AUTH" -H "$JSON" -d '{"signal":"INT"}' \
+  $BASE/v1/workspaces/$WS/sessions/$SES/signal
+
+# 5. resize
+curl -s -o /dev/null -H "$AUTH" -H "$JSON" -d '{"cols":120,"rows":40}' \
+  $BASE/v1/workspaces/$WS/sessions/$SES/resize
+
+# 6. close
+curl -s -X DELETE -H "$AUTH" $BASE/v1/workspaces/$WS/sessions/$SES
+# {"changed":true,"session":{"status":"killed","reason":"user_closed",...}}
+
+# after DELETE, input reports the documented ended-session error
+curl -s -H "$AUTH" -H "$JSON" -d '{"data":"x"}' \
+  $BASE/v1/workspaces/$WS/sessions/$SES/input
+# {"error":{"code":"session_ended","message":"session has ended","details":{"status":"killed"}}}
+```
+
 ### POST /v1/workspaces/{workspaceID}/runs
 
 Start an asynchronous run. Returns immediately; poll it via the run endpoints.
@@ -1363,6 +1680,18 @@ should be updated.
     implementation.
 14. **`LogChunk.truncated` is always false.** The field is in the schema but is
     never set to true; log truncation is reported on the run's `logs.truncated`.
+15. **Session `DELETE` returns 200, not 204.** Unlike `DELETE .../runs/{id}`
+    (204), `DELETE .../sessions/{id}` returns 200 with a
+    `{session, changed}` body so the idempotency signal and the terminal state
+    are observable. It also retains the terminal record (the run delete removes
+    it), so a repeat DELETE reports `changed:false` rather than 404.
+16. **Session path parameter is `sessionId` in OpenAPI, `sessionID` in the
+    router** (same class as discrepancy 1). The value is positional, so there
+    is no client-visible effect.
+17. **`GET .../sessions/{id}/output` returns 409 `session_ended` after DELETE.**
+    For a session ended by DELETE the output is deliberately a tombstone; a
+    session that ended on its own keeps its output readable. This is the one
+    place the session output differs from the run log (which stays readable).
 
 ## Notes
 

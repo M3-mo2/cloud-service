@@ -22,8 +22,9 @@ type Service struct {
 	runner executor.Runner
 	logger *slog.Logger
 
-	mu   sync.Mutex
-	runs map[string]*runningRun
+	mu       sync.Mutex
+	runs     map[string]*runningRun
+	sessions map[string]*liveSession
 }
 
 type runningRun struct {
@@ -36,11 +37,12 @@ type runningRun struct {
 // New constructs a Service.
 func New(cfg config.Config, store *storage.Store, runner executor.Runner, logger *slog.Logger) *Service {
 	return &Service{
-		cfg:    cfg,
-		store:  store,
-		runner: runner,
-		logger: logger,
-		runs:   make(map[string]*runningRun),
+		cfg:      cfg,
+		store:    store,
+		runner:   runner,
+		logger:   logger,
+		runs:     make(map[string]*runningRun),
+		sessions: make(map[string]*liveSession),
 	}
 }
 
@@ -162,13 +164,14 @@ func (s *Service) ListWorkspaces(principalID string) ([]*model.Workspace, error)
 	return s.store.ListWorkspaces(principalID)
 }
 
-// DeleteWorkspace stops all runs and removes the workspace tree.
+// DeleteWorkspace stops all runs and sessions and removes the workspace tree.
 func (s *Service) DeleteWorkspace(id, principalID string) error {
 	w, err := s.GetOwnedWorkspace(id, principalID)
 	if err != nil {
 		return err
 	}
 	s.StopAllRuns(w.ID)
+	s.StopWorkspaceSessions(w.ID, model.SessionReasonWorkspaceDeleted)
 	if err := s.store.DeleteWorkspace(w.ID); err != nil {
 		return err
 	}

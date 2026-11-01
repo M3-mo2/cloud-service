@@ -97,6 +97,12 @@ NEW_PATHS=(
   "/v1/workspaces/{id}/suspend"
   "/v1/workspaces/{id}/resume"
   "/v1/workspaces/{id}/stop"
+  "/v1/workspaces/{id}/sessions"
+  "/v1/workspaces/{id}/sessions/{sessionID}"
+  "/v1/workspaces/{id}/sessions/{sessionID}/input"
+  "/v1/workspaces/{id}/sessions/{sessionID}/signal"
+  "/v1/workspaces/{id}/sessions/{sessionID}/resize"
+  "/v1/workspaces/{id}/sessions/{sessionID}/output"
 )
 for p in "${NEW_PATHS[@]}"; do
   # SPEC.md uses the {id} spelling; accept the {workspaceID} spelling too.
@@ -108,8 +114,8 @@ for p in "${NEW_PATHS[@]}"; do
   fi
 done
 
-# SPEC.md must mention the two new features explicitly.
-for term in suspend resume usage package run; do
+# SPEC.md must mention the new features explicitly.
+for term in suspend resume usage package run session; do
   if grep -qi "$term" docs/SPEC.md; then
     ok "spec.md.term $term"
   else
@@ -128,6 +134,11 @@ if grep -qiE 'resolv|name resolution' docs/VERIFICATION.md; then
   ok "verification.resolver-section"
 else
   fail "verification.resolver-section" "no resolver-fix section in docs/VERIFICATION.md"
+fi
+if grep -qiE '^#+ .*session' docs/VERIFICATION.md; then
+  ok "verification.sessions-section"
+else
+  fail "verification.sessions-section" "no sessions section in docs/VERIFICATION.md"
 fi
 
 # --- 5. stated test count equals the real test count -----------------------
@@ -154,6 +165,11 @@ REQUIRED_TERMS=(
   "read-only"
   "resolv"
   "privileged"
+  "session"
+  "PTY"
+  "idle"
+  "lifetime"
+  "stdin"
 )
 for term in "${REQUIRED_TERMS[@]}"; do
   if grep -qi -- "$term" docs/DECISIONS.md; then

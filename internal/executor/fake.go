@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -17,9 +18,97 @@ type FakeRunner struct {
 	Err           error
 	Delay         time.Duration
 
-	mu      sync.Mutex
-	killed  map[string]bool
-	lastReq *Request
+	// Sessions: when LiveOutput is set, Start writes it to the session's
+	// StdoutPath and stays alive until Kill/Close (or the lifetime delay).
+	StartErr   error
+	LiveOutput string
+	LiveDelay  time.Duration
+
+	mu       sync.Mutex
+	killed   map[string]bool
+	lastReq  *Request
+	live     map[int]*fakeLive
+	lastLive *Request
+	nextPID  int
+}
+
+// fakeLive is an in-memory LiveProcess for tests.
+type fakeLive struct {
+	owner  *FakeRunner
+	pid    int
+	stdin  *fakeStdin
+	done   chan struct{}
+	res    Result
+	closed sync.Once
+	killed bool
+}
+
+type fakeStdin struct {
+	mu     sync.Mutex
+	buf    []byte
+	owner  *fakeLive
+	closed bool
+}
+
+func (s *fakeStdin) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, errors.New("stdin closed")
+	}
+	s.buf = append(s.buf, p...)
+	s.mu.Unlock()
+	// Model the helper: a structured {"type":"close"} ends the process.
+	if strings.Contains(string(p), `"type":"close"`) {
+		if s.owner != nil {
+			s.owner.finish(Result{ExitCode: 0, Streamed: true})
+		}
+	}
+	return len(p), nil
+}
+
+func (s *fakeStdin) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	return nil
+}
+
+// Written returns the bytes written to the fake session's stdin so far.
+func (f *FakeRunner) Written(pid int) []byte {
+	f.mu.Lock()
+	lp := f.live[pid]
+	f.mu.Unlock()
+	if lp == nil {
+		return nil
+	}
+	lp.stdin.mu.Lock()
+	defer lp.stdin.mu.Unlock()
+	return append([]byte(nil), lp.stdin.buf...)
+}
+
+// LastLiveRequest returns the most recent Start request.
+func (f *FakeRunner) LastLiveRequest() *Request {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastLive
+}
+
+// LastLivePID returns the pid of the most recent Start.
+func (f *FakeRunner) LastLivePID() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lastLive == nil {
+		return 0
+	}
+	return f.nextPID
+}
+
+// LiveCount returns the number of fake interactive processes still alive.
+func (f *FakeRunner) LiveCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.live)
 }
 
 // FakeRunnerInterface guards against accidental signature drift.
@@ -105,6 +194,98 @@ func (f *FakeRunner) Kill(runID string) bool {
 	already := f.killed[runID]
 	f.killed[runID] = true
 	return !already
+}
+
+// Start launches an in-memory interactive process. It writes the configured
+// LiveOutput to the request's StdoutPath and blocks until the process is killed,
+// its stdin is closed, or LiveDelay elapses -- modelling a long-lived session
+// without nsjail.
+func (f *FakeRunner) Start(req Request) (LiveProcess, error) {
+	f.mu.Lock()
+	f.lastLive = &req
+	if f.StartErr != nil {
+		err := f.StartErr
+		f.mu.Unlock()
+		return nil, err
+	}
+	if f.live == nil {
+		f.live = map[int]*fakeLive{}
+	}
+	f.nextPID++
+	pid := f.nextPID
+	lp := &fakeLive{
+		owner: f,
+		pid:   pid,
+		stdin: &fakeStdin{},
+		done:  make(chan struct{}),
+		res:   Result{ExitCode: f.ExitCode, Streamed: true},
+	}
+	lp.stdin.owner = lp
+	f.live[pid] = lp
+	out := f.LiveOutput
+	delay := f.LiveDelay
+	f.mu.Unlock()
+
+	if req.StdoutPath != "" {
+		_ = appendFile(req.StdoutPath, out)
+	}
+	go func() {
+		if delay > 0 {
+			select {
+			case <-time.After(delay):
+				lp.finish(Result{ExitCode: f.ExitCode, Streamed: true})
+			case <-lp.done:
+			}
+			return
+		}
+		<-lp.done
+	}()
+	return lp, nil
+}
+
+// finish closes the fake process exactly once.
+func (l *fakeLive) finish(res Result) {
+	l.owner.mu.Lock()
+	delete(l.owner.live, l.pid)
+	l.owner.mu.Unlock()
+	l.closed.Do(func() {
+		l.res = res
+		close(l.done)
+	})
+}
+
+// Write appends to the fake process's stdin.
+func (l *fakeLive) Write(p []byte) error {
+	_, err := l.stdin.Write(p)
+	return err
+}
+
+// Close ends the fake process like a session leader losing its terminal.
+func (l *fakeLive) Close() error {
+	_ = l.stdin.Close()
+	l.finish(Result{ExitCode: 0, Streamed: true})
+	return nil
+}
+
+// Pid returns the fake process id.
+func (l *fakeLive) Pid() int { return l.pid }
+
+// Kill ends the fake process as killed.
+func (l *fakeLive) Kill() bool {
+	l.owner.mu.Lock()
+	known := l.owner.live[l.pid] != nil
+	l.owner.mu.Unlock()
+	if !known {
+		return false
+	}
+	l.finish(Result{ExitCode: 137, Killed: true, Streamed: true})
+	return true
+}
+
+// Wait blocks until the fake process finishes.
+func (l *fakeLive) Wait() (Result, error) {
+	<-l.done
+	return l.res, nil
 }
 
 func appendFile(path, data string) error {

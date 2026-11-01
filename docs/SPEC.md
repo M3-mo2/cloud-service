@@ -139,6 +139,63 @@ Hard cap timeout (default 60 s). Captures capped at §1.8.
 - `POST /v1/workspaces/{id}/runs/{runId}/stop` → 202 (idempotent; SIGTERM→SIGKILL per §1.11)
 - `GET /v1/workspaces/{id}/runs/{runId}/logs?stream=stdout|stderr&offset=0&limit=65536` → `{"data":"...","offset":0,"next":123,"eof":false,"truncated":false}`
 
+### 2.5.2 Terminal sessions (interactive)
+
+A **session** is a first-class, server-side interactive terminal running a real
+PTY inside the workspace sandbox. It is distinct from `exec` (one-shot) and
+`runs` (async, no input). Session ids are `ses_<ULID>`.
+
+- `POST /v1/workspaces/{id}/sessions` body
+  `{"shell":"/bin/sh"|null,"cwd":"..."|null,"cols":N,"rows":M,"env":{...}|null,"timeout_sec":N}`
+  → 201 `{session}`
+- `GET /v1/workspaces/{id}/sessions?status=&limit=&offset=` →
+  `{"sessions":[...],"total":N,"limit":L,"offset":O}`
+- `GET /v1/workspaces/{id}/sessions/{sessionID}` → `{session}`
+- `POST /v1/workspaces/{id}/sessions/{sessionID}/input` body
+  `{"data":"<raw string>"}` → 204
+- `POST /v1/workspaces/{id}/sessions/{sessionID}/signal` body
+  `{"signal":"INT"|"TERM"|"QUIT"|"HUP"}` → 204
+- `POST /v1/workspaces/{id}/sessions/{sessionID}/resize` body
+  `{"cols":N,"rows":M}` → 204
+- `GET /v1/workspaces/{id}/sessions/{sessionID}/output?offset=&limit=` →
+  `{"data":"...","offset":N,"next":N,"eof":bool,"truncated":bool}`
+- `DELETE /v1/workspaces/{id}/sessions/{sessionID}` → 200 `{session,changed}`
+
+Session JSON:
+
+```json
+{"id":"ses_...","workspace_id":"ws_...","shell":"/bin/sh","cwd":"/","cols":80,"rows":24,
+ "status":"running|exited|killed|timed_out","created_at":"...","last_activity_at":"...",
+ "started_at":"...","ended_at":"...","exit_code":null,"reason":"...",
+ "output_bytes":0,"output_truncated":false}
+```
+
+**Lifecycle.** `running` → `exited` (shell exits), `killed` (DELETE /
+workspace delete / suspend / service shutdown), or `timed_out` (idle timeout or
+absolute lifetime). Each terminal transition carries a `reason`. All terminal
+states are final.
+
+**Limits.** A per-workspace concurrent-session cap (`sessions.max_per_workspace`,
+default 4) returns **409 `too_many_sessions`**. An idle timeout
+(`sessions.idle_timeout_sec`, default 900) and an absolute lifetime
+(`sessions.lifetime_sec`, default 3600) both end the session with status
+`timed_out`; the requested `timeout_sec` may shorten the lifetime, never lengthen
+it. Sizes are bounded 1..1000. `cwd` is resolved with the workspace path-safety
+helper and must exist.
+
+**Signal vs run stop.** A session signal is delivered to the session's
+**foreground process group**, so `INT` interrupts a running command without
+ending the session; `POST .../runs/{id}/stop` instead terminates the run.
+
+**Ended sessions.** `DELETE` is idempotent and retains the terminal record;
+`input`/`signal`/`resize` (and `output` after `DELETE`) report **409
+`session_ended`**. A session that ended on its own (shell exit or timeout) keeps
+its `output` readable.
+
+**Config keys** (`sessions:`): `max_per_workspace`, `idle_timeout_sec`,
+`lifetime_sec`, `output_kb`, `max_input_kb`, `shell`, `kill_grace_sec`. The
+service starts with none of them set.
+
 Run JSON:
 
 ```json
@@ -233,7 +290,9 @@ the table) is:
 | `forbidden` | 403 | Valid key, resource owned by another principal. |
 | `not_found` | 404 | Unknown workspace/run/file/package or unknown route. |
 | `conflict` | 409 | Purging run history (or deleting one run) while a run is still queued/running. |
-| `workspace_suspended` | 409 | Work (exec/run/package management) requested on a suspended workspace. |
+| `workspace_suspended` | 409 | Work (exec/run/package management/session) requested on a suspended workspace. |
+| `too_many_sessions` | 409 | Concurrent terminal sessions exceed `sessions.max_per_workspace`. |
+| `session_ended` | 409 | Operation on a terminal session (input/signal/resize, or output after DELETE). |
 | `validation` | 400 | Bad JSON, unknown field, failed `validate` tag, bad filter/query. Also carries **405** for method-not-allowed. |
 | `unprocessable` | 422 | Unsafe path/symlink escape, `cwd` escape, command not found, a limit `<= 0` or above the server maximum, invalid package requirement. |
 | `payload_too_large` | 413 | Body/file over a hard cap. |
@@ -283,6 +342,18 @@ config template `configs/nsjail_python.cfg.tmpl` must include:
 If nsjail binary is absent, executor returns `ErrNsjailUnavailable` (mapped to
 503 `unavailable`). `/readyz` reflects this. Tests must NOT require nsjail; use
 build tag `//go:build integration` for tests that invoke real nsjail.
+
+**Terminal sessions reuse the exact same sandbox.** nsjail has no PTY support
+(no pty/tty option) and the image has no `socat`/`expect`, but its `python3` has
+`pty`/`termios`. A session therefore runs a small stdlib-only **PTY relay
+helper** as the entry command, with the helper materialized in the session's
+private `/tmp` and bind-mounted read-only at `/run/sandboxd`. The helper
+allocates the PTY, runs the shell as a session leader, and relays a
+line-delimited JSON control protocol from its stdin; its stdout is the terminal
+byte stream. The session runs with the same uid/gid, mounts and seccomp policy
+as any workload — the sandbox is never weakened. Client `data` is written to the
+PTY as raw bytes and is never interpreted as a helper command. See
+[ARCHITECTURE.md](ARCHITECTURE.md) and [DECISIONS.md](DECISIONS.md).
 
 Process kill must kill the process group (nsjail + children) per §1.11.
 

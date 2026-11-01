@@ -177,6 +177,19 @@ mount {
   rw: true
 }
 
+{{- if .HelperDir }}
+
+# The terminal-session PTY relay helper, mounted read-only so the interactive
+# shell cannot rewrite the code that allocates its terminal. It runs as the
+# sandbox uid with the same mounts and seccomp policy as any workload.
+mount {
+  src: "{{ .HelperDir }}"
+  dst: "/run/sandboxd"
+  is_bind: true
+  rw: false
+}
+{{- end }}
+
 {{- if .SharedPackagesDir }}
 
 # Shared package tier: ONE package set on the host, visible read-only to every

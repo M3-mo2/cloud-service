@@ -144,10 +144,10 @@ flowchart TD
 | `internal/model` | `types.go`, `errors.go` | Domain types (Workspace, Run, Limits), ULID IDs, API error type |
 | `internal/auth` | `auth.go` | Static bearer keys → `principal_id`, constant-time compare |
 | `internal/api` | `router.go`, `*.go` | chi routes, handlers, DTOs, JSON error envelope, Prometheus metrics, audit log |
-| `internal/service` | `service.go`, `files.go`, `exec.go`, `runs.go` | Orchestration, ownership checks, limits, retention, run registry |
+| `internal/service` | `service.go`, `files.go`, `exec.go`, `runs.go`, `control.go`, `packages.go`, `sessions.go` | Orchestration, ownership checks, limits, retention, run and session registries |
 | `internal/workspace` | `fs.go`, `path.go` | Safe rooted filesystem, traversal/symlink defense, disk quota accounting |
-| `internal/storage` | `store.go` | Atomic JSON metadata + run-log files on disk |
-| `internal/executor` | `executor.go`, `nsjail.go`, `identity.go`, `fake.go` | nsjail config rendering, UID/GID mapping, process lifecycle, capped capture |
+| `internal/storage` | `store.go` | Atomic JSON metadata + run-log/session-output files on disk |
+| `internal/executor` | `executor.go`, `nsjail.go`, `live.go`, `identity.go`, `fake.go`, `pty_relay.py` | nsjail config rendering, UID/GID mapping, one-shot and interactive process lifecycles, capped capture, PTY relay helper |
 | `configs` | `nsjail_python.cfg.tmpl`, `embed.go` | nsjail TextProto template (also compiled into the binary) |
 | `scripts` | `acceptance.sh`, `nsjail-stub.py` | End-to-end acceptance transcript; test stub |
 
@@ -274,6 +274,103 @@ current status and signals `false`. A stop both cancels the context and calls
 `runner.Kill`, which kills the whole process group; when a live process was
 signalled the response status is `killed`.
 
+### 4.4.1 Interactive terminal sessions and the PTY relay
+
+Sessions are the third execution mode alongside `exec` and `runs`. They differ
+in one structural way: the process is **long-lived and driven by the client**.
+A session's lifecycle is owned by a service goroutine (`runSession`) that waits
+for the process, enforces timeouts, and records the terminal transition exactly
+once.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as api.handleCreateSession
+    participant SVC as service.StartSession
+    participant EX as executor.Start
+    participant N as nsjail
+    participant H as pty_relay.py
+    participant SH as /bin/sh (on PTY)
+
+    C->>API: POST /sessions {shell, cwd, cols, rows}
+    API->>SVC: StartSession
+    SVC->>EX: Start(Request{PTY:true, StdoutPath, ...})
+    EX->>EX: write helper into session tmp (mount Ro /run/sandboxd)
+    EX->>N: nsjail --config <rendered>
+    N->>H: exec pty_relay.py '{"shell":..,"cols":..,"rows":..}'
+    H->>SH: pty.fork() + exec shell (session leader)
+    EX-->>SVC: LiveProcess (stdin pipe owned by service)
+    SVC-->>API: *Session (running)
+    API-->>C: 201 {session}
+
+    C->>API: POST /sessions/{id}/input {"data":"ls\n"}
+    API->>SVC: Input
+    SVC->>EX: proc.Write({"type":"input","data":"ls\n"}\n)
+    EX->>H: stdin line
+    H->>SH: raw bytes on the PTY
+
+    SH-->>H: PTY output
+    H-->>N: stdout (unbuffered)
+    N-->>EX: stdout -> output.log (capped writer)
+    C->>API: GET /sessions/{id}/output?offset=&limit=
+    API->>SVC: ReadSessionOutput (same mechanism as run logs)
+    API-->>C: {data, offset, next, eof, truncated}
+```
+
+**Why a helper exists (measured).** `nsjail` exposes no PTY/tty option at all, so
+it cannot allocate a controlling terminal. The sandbox image has no `socat` and
+no `expect`, but its `python3` ships `pty`, `termios` and `fcntl`, and
+`pty.fork()` gives a child a real `/dev/pts/N`. A ~200-line stdlib-only script is
+therefore the smallest, most portable way to allocate a PTY. It is embedded in
+the binary (`internal/executor/embed.go`) and materialized at `Start` time into
+the session's private `/tmp`, which the executor already bind-mounts
+**read-only** at `/run/sandboxd`. That the helper runs from a read-only mount
+matters: the interactive shell cannot rewrite the code that allocates its
+terminal, and the helper executes as the sandbox uid with the same mounts and
+seccomp policy as any workload. No sandbox control is relaxed for sessions.
+
+**The control protocol.** The helper reads line-delimited JSON on its stdin and
+performs exactly four operations: `{"type":"input","data":"..."}` (write bytes
+to the PTY), `{"type":"signal","signal":"INT|TERM|QUIT|HUP|..."}` (signal the
+PTY's foreground process group), `{"type":"resize","cols":N,"rows":M}`
+(`TIOCSWINSZ`) and `{"type":"close"}` (SIGHUP, grace, SIGKILL). The `data` string
+of an `input` message is written to the PTY as literal bytes and is **never**
+re-parsed, so a client payload shaped like `{"type":"close"}` cannot become a
+control message. The helper's stdout is the terminal stream verbatim: it injects
+no JSON, sentinels or framing, so the client receives exactly the bytes a real
+terminal produced.
+
+**How output reuses the run-log mechanism.** The session's stdout is pointed at
+`{data}/workspaces/{ws}/sessions/{ses}/output.log` through the same
+`cappedWriter` that bounds a run log (here capped by `sessions.output_kb`).
+`GET .../output` then reads the file by byte offset with the identical
+`offset`/`next`/`eof`/`truncated` semantics as `GET .../runs/{id}/logs` — no
+second streaming mechanism is invented, and a client's existing tail loop works
+unchanged.
+
+**State machine.**
+
+```mermaid
+stateDiagram-v2
+    [*] --> running: POST /sessions
+    running --> exited: shell exits (reason shell_exited)
+    running --> killed: DELETE / delete / suspend / shutdown
+    running --> timed_out: idle or absolute lifetime
+    running --> killed: restart recovery (reason interrupted)
+    exited --> [*]
+    killed --> [*]
+    timed_out --> [*]
+```
+
+A goroutine per session (`watchSession`) enforces the idle timeout
+(`sessions.idle_timeout_sec`) and the absolute lifetime
+(`sessions.lifetime_sec`, or a shorter requested `timeout_sec`); either fires
+`endSession`, which kills the process and records a pending reason. `runSession`
+converts that reason into the terminal `status`/`reason` pair. Because the
+session goroutine alone writes the terminal state and holds the session lock
+across the metadata save, an in-flight input/resize activity update can never
+persist a stale `running` status after the transition.
+
 ### 4.5 Workspace lifecycle (control plane)
 
 Workspaces have their own small state machine, persisted in `meta.json` (the
@@ -288,9 +385,11 @@ stateDiagram-v2
     suspended --> suspended: POST /{id}/stop (idempotent)
 ```
 
-- **`suspend`** refuses *new* work (`exec`, run creation, and package
-  management → `409 workspace_suspended`) while leaving the data readable, and
-  stops every running/queued run.
+- **`suspend`** refuses *new* work (`exec`, run creation, session creation, and
+  package management → `409 workspace_suspended`) while leaving the data
+  readable, and stops every running/queued run and every live session. A session
+  already open when the suspend happens is ended (reason `workspace_suspended`),
+  because a suspended workspace must not keep running work.
 - **`resume`** accepts work again; it does not restart anything.
 - **`stop`** kills the workspace's running/queued runs but leaves it `active`
   (new work is still accepted). It is a distinct control from `suspend`: same
@@ -305,10 +404,11 @@ the control plane — `PATCH /workspaces/{id}`, `POST .../{suspend,resume,stop}`
 the `DELETE .../runs*` purges, and package management
 (`POST .../packages/install`, `DELETE .../packages`). They change what the
 workspace *is* or *may do*. The data plane is everything that moves bytes or
-runs a workload: file CRUD, `exec`, `POST/GET .../runs`, run logs, and the
-read-only `GET .../usage` and `GET .../packages` observations. The split is not
-just naming: **suspension gates the work-starting control/data operations**
-(`exec`, `runs`, package management) while pure reads still answer.
+runs a workload: file CRUD, `exec`, `POST/GET .../runs`, run logs, session
+creation/input/output, and the read-only `GET .../usage` and `GET .../packages`
+observations. The split is not just naming: **suspension gates the
+work-starting control/data operations** (`exec`, `runs`, `sessions`, package
+management) while pure reads still answer.
 
 ---
 
@@ -517,6 +617,7 @@ changes can't drift the accounting.
 ```mermaid
 erDiagram
     WORKSPACE ||--o{ RUN : "has many"
+    WORKSPACE ||--o{ SESSION : "has many"
     WORKSPACE {
         string id PK "ws_<ULID>"
         string owner_id "principal_id"
@@ -537,6 +638,23 @@ erDiagram
         time ended_at
         object logs "stdout_bytes,stderr_bytes,truncated"
     }
+    SESSION {
+        string id PK "ses_<ULID>"
+        string workspace_id FK
+        string shell
+        string cwd
+        int cols
+        int rows
+        string status "running/exited/killed/timed_out"
+        string reason
+        int exit_code
+        time created_at
+        time last_activity_at
+        time started_at
+        time ended_at
+        int output_bytes
+        bool output_truncated
+    }
 ```
 
 ```
@@ -549,11 +667,15 @@ erDiagram
         │   └── ...                        user files
         ├── packages/                     PRIVATE package tier (bind-mounted
         │   └── ...                        writable at /opt/python/private)
-        └── runs/
-            └── {run_id}/
-                ├── meta.json             run metadata (atomic on every transition)
-                ├── stdout.log            capped run stdout
-                └── stderr.log            capped run stderr
+        ├── runs/
+        │   └── {run_id}/
+        │       ├── meta.json             run metadata (atomic on every transition)
+        │       ├── stdout.log            capped run stdout
+        │       └── stderr.log            capped run stderr
+        └── sessions/
+            └── {ses_id}/
+                ├── meta.json             session metadata (atomic on every transition)
+                └── output.log            capped PTY output stream
 ```
 
 Metadata writes are **atomic**: write to a temp file in the same directory,
@@ -582,6 +704,7 @@ flowchart LR
         F["GET/DELETE /files · /files/content\nPOST /files/{mkdir,rename,upload}"]
         EX["POST /exec (sync, ≤60s)"]
         RN["POST/GET/DELETE /runs · /runs/{id}\nPOST /runs/{id}/stop\nDELETE /runs/{id}\nGET /runs/{id}/logs"]
+        SS["POST/GET /sessions · /sessions/{id}\nPOST .../input|signal|resize\nGET .../output\nDELETE /sessions/{id}"]
     end
 ```
 
@@ -616,6 +739,13 @@ flowchart LR
 | `DELETE .../runs` / `.../runs/{id}` | purge finished runs / one run | 200 / 204 | 409 running |
 | `POST .../runs/{id}/stop` | kill process group | 202 | 404 |
 | `GET .../runs/{id}/logs` | poll logs | 200 | 404 |
+| `POST .../sessions` | start interactive PTY session | 201 | 409 suspended/sessions, 422 |
+| `GET .../sessions` / `.../sessions/{id}` | list (filter/page) / get | 200 | 400, 404 |
+| `POST .../sessions/{id}/input` | write bytes to the PTY | 204 | 409 ended, 413 |
+| `POST .../sessions/{id}/signal` | signal foreground process group | 204 | 409 ended, 422 |
+| `POST .../sessions/{id}/resize` | `TIOCSWINSZ` | 204 | 409 ended, 422 |
+| `GET .../sessions/{id}/output` | poll PTY output by offset | 200 | 409 ended |
+| `DELETE .../sessions/{id}` | graceful close (idempotent) | 200 | 404 |
 
 All errors share one envelope:
 
@@ -663,6 +793,14 @@ packages:                    # two-tier Python packages
   shared_requirements: ""    # optional, informational only
   install_timeout_sec: 120
   install_output_kb: 256
+sessions:                    # interactive terminal sessions (all defaulted)
+  max_per_workspace: 4       # 409 too_many_sessions past this
+  idle_timeout_sec: 900      # no activity → timed_out/idle_timeout
+  lifetime_sec: 3600         # absolute ceiling → timed_out/lifetime
+  output_kb: 1024            # capped PTY output log
+  max_input_kb: 64           # per-request input cap
+  shell: "/bin/sh"           # default shell in the image
+  kill_grace_sec: 3          # SIGHUP → SIGKILL grace
 keys:                        # static bearer keys → principal_id (1:N allowed)
   - { key: "dev-key-please-rotate", principal_id: "user_dev" }
 ```
@@ -767,13 +905,15 @@ Deferred to v0.1 (documented, not bugs):
 
 ## 13. Decision index
 
-The 43 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
+The 51 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
 including the isolation model, network default-off, retention (100 runs),
 exec-vs-runs split, disk-quota strategy, caps, path safety, process kill, error
 envelope, ULID IDs, health-probe semantics, the cgroup/rlimit/env/lifecycle
 corrections, run recovery, the workspace control plane (runtime-mutable limits,
 suspend vs stop, run filter/purge, usage accounting), the two-tier package model,
-and the conditional resolver mounts.
+the conditional resolver mounts, and terminal sessions (the PTY helper vs its
+alternatives, stdin-pipe vs `--pass_fd`, signal-vs-stop, idle/lifetime values,
+restart/cleanup, output reuse and injection-proofing).
 
 ---
 
@@ -784,6 +924,8 @@ and the conditional resolver mounts.
 | **workspace** | Named, owned container of files + runs; `ws_<ULID>` |
 | **run** | One async execution; `run_<ULID>` |
 | **exec** | One synchronous execution (≤60 s), output returned inline |
+| **session** | One interactive terminal with a real PTY; `ses_<ULID>` |
+| **PTY relay helper** | Stdlib-only Python script that allocates the PTY and relays the control protocol inside the sandbox |
 | **principal** | Identity behind an API key; ownership is per-principal |
 | **nsjail** | Linux sandbox tool built on namespaces, cgroups, seccomp, rlimits |
 | **cgroup v2** | Unified Linux resource-control hierarchy |

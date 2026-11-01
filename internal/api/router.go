@@ -80,6 +80,17 @@ func (s *Server) Router() http.Handler {
 
 				r.Post("/exec", s.handleExec)
 
+				r.Post("/sessions", s.handleCreateSession)
+				r.Get("/sessions", s.handleListSessions)
+				r.Route("/sessions/{sessionID}", func(r chi.Router) {
+					r.Get("/", s.handleGetSession)
+					r.Delete("/", s.handleDeleteSession)
+					r.Post("/input", s.handleSessionInput)
+					r.Post("/signal", s.handleSessionSignal)
+					r.Post("/resize", s.handleSessionResize)
+					r.Get("/output", s.handleSessionOutput)
+				})
+
 				r.Post("/runs", s.handleCreateRun)
 				r.Get("/runs", s.handleListRuns)
 				r.Delete("/runs", s.handlePurgeRuns)

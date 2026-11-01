@@ -23,6 +23,19 @@ const (
 	// condition is a policy refusal (the workspace exists and is owned), not a
 	// conflict with concurrent state, so it gets its own code and HTTP 409.
 	CodeWorkspaceSuspended = "workspace_suspended"
+
+	// CodeTooManySessions is returned when a workspace already hosts the
+	// configured maximum number of concurrent terminal sessions. It is a
+	// per-workspace policy limit (409), distinct from the workspace-level
+	// suspension refusal.
+	CodeTooManySessions = "too_many_sessions"
+
+	// CodeSessionEnded is returned when input, a signal or a resize is sent to
+	// a session that has already reached a terminal state but whose record is
+	// still retained (a shell that exited on its own, an idle/lifetime timeout,
+	// ...). Deleting a session removes its record, so subsequent operations
+	// return not_found instead.
+	CodeSessionEnded = "session_ended"
 )
 
 // Error is the canonical API error, carrying an HTTP mapping and a code.

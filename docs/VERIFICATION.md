@@ -69,7 +69,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **184** (182 unit + 2 `integration`-tagged), including regression
+Test functions: **219** (217 unit + 2 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -77,16 +77,17 @@ tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestRenderConfigOmitsResolverWhenNetDenied`), for the workspace control plane
 (`TestPatchWorkspace*`, `TestSuspend*`, `TestStopWorkspace*`,
 `TestListRunsFilterAndPage`, `TestPurgeRun*`, `TestUsageReportsDiskAndCounters`,
-`TestNewEndpointsEnforceOwnership`) and for the two-tier packages
+`TestNewEndpointsEnforceOwnership`), for the two-tier packages
 (`TestInstallPackages*`, `TestListPrivatePackages`, `TestRemovePackage*`,
-`TestPrivateTierIsolatedBetweenWorkspaces`, `TestPackagesCrossOwnerForbidden`).
+`TestPrivateTierIsolatedBetweenWorkspaces`, `TestPackagesCrossOwnerForbidden`)
+and for terminal sessions (`TestPTYHelper*`, `TestSession*`; see §9b).
 
 The count is the number of `^func Test` declarations across every `*_test.go`
 file (the same measure `scripts/docs-consistency.sh` asserts against):
 
 ```
 $ find . -name '*_test.go' -exec grep -hE '^func Test' {} + | wc -l
-184
+219
 ```
 
 ## 2. Probes
@@ -390,9 +391,105 @@ curl …/workspaces/$B/exec -d '{"cmd":["python3","-c","import six"]}'
 # shared import works in both A and B with no install step (when shared_dir holds it)
 ```
 
+## 9b. Terminal sessions (acceptance)
+
+Server-side interactive terminal sessions have three layers of evidence:
+
+1. **A real PTY** — the relay helper is exercised directly as a subprocess
+   (`internal/executor/pty_test.go`), no nsjail required, proving `pty.fork()`
+   gives a real `/dev/pts/N`.
+2. **The sandbox changes** — the rendered nsjail config is asserted to mount the
+   helper read-only and keep the full workload isolation (also no nsjail
+   required).
+3. **The HTTP contract** — handler-level tests over the `FakeRunner`
+   (`internal/api/sessions_test.go`) assert every status/code, including the
+   timeouts.
+
+The full matrix that the spec required:
+
+| # | Scenario | Test (all pass) |
+|---|----------|-----------------|
+| 1 | session starts; a real `tty` is reported (`test -t 1`) | `TestPTYHelperRealTTY` (real PTY) + `TestSessionCreateAndInspect` (API, asserts the PTY launch path) |
+| 2 | state persists: `cd /tmp` then `pwd` → `/tmp` | `TestPTYHelperRealTTY` (real PTY) |
+| 3 | `alias` and a function persist to the next command | `TestPTYHelperStatePersists` (real PTY); also asserts **no framing bytes** leak into the stream |
+| 4 | `signal INT` interrupts `sleep 30`, session survives and runs again | `TestPTYHelperSignalInterruptsForeground` (real PTY) + `TestSessionSignalRelayed` (API, status stays `running`) |
+| 5 | `resize` reaches the PTY (`stty size`) | `TestPTYHelperRealTTY` (real PTY: `50 120`) + `TestSessionResizeRelayed` (API) |
+| 6 | `DELETE` ends, is idempotent, then input/output report the ended-session error | `TestSessionDeleteEndsAndIsIdempotent` |
+| 7 | suspended workspace refuses create and input | `TestSessionSuspendedWorkspace` |
+| 8 | session cap enforced with the documented code/default | `TestSessionCap` |
+| 9 | hostile input `{"type":"close"}` delivered as literal text | `TestSessionHostileInput` + `TestPTYHelperInjectionProof` |
+| 10 | foreign principal gets 403 on every session route | `TestSessionOwnership` |
+| 11 | idle timeout and absolute lifetime fire with documented status/reason | `TestSessionIdleTimeout`, `TestSessionLifetime`, `TestSessionLifetimeRequestedShorter` |
+| 12 | no leaked process after `DELETE` | `TestSessionNoLeakAfterDelete` (live-process interface; real process tree is nsjail's) |
+| 13 | `gofmt`/`vet`/`test`/`test -race` green | the build/test transcript above |
+
+Plus: `TestRenderSessionConfigHelperMount` (helper mounted `rw:false` at
+`/run/sandboxd`, seccomp/uidmap/`mount_proc:false` retained),
+`TestRenderSessionConfigNoHelperMount` (non-session config untouched),
+`TestStartLiveProcessRoundTrip` and `TestStartKillProcessGroup` (the real
+`Start`/`LiveProcess` plumbing through a config-parsing nsjail stub),
+`TestStartUnavailable`, `TestSessionRecoveryMarksInterrupted`,
+`TestSessionInputTooLarge`, `TestSessionCwdSafety`,
+`TestSessionRejectsAbsurdSize`, `TestSessionDefaultSize`,
+`TestSessionListFilterAndPage`, `TestSessionInputTooLarge`,
+`TestPTYRelayScriptIsStdlibOnly`.
+
+Observed (unprivileged host; real helper subprocess, fake sandbox for HTTP):
+
+```
+$ go test ./internal/executor/ -run 'PTY|RenderSession' -v
+--- PASS: TestPTYRelayScriptIsStdlibOnly
+--- PASS: TestPTYHelperRealTTY                    # test -t 1 → TTY_OK; cd /tmp; pwd → /tmp; stty size → 50 120
+--- PASS: TestPTYHelperStatePersists              # alias + function persist; no framing in output
+--- PASS: TestPTYHelperSignalInterruptsForeground # sleep 30 interrupted; session runs again
+--- PASS: TestPTYHelperInjectionProof             # {"type":"close"} arrives as literal text
+--- PASS: TestPTYHelperCloseEndsSession
+--- PASS: TestRenderSessionConfigHelperMount      # /run/sandboxd mounted rw:false; seccomp+uidmap kept
+--- PASS: TestRenderSessionConfigNoHelperMount
+
+$ go test ./internal/api/ -run 'Session' -v
+--- PASS: TestSessionCreateAndInspect
+--- PASS: TestSessionDefaultSize
+--- PASS: TestSessionRejectsAbsurdSize
+--- PASS: TestSessionCwdSafety
+--- PASS: TestSessionInputAndOutput
+--- PASS: TestSessionSignalRelayed
+--- PASS: TestSessionResizeRelayed
+--- PASS: TestSessionDeleteEndsAndIsIdempotent
+--- PASS: TestSessionDeleteUnknownIs404
+--- PASS: TestSessionSuspendedWorkspace
+--- PASS: TestSessionCap
+--- PASS: TestSessionHostileInput
+--- PASS: TestSessionOwnership
+--- PASS: TestSessionIdleTimeout
+--- PASS: TestSessionLifetime
+--- PASS: TestSessionLifetimeRequestedShorter
+--- PASS: TestSessionNoLeakAfterDelete
+--- PASS: TestSessionListFilterAndPage
+--- PASS: TestSessionRecoveryMarksInterrupted
+--- PASS: TestSessionInputTooLarge
+```
+
+**[requires privileged container] Real-nsjail session transcript.** The session
+inside a real nsjail instance (a real jail, a real shell on a real PTY, real
+process-tree checks) was **not** run in this environment (no nsjail binary,
+unprivileged orchestrator). The launch path is asserted against the rendered
+config and the live-process interface instead. The expected real-nsjail
+transcript:
+
+```sh
+# create, then: test -t 1 && echo REAL_TTY ; cd /tmp ; pwd
+curl -s -H "$AUTH" -H "$JSON" -d '{"cols":80,"rows":24}' $BASE/v1/workspaces/$WS/sessions
+# 201 {"session":{"id":"ses_...","status":"running",...}}
+curl -s -H "$AUTH" "$BASE/v1/workspaces/$WS/sessions/$SES/output?offset=0"
+# {"data":"... REAL_TTY\n ... /tmp\n","next":N,"eof":false,...}
+curl -s -H "$AUTH" -H "$JSON" -d '{"signal":"INT"}' $BASE/v1/workspaces/$WS/sessions/$SES/signal
+# 204; session status remains "running"
+```
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **43** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **51** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults.
 
 ## 11. OpenAPI
@@ -416,10 +513,12 @@ All paths, methods, request/response schemas, and error codes are described.
 `scripts/docs-consistency.sh` asserts that the documents match the code: every
 route in `internal/api/router.go` appears in `docs/API.md`, every error code in
 `internal/model/errors.go` appears in the API error table, every new endpoint
-appears in `docs/SPEC.md`, `docs/VERIFICATION.md` has packages and resolver
-sections, the stated test count equals the real one, `docs/DECISIONS.md` covers
-each required decision, the OpenAPI lint passes, and `gofmt`/`go build`/
-`go test` stay green. It exits non-zero on any failure.
+(including all session routes) appears in `docs/SPEC.md`,
+`docs/VERIFICATION.md` has packages, resolver and sessions sections, the stated
+test count equals the real one, `docs/DECISIONS.md` covers each required
+decision (including the session/PTY/idle/lifetime/stdin decisions), the OpenAPI
+lint passes, and `gofmt`/`go build`/`go test` stay green. It exits non-zero on
+any failure.
 
 ```
 $ bash scripts/docs-consistency.sh

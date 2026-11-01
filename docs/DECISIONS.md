@@ -193,6 +193,83 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     skipping the assertions entirely when nsjail is absent — would leave the resolver and tier
     decisions untested on exactly the hosts most likely to regress them.
 
+## v0.0.9 — first-class terminal sessions
+
+44. **A stdlib-only Python PTY relay helper, not an alternative.** nsjail has
+    **no PTY/tty option at all** and cannot allocate a controlling terminal; the
+    sandbox image has **no `socat`** and **no `expect`**. Its `python3` does have
+    `pty`, `termios` and `fcntl`, and `pty.fork()` gives a child a real
+    `/dev/pts/N` (measured). A ~200-line stdlib-only script is therefore the
+    smallest portable mechanism that allocates a real PTY. The rejected
+    alternatives — `socat`/`expect` (absent), a C helper (a toolchain and a new
+    artifact for no gain), or running the shell without a PTY (defeats the whole
+    feature: no job control, no `isatty`, no interactive programs) — are all
+    worse. The helper is embedded in the binary and materialized per session,
+    so the image needs nothing beyond `python3`.
+45. **The helper is mounted read-only; sessions reuse the whole sandbox.** The
+    helper lives in the session's private `/tmp` and is bind-mounted `rw:false`
+    at `/run/sandboxd`. A read-only mount means the interactive shell cannot
+    rewrite the code that allocates its terminal, and the helper runs with the
+    **same uid/gid, mounts and seccomp policy as any workload** — no sandbox
+    control is relaxed. The isolated private `/tmp` is why `/run/sandboxd` is
+    never confused with the workspace. _Rationale_: a terminal must not be a
+    weaker path into the host than a run.
+46. **A stdin pipe, not nsjail's `--pass_fd`.** nsjail does have `--pass_fd`,
+    `--skip_setsid` and `--forward_signals`, and a session could in principle
+    pass a PTY master/worker fd across the jail boundary. That would put a host
+    PTY fd into the sandboxed process and make the service responsible for PTY
+    lifecycle outside the jail. Instead the helper allocates the PTY *inside* the
+    sandbox and the service keeps the child's stdin as an ordinary pipe it owns
+    (`LiveProcess.Write`). _Rationale_: stdin needs no new nsjail feature, keeps
+    the terminal entirely inside the isolation boundary, and matches the
+    existing "keep a live `*exec.Cmd` per process" machinery.
+47. **Signals are delivered to the foreground process group, not the run.**
+    `POST .../sessions/{id}/signal` relays `INT`/`TERM`/`QUIT`/`HUP` to the PTY's
+    foreground process group, so Ctrl-C interrupts the running command **without
+    ending the session**; the same session then runs another command. This is
+    deliberately different from `POST .../runs/{id}/stop`, which cancels the
+    context and kills the whole process group. _Rationale_: an interactive
+    terminal's core affordance is interrupting one command and continuing; a
+    control that ended the session on every signal would not be a terminal.
+48. **Idle and lifetime are separate, both configurable.** `sessions.
+    idle_timeout_sec` (default **900**) ends a session after no input, signal,
+    resize or output; `sessions.lifetime_sec` (default **3600**) is an absolute
+    ceiling regardless of activity. Both reach status `timed_out`, with reason
+    `idle_timeout` / `lifetime`. A create request's `timeout_sec` may **shorten**
+    the lifetime but never lengthen it past the configured maximum.
+    _Rationale_: an interactive shell can legitimately sit idle (a person
+    thinking), so an idle timeout alone would be wrong; a lifetime alone would
+    let an abandoned session hold resources forever. Two clearly-labelled
+    reasons make both observable.
+49. **Restart marks orphaned sessions honestly; DELETE retains the record.**
+    No sandbox process survives a service restart, so at startup every session
+    persisted `running` is moved to `killed` with reason `interrupted` (never
+    left looking live). Service shutdown and workspace delete kill live sessions
+    (reasons `service_shutdown`, `workspace_deleted`). `DELETE` is idempotent and
+    **retains** the terminal record and its output log: a later
+    `input`/`signal`/`resize` (or `output` after DELETE) reports **409
+    `session_ended`** rather than a plain `not_found`, and the record is removed
+    with the workspace. _Rationale_: a client that raced a session ending
+    deserves a precise, documented answer; and pretending a crashed session is
+    still running is a lie the run model already refuses to tell
+    (`interrupted`).
+50. **Session output reuses the run-log mechanism.** The helper's stdout is the
+    terminal byte stream, written through the **same** `cappedWriter` to
+    `sessions/{id}/output.log` and read by `GET .../output` with the identical
+    `offset`/`next`/`eof`/`truncated` semantics as `GET .../runs/{id}/logs`.
+    _Rationale_: a second streaming mechanism (SSE, websockets, a ring buffer)
+    would duplicate the run-log contract and its tail recipe; reusing it means a
+    client's existing poll loop works against a session unchanged.
+51. **The control protocol is injection-proof by construction.** Client `data`
+    is relayed as the JSON string value of an `input` message and written to the
+    PTY as literal bytes; it is never re-parsed. A payload containing
+    `{"type":"close"}` therefore arrives as terminal text (verified by
+    `TestSessionHostileInput` and `TestPTYHelperInjectionProof`), and the helper
+    injects no JSON/sentinels into the output stream, so no framing noise ever
+    reaches the client. _Rationale_: the input channel and the control channel
+    share one pipe; the only safe design is that the client's bytes can never be
+    promoted into a command.
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.

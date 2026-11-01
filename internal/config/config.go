@@ -18,7 +18,60 @@ type Config struct {
 	MaxLimits LimitsConfig   `koanf:"max_limits"`
 	Caps      CapsConfig     `koanf:"caps"`
 	Packages  PackagesConfig `koanf:"packages"`
+	Sessions  SessionsConfig `koanf:"sessions"`
 	Keys      []KeyConfig    `koanf:"keys"`
+}
+
+// SessionsConfig controls first-class server-side terminal sessions.
+//
+// Every key has a safe default, so the service starts with none of them set
+// (see Default and applyDefaults). A session is a long-lived interactive shell
+// running under a real PTY inside the workspace's nsjail sandbox; the executor
+// relays a line-delimited JSON control protocol to that PTY.
+type SessionsConfig struct {
+	// MaxPerWorkspace bounds concurrent sessions (running or still-recorded)
+	// for a single workspace. A create past the cap is rejected with
+	// 409 too_many_sessions.
+	MaxPerWorkspace int `koanf:"max_per_workspace"`
+	// IdleTimeoutSec ends a session after this long without any input, signal,
+	// resize or output activity. It ends with status timed_out and reason
+	// idle_timeout.
+	IdleTimeoutSec int `koanf:"idle_timeout_sec"`
+	// LifetimeSec is the absolute wall-clock ceiling for a session, regardless
+	// of activity. It ends with status timed_out and reason lifetime.
+	LifetimeSec int `koanf:"lifetime_sec"`
+	// OutputKB caps the persisted PTY output log per session. Past the cap the
+	// bytes are dropped and the session is marked output_truncated.
+	OutputKB int `koanf:"output_kb"`
+	// MaxInputKB bounds a single input request body's data payload.
+	MaxInputKB int `koanf:"max_input_kb"`
+	// Shell is the default shell run inside the sandbox when a create request
+	// omits one. It must be an absolute path available in the sandbox image.
+	Shell string `koanf:"shell"`
+	// KillGraceSec is the SIGHUP->SIGKILL grace applied when a session is
+	// closed (DELETE or a timeout).
+	KillGraceSec int `koanf:"kill_grace_sec"`
+}
+
+// IdleTimeout returns the session idle-timeout duration.
+func (s SessionsConfig) IdleTimeout() time.Duration {
+	return time.Duration(s.IdleTimeoutSec) * time.Second
+}
+
+// Lifetime returns the session absolute-lifetime duration.
+func (s SessionsConfig) Lifetime() time.Duration {
+	return time.Duration(s.LifetimeSec) * time.Second
+}
+
+// OutputBytes returns the per-session output cap in bytes.
+func (s SessionsConfig) OutputBytes() int64 { return int64(s.OutputKB) * 1024 }
+
+// MaxInputBytes returns the per-request input cap in bytes.
+func (s SessionsConfig) MaxInputBytes() int64 { return int64(s.MaxInputKB) * 1024 }
+
+// KillGrace returns the session SIGHUP->SIGKILL grace period.
+func (s SessionsConfig) KillGrace() time.Duration {
+	return time.Duration(s.KillGraceSec) * time.Second
 }
 
 // PackagesConfig controls the two-tier Python package model.
@@ -175,6 +228,15 @@ func Default() Config {
 			InstallTimeoutSec: 120,
 			InstallOutputKB:   256,
 		},
+		Sessions: SessionsConfig{
+			MaxPerWorkspace: 4,
+			IdleTimeoutSec:  900,
+			LifetimeSec:     3600,
+			OutputKB:        1024,
+			MaxInputKB:      64,
+			Shell:           "/bin/sh",
+			KillGraceSec:    3,
+		},
 		Keys: []KeyConfig{},
 	}
 }
@@ -283,6 +345,28 @@ func (c *Config) applyDefaults() {
 	if pkgs.InstallOutputKB <= 0 {
 		pkgs.InstallOutputKB = d.Packages.InstallOutputKB
 	}
+	sess := &c.Sessions
+	if sess.MaxPerWorkspace <= 0 {
+		sess.MaxPerWorkspace = d.Sessions.MaxPerWorkspace
+	}
+	if sess.IdleTimeoutSec <= 0 {
+		sess.IdleTimeoutSec = d.Sessions.IdleTimeoutSec
+	}
+	if sess.LifetimeSec <= 0 {
+		sess.LifetimeSec = d.Sessions.LifetimeSec
+	}
+	if sess.OutputKB <= 0 {
+		sess.OutputKB = d.Sessions.OutputKB
+	}
+	if sess.MaxInputKB <= 0 {
+		sess.MaxInputKB = d.Sessions.MaxInputKB
+	}
+	if sess.Shell == "" {
+		sess.Shell = d.Sessions.Shell
+	}
+	if sess.KillGraceSec <= 0 {
+		sess.KillGraceSec = d.Sessions.KillGraceSec
+	}
 }
 
 func rawDefaults() []byte {
@@ -324,5 +408,13 @@ packages:
   shared_requirements: ""
   install_timeout_sec: 120
   install_output_kb: 256
+sessions:
+  max_per_workspace: 4
+  idle_timeout_sec: 900
+  lifetime_sec: 3600
+  output_kb: 1024
+  max_input_kb: 64
+  shell: "/bin/sh"
+  kill_grace_sec: 3
 `)
 }

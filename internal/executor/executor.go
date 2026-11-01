@@ -69,6 +69,17 @@ type Request struct {
 	// package directory, mounted read-write into the sandbox as the private
 	// tier. It is never the shared, read-only location.
 	PrivatePackagesDir string
+
+	// PTY, when set, runs an interactive terminal session: the PTY relay helper
+	// becomes the entry command, stdin stays an open pipe the caller owns, and
+	// Shell/Cols/Rows configure the shell started on the PTY.
+	PTY   bool
+	Shell string
+	Cols  int
+	Rows  int
+	// SessionOutputCap bounds the persisted PTY output log. It overrides the
+	// default run-log cap for a session.
+	SessionOutputCap int64
 }
 
 // Result is the outcome of an execution.
@@ -92,6 +103,10 @@ type Runner interface {
 	CgroupsUsable() bool
 	// Run executes a request to completion.
 	Run(req Request) (Result, error)
+	// Start launches a long-lived interactive process (e.g. a PTY session) and
+	// returns a handle whose stdin the caller owns. Run is for one-shot
+	// execution and is unaffected.
+	Start(req Request) (LiveProcess, error)
 	// Kill terminates a running process tree by run ID. It returns true if a
 	// live process was signalled.
 	Kill(runID string) bool

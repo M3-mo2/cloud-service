@@ -25,6 +25,8 @@ const Retention = 100
 //	{data}/workspaces/{ws_id}/runs/{run_id}/meta.json
 //	{data}/workspaces/{ws_id}/runs/{run_id}/stdout.log
 //	{data}/workspaces/{ws_id}/runs/{run_id}/stderr.log
+//	{data}/workspaces/{ws_id}/sessions/{ses_id}/meta.json
+//	{data}/workspaces/{ws_id}/sessions/{ses_id}/output.log
 type Store struct {
 	dataDir string
 }
@@ -239,6 +241,87 @@ func (s *Store) DeleteWorkspace(id string) error {
 		return err
 	}
 	return nil
+}
+
+// sessionsDir returns the sessions directory for a workspace.
+func (s *Store) sessionsDir(wsID string) string {
+	return filepath.Join(s.WorkspaceDir(wsID), "sessions")
+}
+
+// SessionDir returns the directory for a single session.
+func (s *Store) SessionDir(wsID, sessionID string) string {
+	return filepath.Join(s.sessionsDir(wsID), sessionID)
+}
+
+// SessionMetaPath returns the path to a session's meta.json.
+func (s *Store) SessionMetaPath(wsID, sessionID string) string {
+	return filepath.Join(s.SessionDir(wsID, sessionID), "meta.json")
+}
+
+// SessionOutputPath returns the path of a session's PTY output log. The output
+// stream reuses the run-log mechanism (a plain capped file read by offset).
+func (s *Store) SessionOutputPath(wsID, sessionID string) string {
+	return filepath.Join(s.SessionDir(wsID, sessionID), "output.log")
+}
+
+// CreateSession creates a session directory, an empty output log, and writes
+// its metadata.
+func (s *Store) CreateSession(wsID string, sess *model.Session) error {
+	if err := os.MkdirAll(s.SessionDir(wsID, sess.ID), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(s.SessionOutputPath(wsID, sess.ID), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	f.Close()
+	return s.SaveSession(wsID, sess)
+}
+
+// SaveSession atomically rewrites session metadata.
+func (s *Store) SaveSession(wsID string, sess *model.Session) error {
+	return writeJSONAtomic(s.SessionMetaPath(wsID, sess.ID), sess)
+}
+
+// GetSession loads a session by ID.
+func (s *Store) GetSession(wsID, sessionID string) (*model.Session, error) {
+	var sess model.Session
+	if err := readJSON(s.SessionMetaPath(wsID, sessionID), &sess); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, model.ErrNotFound
+		}
+		return nil, err
+	}
+	return &sess, nil
+}
+
+// ListSessions returns all sessions for a workspace, newest first.
+func (s *Store) ListSessions(wsID string) ([]*model.Session, error) {
+	entries, err := os.ReadDir(s.sessionsDir(wsID))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []*model.Session{}, nil
+		}
+		return nil, err
+	}
+	out := make([]*model.Session, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), model.SessionIDPrefix) {
+			continue
+		}
+		sess, err := s.GetSession(wsID, e.Name())
+		if err != nil {
+			continue
+		}
+		out = append(out, sess)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// DeleteSession removes a session directory (metadata and output log).
+func (s *Store) DeleteSession(wsID, sessionID string) error {
+	return os.RemoveAll(s.SessionDir(wsID, sessionID))
 }
 
 // CreateRun creates a run directory and writes its metadata.

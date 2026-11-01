@@ -19,6 +19,12 @@ A secure per-user code execution backend exposed over HTTP/JSON.
 - **Execution** — synchronous `exec` (hard 60 s cap, capped output) and
   asynchronous `runs` (streamed logs, filterable/paginated listing, purge of
   history, stop).
+- **Interactive terminal sessions** — first-class server-side sessions
+  (`ses_<ULID>`) hosting a real PTY inside the workspace sandbox: create, input,
+  read incremental output, resize, signal the foreground process group, and
+  close, all over HTTP. Idle and absolute timeouts, a per-workspace cap, and an
+  injection-proof control channel; output tails with the same `offset`/`limit`
+  mechanism as run logs.
 - **Usage** — disk use, run counters and effective limits via
   `GET /v1/workspaces/{id}/usage`.
 - **Two-tier Python packages** — a shared read-only tier plus a private writable

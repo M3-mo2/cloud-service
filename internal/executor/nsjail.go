@@ -522,6 +522,11 @@ type tmplData struct {
 	SeccompString string
 	SeccompPolicy []string
 
+	// HelperDir, when set, is the session's private /tmp host directory,
+	// bind-mounted read-only at /run/sandboxd so the PTY relay helper runs
+	// there without a writable code path. Empty for non-session requests.
+	HelperDir string
+
 	// Two-tier package mounts. SharedPackagesDir is the host directory
 	// bind-mounted read-only; PrivatePackagesDir is the workspace's host
 	// directory bind-mounted writable. Both are optional (empty = not mounted).
@@ -607,6 +612,13 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 	// paths as the bind sources; an empty value omits the mount entirely.
 	sharedDir := req.SharedPackagesDir
 	privateDir := req.PrivatePackagesDir
+	// The session helper lives in the session's own /tmp host dir; mount it
+	// read-only at /run/sandboxd. Using the run tmp keeps the helper out of the
+	// workspace (which is writable) and gives it no writable code path.
+	var helperDir string
+	if req.PTY {
+		helperDir = runTmp
+	}
 	pkgPath := packageSearchPath(sharedPackagesMount, privatePackagesMount, req.SharedPackagesDir, req.PrivatePackagesDir)
 
 	data := tmplData{
@@ -633,6 +645,8 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		TempDir:       runTmp,
 		SeccompString: seccompString(),
 		SeccompPolicy: seccompPolicy(),
+
+		HelperDir: helperDir,
 
 		SharedPackagesDir:  sharedDir,
 		PrivatePackagesDir: privateDir,

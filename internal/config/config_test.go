@@ -218,3 +218,68 @@ packages:
 		t.Fatalf("install defaults lost: %+v", cfg.Packages)
 	}
 }
+
+func TestSessionsDefaults(t *testing.T) {
+	d := Default()
+	if d.Sessions.MaxPerWorkspace != 4 {
+		t.Fatalf("max_per_workspace = %d, want 4", d.Sessions.MaxPerWorkspace)
+	}
+	if d.Sessions.IdleTimeoutSec != 900 || d.Sessions.LifetimeSec != 3600 {
+		t.Fatalf("timeouts = %+v", d.Sessions)
+	}
+	if d.Sessions.OutputKB != 1024 || d.Sessions.MaxInputKB != 64 {
+		t.Fatalf("caps = %+v", d.Sessions)
+	}
+	if d.Sessions.Shell != "/bin/sh" || d.Sessions.KillGraceSec != 3 {
+		t.Fatalf("shell/grace = %+v", d.Sessions)
+	}
+	if d.Sessions.IdleTimeout() != 900*time.Second || d.Sessions.Lifetime() != 3600*time.Second {
+		t.Fatalf("durations = %v / %v", d.Sessions.IdleTimeout(), d.Sessions.Lifetime())
+	}
+	if d.Sessions.OutputBytes() != 1024*1024 || d.Sessions.MaxInputBytes() != 64*1024 {
+		t.Fatalf("byte caps = %d / %d", d.Sessions.OutputBytes(), d.Sessions.MaxInputBytes())
+	}
+}
+
+func TestLoadSessions(t *testing.T) {
+	p := writeTemp(t, `
+sessions:
+  max_per_workspace: 2
+  idle_timeout_sec: 60
+  lifetime_sec: 120
+  output_kb: 64
+  max_input_kb: 8
+  shell: "/bin/bash"
+  kill_grace_sec: 1
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Sessions.MaxPerWorkspace != 2 || cfg.Sessions.Shell != "/bin/bash" {
+		t.Fatalf("sessions = %+v", cfg.Sessions)
+	}
+	if cfg.Sessions.IdleTimeout() != 60*time.Second || cfg.Sessions.Lifetime() != 120*time.Second {
+		t.Fatalf("timeouts = %+v", cfg.Sessions)
+	}
+	if cfg.Sessions.KillGrace() != time.Second {
+		t.Fatalf("kill grace = %v", cfg.Sessions.KillGrace())
+	}
+}
+
+func TestLoadSessionsPartialKeepsDefaults(t *testing.T) {
+	p := writeTemp(t, `
+sessions:
+  max_per_workspace: 7
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Sessions.MaxPerWorkspace != 7 {
+		t.Fatalf("max = %d", cfg.Sessions.MaxPerWorkspace)
+	}
+	if cfg.Sessions.IdleTimeoutSec != 900 || cfg.Sessions.LifetimeSec != 3600 || cfg.Sessions.Shell != "/bin/sh" {
+		t.Fatalf("session defaults lost: %+v", cfg.Sessions)
+	}
+}

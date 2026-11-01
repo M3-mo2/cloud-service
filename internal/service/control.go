@@ -180,10 +180,13 @@ func (s *Service) SetSuspended(id string, suspended bool) (*model.Workspace, boo
 	return w, changed, nil
 }
 
-// SuspendWorkspace sets the workspace suspended and stops its running runs.
-// Idempotent: suspending an already-suspended workspace reports changed=false
-// (and still stops anything running). It returns the updated workspace, the
-// IDs of runs that were signalled, and whether the status changed.
+// SuspendWorkspace sets the workspace suspended and stops its running runs and
+// live terminal sessions. Suspension refuses new work; a session already open
+// when the suspend happens is ended (reason workspace_suspended), because a
+// suspended workspace must not keep running work. Idempotent: suspending an
+// already-suspended workspace reports changed=false (and still stops anything
+// running). It returns the updated workspace, the IDs of runs that were
+// signalled, and whether the status changed.
 func (s *Service) SuspendWorkspace(id string) (*model.Workspace, []string, bool, error) {
 	stopped := s.runningRunIDs(id)
 	w, changed, err := s.SetSuspended(id, true)
@@ -191,6 +194,7 @@ func (s *Service) SuspendWorkspace(id string) (*model.Workspace, []string, bool,
 		return nil, nil, false, err
 	}
 	s.StopAllRuns(id)
+	s.StopWorkspaceSessions(id, model.SessionReasonWorkspaceSuspended)
 	return w, stopped, changed, nil
 }
 

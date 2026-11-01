@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"sandboxd/internal/auth"
 	"sandboxd/internal/config"
@@ -62,8 +63,10 @@ func newHarnessAt(t *testing.T, dataDir string) *harness {
 	})
 	srv := NewServer(svc, authn, logger)
 	// Ensure background run goroutines finish before TempDir cleanup runs.
-	// t.Cleanup is LIFO, so this executes before the TempDir removal.
+	// t.Cleanup is LIFO, so these execute before the TempDir removal. Live
+	// sessions are killed first (bounded), then runs are awaited.
 	t.Cleanup(svc.WaitAll)
+	t.Cleanup(func() { svc.ShutdownSessions(2 * time.Second) })
 	return &harness{
 		t:       t,
 		server:  srv,
