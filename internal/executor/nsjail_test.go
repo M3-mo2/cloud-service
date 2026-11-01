@@ -474,3 +474,66 @@ func TestKillProcessGroupReal(t *testing.T) {
 		t.Fatalf("expected signal termination, status=%v", ws)
 	}
 }
+
+// TestRenderConfigMountsResolverWhenNetAllowed is a regression guard for a real
+// breakage found by exercising the running service: with allow_net the container
+// shares the host network namespace (clone_newnet: false) and TCP to a raw IP
+// works, but name resolution fails outright with "Temporary failure in name
+// resolution" because no /etc/resolv.conf is mounted into the jail. That breaks
+// `pip install` and any workload that resolves a hostname, which is exactly what
+// the private package tier exists to support.
+func TestRenderConfigMountsResolverWhenNetAllowed(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{
+		CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1, AllowNet: true}}
+	path, err := r.renderConfig(Request{
+		Workspace:     ws,
+		WorkspaceRoot: "/tmp/wsroot",
+		Argv:          []string{"/bin/true"},
+	}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+
+	for _, want := range []string{"/etc/resolv.conf", "/etc/hosts"} {
+		mount := `src: "` + want + `"
+  dst: "` + want + `"
+  is_bind: true
+  rw: false`
+		if !strings.Contains(out, mount) {
+			t.Errorf("allow_net must bind-mount %s read-only so DNS resolves inside the jail:\n%s",
+				want, out)
+		}
+	}
+	if !strings.Contains(out, "clone_newnet: false") {
+		t.Errorf("allow_net must keep the host network namespace:\n%s", out)
+	}
+}
+
+// A workspace without network must not see the host resolver at all: leaking it
+// would publish the host's search domain and nameservers into a jailed workload
+// that has no network to use them with.
+func TestRenderConfigOmitsResolverWhenNetDenied(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{
+		CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1, AllowNet: false}}
+	path, err := r.renderConfig(Request{
+		Workspace:     ws,
+		WorkspaceRoot: "/tmp/wsroot",
+		Argv:          []string{"/bin/true"},
+	}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+
+	if strings.Contains(out, "/etc/resolv.conf") {
+		t.Errorf("a workspace without allow_net must not get the host resolver:\n%s", out)
+	}
+	if !strings.Contains(out, "clone_newnet: true") {
+		t.Errorf("allow_net=false must isolate the network namespace:\n%s", out)
+	}
+}

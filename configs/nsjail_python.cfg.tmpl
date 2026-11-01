@@ -96,6 +96,31 @@ mount {
   mandatory: false
 }
 
+{{- if .AllowNet }}
+
+# DNS configuration. Without a resolv.conf inside the jail, name resolution
+# fails with "Temporary failure in name resolution" even though the network
+# namespace is shared with the host: the resolver has no nameserver to query.
+# This is what breaks `pip install` (and any workload that resolves a hostname)
+# for a workspace with allow_net enabled. mandatory:false so a host without
+# /etc/resolv.conf still renders a valid run.
+mount {
+  src: "/etc/resolv.conf"
+  dst: "/etc/resolv.conf"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/etc/hosts"
+  dst: "/etc/hosts"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+{{- end }}
+
 mount {
   src: "/etc/passwd"
   dst: "/etc/passwd"
