@@ -123,6 +123,51 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     _Rationale_: stop is documented as idempotent; a confusing failure on a race (the run ended
     between the client's check and the stop) would be worse than a clear no-op.
 
+## v0.0.7 — two-tier Python packages
+
+35. **Two package tiers, separate trust levels.** Python packages come from a **shared read-only
+    tier** (one host directory installed once, visible to every workspace, bind-mounted `rw:false`)
+    and a **private per-workspace tier** (a directory inside the workspace's own data dir,
+    bind-mounted `rw:true`, writable by that workspace's sandbox uid only). _Rationale_: heavy/common
+    dependencies stay on the image and are not duplicated per workspace, while a workspace can still
+    `pip install` at runtime without being able to poison the shared set for anyone else.
+36. **`sys.path` mechanism: an injected `PYTHONPATH`.** The two sandbox mount points
+    (`/opt/python/shared`, `/opt/python/private`) are added through the already-allowlisted
+    `PYTHONPATH` variable, with the **shared path first**. _Rationale_: it needs no interpreter
+    mutation, works identically for `python3 -c`, `python3 file.py` and `python3 -m module`, and the
+    ordering is explicit. Keeping the shared path first means a private package of the same name
+    shadows the shared one **only for its own workspace** (private dirs are per workspace), which is
+    the intended, safe override; the shared set can never be shadowed across workspaces because no
+    other workspace can write it. A `.pth`/`sitecustomize.py` would require writing into the
+    interpreter's site-packages (which we mount read-only) and copying would duplicate the set.
+37. **The shared tier is bind-mounted read-only; the private tier is writable and sandbox-owned.**
+    The nsjail config uses `rw:false` for the shared mount and `rw:true` for the private mount. When
+    the orchestrator is privileged the private directory is chowned to the sandbox uid (the shared
+    directory is deliberately never touched). _Rationale_: `rw:false` is the kernel-enforced
+    guarantee that no workspace can modify or poison the shared set; ownership gives the workload
+    write access to its own tier only, keeping the existing `sandbox` identity-drop model intact.
+38. **A missing, empty or unreadable shared directory degrades to private-only.** The tier is probed
+    on every run, and a workspace run/exec with no usable shared dir mounts only the private tier and
+    starts normally. _Rationale_: the shared set is an optimization, not a dependency; a
+    misconfigured image must not take the whole service down.
+39. **Requirement specifiers are strictly validated.** `POST /packages/install` rejects anything that
+    is empty, longer than 200 characters, does not start with an alphanumeric, or contains a
+    character outside `[A-Za-z0-9._+~*=<>,!\[\]-]` (with balanced brackets) — with **422**. The
+    values are also passed to `pip` as individual argv elements, never through a shell.
+    _Rationale_: defense in depth against command-line injection (`-e`, `--upgrade`,
+    `pkg; rm -rf /`, `../../etc/passwd`, ...): an allowlist plus no-shell execution means hostile
+    input can never reach a command line.
+40. **Installation runs inside the workspace's own sandbox.** `pip install --target
+    /opt/python/private` executes under nsjail as the unprivileged sandbox uid with the shared tier
+    read-only, so package setup code cannot run as the orchestrator or write outside the workspace.
+    Wall-clock is bounded by `packages.install_timeout_sec` (default 120 s) and captured output by
+    `packages.install_output_kb` (default 256 KiB). _Rationale_: installing is running untrusted
+    package build code; it must be contained by the same isolation as any other workload.
+41. **Removing all private packages requires an explicit `?all=true`.** `DELETE .../packages` with
+    `?name=<pkg>` removes one distribution (using its `RECORD` where available); no parameter is a
+    **400**, and `?name=` together with `?all=true` is a **400**. _Rationale_: an empty-name delete
+    must never silently wipe a workspace's packages.
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func writeTemp(t *testing.T, content string) string {
@@ -152,5 +153,68 @@ func TestKillGrace(t *testing.T) {
 	s := SandboxConfig{KillGraceSec: 3}
 	if s.KillGrace().Seconds() != 3 {
 		t.Fatalf("grace = %v", s.KillGrace())
+	}
+}
+
+func TestPackagesDefaults(t *testing.T) {
+	d := Default()
+	if !d.Packages.SharedEnabled {
+		t.Fatal("shared tier should be enabled by default")
+	}
+	if d.Packages.SharedDir != "" {
+		t.Fatalf("shared_dir default = %q, want empty", d.Packages.SharedDir)
+	}
+	if d.Packages.InstallTimeoutSec != 120 {
+		t.Fatalf("install_timeout_sec = %d, want 120", d.Packages.InstallTimeoutSec)
+	}
+	if d.Packages.InstallOutputKB != 256 {
+		t.Fatalf("install_output_kb = %d, want 256", d.Packages.InstallOutputKB)
+	}
+	if d.Packages.InstallTimeout() != 120*time.Second {
+		t.Fatalf("InstallTimeout = %v", d.Packages.InstallTimeout())
+	}
+	if d.Packages.InstallOutputBytes() != 256*1024 {
+		t.Fatalf("InstallOutputBytes = %d", d.Packages.InstallOutputBytes())
+	}
+}
+
+func TestLoadPackages(t *testing.T) {
+	p := writeTemp(t, `
+packages:
+  shared_dir: "/opt/shared"
+  shared_enabled: false
+  shared_requirements: "/opt/req.txt"
+  install_timeout_sec: 30
+  install_output_kb: 64
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Packages.SharedDir != "/opt/shared" || cfg.Packages.SharedEnabled {
+		t.Fatalf("packages = %+v", cfg.Packages)
+	}
+	if cfg.Packages.SharedRequirements != "/opt/req.txt" {
+		t.Fatalf("requirements = %q", cfg.Packages.SharedRequirements)
+	}
+	if cfg.Packages.InstallTimeout() != 30*time.Second || cfg.Packages.InstallOutputBytes() != 64*1024 {
+		t.Fatalf("install bounds = %+v", cfg.Packages)
+	}
+}
+
+func TestLoadPackagesPartialKeepsDefaults(t *testing.T) {
+	p := writeTemp(t, `
+packages:
+  shared_dir: "/opt/shared"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Packages.SharedDir != "/opt/shared" {
+		t.Fatalf("shared_dir = %q", cfg.Packages.SharedDir)
+	}
+	if cfg.Packages.InstallTimeoutSec != 120 || cfg.Packages.InstallOutputKB != 256 {
+		t.Fatalf("install defaults lost: %+v", cfg.Packages)
 	}
 }

@@ -165,6 +165,20 @@ func (r *NsjailRunner) Run(req Request) (Result, error) {
 			return Result{}, fmt.Errorf("prepare workspace ownership: %w", err)
 		}
 	}
+	// The private package tier is mounted writable, so (when privileged) it must
+	// be owned by the sandbox identity for the workload to install into it. The
+	// shared tier is read-only and is deliberately never chowned: it must stay
+	// exactly as the operator installed it.
+	if r.identity.Privileged && req.PrivatePackagesDir != "" {
+		if _, err := os.Stat(req.PrivatePackagesDir); err == nil {
+			if err := ensureTraversable(req.PrivatePackagesDir); err != nil {
+				return Result{}, err
+			}
+			if err := chownTree(req.PrivatePackagesDir, r.identity.SandboxUID, r.identity.SandboxGID); err != nil {
+				return Result{}, fmt.Errorf("prepare private package ownership: %w", err)
+			}
+		}
+	}
 
 	// Base the run on the caller's context so an explicit stop cancels the
 	// process tree, then layer the wall-clock timeout on top.
@@ -507,6 +521,58 @@ type tmplData struct {
 	TempDir       string
 	SeccompString string
 	SeccompPolicy []string
+
+	// Two-tier package mounts. SharedPackagesDir is the host directory
+	// bind-mounted read-only; PrivatePackagesDir is the workspace's host
+	// directory bind-mounted writable. Both are optional (empty = not mounted).
+	SharedPackagesDir  string
+	PrivatePackagesDir string
+	// PackagesPathEnv is the interpreter search-path value passed via the
+	// allowlisted PYTHONPATH variable (empty when no tier is mounted).
+	PackagesPathEnv string
+}
+
+// Paths at which the package tiers are mounted inside the sandbox.
+const (
+	sharedPackagesMount  = "/opt/python/shared"
+	privatePackagesMount = "/opt/python/private"
+)
+
+// packageSearchPath builds the PYTHONPATH value for whichever tiers are
+// mounted. Ordering is deliberate: the shared (read-only) tier precedes the
+// private tier, so the private tier can override a shared package for its own
+// workspace without affecting any other workspace. Every mounted dir is
+// included so `python3 -c`, `python3 file.py` and `python3 -m module` all see
+// the same sys.path additions.
+func packageSearchPath(sharedMount, privateMount, sharedDir, privateDir string) string {
+	var parts []string
+	if sharedDir != "" {
+		parts = append(parts, sharedMount)
+	}
+	if privateDir != "" {
+		parts = append(parts, privateMount)
+	}
+	return strings.Join(parts, ":")
+}
+
+// withPackagePath appends the package search path as an allowlisted PYTHONPATH
+// entry. A caller-supplied PYTHONPATH is preserved and the tier paths are
+// placed after it so the two tiers always remain visible. The value is not
+// treated as trusted input because those paths are service-chosen mounts, not
+// caller-controlled.
+func withPackagePath(env []string, pkgPath string) []string {
+	if pkgPath == "" {
+		return env
+	}
+	for i, kv := range env {
+		if strings.HasPrefix(kv, "PYTHONPATH=") {
+			env[i] = kv + ":" + pkgPath
+			return env
+		}
+	}
+	out := append(env, "PYTHONPATH="+pkgPath)
+	sortStrings(out)
+	return out
 }
 
 func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) {
@@ -537,9 +603,15 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		return "", err
 	}
 
+	// The template hardcodes the sandbox mount points and uses these host
+	// paths as the bind sources; an empty value omits the mount entirely.
+	sharedDir := req.SharedPackagesDir
+	privateDir := req.PrivatePackagesDir
+	pkgPath := packageSearchPath(sharedPackagesMount, privatePackagesMount, req.SharedPackagesDir, req.PrivatePackagesDir)
+
 	data := tmplData{
 		Argv:          req.Argv,
-		Env:           formatEnv(req.Env),
+		Env:           withPackagePath(formatEnv(req.Env), pkgPath),
 		Cwd:           cwd,
 		TimeLimitSec:  timeoutSec,
 		CPUCores:      lim.CPUCores,
@@ -561,6 +633,10 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		TempDir:       runTmp,
 		SeccompString: seccompString(),
 		SeccompPolicy: seccompPolicy(),
+
+		SharedPackagesDir:  sharedDir,
+		PrivatePackagesDir: privateDir,
+		PackagesPathEnv:    pkgPath,
 	}
 	if data.PidsMax <= 0 {
 		data.PidsMax = 64

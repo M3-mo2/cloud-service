@@ -48,6 +48,22 @@ caps:
   file_read_mb: 5
   file_write_mb: 10
 
+# Two-tier Python packages.
+#
+# Shared tier: one host directory installed once, bind-mounted read-only into
+# every sandbox so common/heavy dependencies are not duplicated per workspace.
+# If the directory is missing, empty or unreadable the service degrades to the
+# per-workspace private tier and runs still work.
+packages:
+  shared_dir: "/opt/sandboxd/packages"
+  shared_enabled: true
+  # Optional requirements file documenting what the shared image should contain.
+  # Informational only; the service never installs from it.
+  shared_requirements: "/opt/sandboxd/requirements-shared.txt"
+  # Wall-clock bound and captured-output cap for a single pip install.
+  install_timeout_sec: 120
+  install_output_kb: 256
+
 # Static API keys. Each entry maps a key to a principal_id.
 # Multiple keys may share a principal_id.
 keys:

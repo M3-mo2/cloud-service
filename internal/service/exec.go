@@ -41,6 +41,10 @@ func (s *Service) Exec(w *model.Workspace, spec ExecSpec) (ExecOutcome, error) {
 		timeout = execHardCapSec
 	}
 	caps := s.cfg.Caps
+	sharedHost, privateHost, err := s.packageDirs(w)
+	if err != nil {
+		return ExecOutcome{}, err
+	}
 	req := executor.Request{
 		Workspace:     w,
 		WorkspaceRoot: s.store.WorkspaceRoot(w.ID),
@@ -51,6 +55,9 @@ func (s *Service) Exec(w *model.Workspace, spec ExecSpec) (ExecOutcome, error) {
 		Timeout:       time.Duration(timeout) * time.Second,
 		StdoutCap:     caps.ExecStdoutBytes(),
 		StderrCap:     caps.ExecStderrBytes(),
+
+		SharedPackagesDir:  sharedHost,
+		PrivatePackagesDir: privateHost,
 	}
 	start := time.Now()
 	res, err := s.runner.Run(req)

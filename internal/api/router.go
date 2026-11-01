@@ -66,6 +66,10 @@ func (s *Server) Router() http.Handler {
 				r.Post("/stop", s.handleStopWorkspace)
 				r.Get("/usage", s.handleUsage)
 
+				r.Get("/packages", s.handleListPackages)
+				r.Post("/packages/install", s.handleInstallPackages)
+				r.Delete("/packages", s.handleDeletePackages)
+
 				r.Get("/files", s.handleListFiles)
 				r.Delete("/files", s.handleDeleteFile)
 				r.Get("/files/content", s.handleGetFileContent)

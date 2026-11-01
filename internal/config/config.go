@@ -11,14 +11,49 @@ import (
 
 // Config is the top-level service configuration loaded from YAML.
 type Config struct {
-	Server    ServerConfig  `koanf:"server"`
-	Storage   StorageConfig `koanf:"storage"`
-	Sandbox   SandboxConfig `koanf:"sandbox"`
-	Limits    LimitsConfig  `koanf:"limits"`
-	MaxLimits LimitsConfig  `koanf:"max_limits"`
-	Caps      CapsConfig    `koanf:"caps"`
-	Keys      []KeyConfig   `koanf:"keys"`
+	Server    ServerConfig   `koanf:"server"`
+	Storage   StorageConfig  `koanf:"storage"`
+	Sandbox   SandboxConfig  `koanf:"sandbox"`
+	Limits    LimitsConfig   `koanf:"limits"`
+	MaxLimits LimitsConfig   `koanf:"max_limits"`
+	Caps      CapsConfig     `koanf:"caps"`
+	Packages  PackagesConfig `koanf:"packages"`
+	Keys      []KeyConfig    `koanf:"keys"`
 }
+
+// PackagesConfig controls the two-tier Python package model.
+//
+// The shared tier is a single host directory installed once and bind-mounted
+// read-only into every sandbox, so heavy/common dependencies are not duplicated
+// per workspace. The private tier is a per-workspace directory inside the
+// workspace's own data directory; it is writable by the workspace's uid only
+// and is created, backed up and deleted with the workspace.
+type PackagesConfig struct {
+	// SharedDir is the host directory bind-mounted read-only as the shared
+	// package tier. When it is missing, empty or unreadable the service
+	// degrades to private-only and runs still work.
+	SharedDir string `koanf:"shared_dir"`
+	// SharedEnabled toggles the shared tier mount. Defaults to true; a missing
+	// SharedDir still degrades gracefully.
+	SharedEnabled bool `koanf:"shared_enabled"`
+	// SharedRequirements is an optional path to a requirements file that
+	// documents what the shared image should contain. It is informational; the
+	// service never installs from it.
+	SharedRequirements string `koanf:"shared_requirements"`
+	// InstallTimeoutSec bounds a single pip install wall-clock duration.
+	InstallTimeoutSec int `koanf:"install_timeout_sec"`
+	// InstallOutputKB bounds the captured pip stdout+stderr returned to the
+	// client.
+	InstallOutputKB int `koanf:"install_output_kb"`
+}
+
+// InstallTimeout returns the pip install wall-clock bound.
+func (p PackagesConfig) InstallTimeout() time.Duration {
+	return time.Duration(p.InstallTimeoutSec) * time.Second
+}
+
+// InstallOutputBytes returns the pip install captured-output cap in bytes.
+func (p PackagesConfig) InstallOutputBytes() int64 { return int64(p.InstallOutputKB) * 1024 }
 
 // ServerConfig controls the HTTP listener.
 type ServerConfig struct {
@@ -134,6 +169,12 @@ func Default() Config {
 			FileReadMB:   5,
 			FileWriteMB:  10,
 		},
+		Packages: PackagesConfig{
+			SharedDir:         "",
+			SharedEnabled:     true,
+			InstallTimeoutSec: 120,
+			InstallOutputKB:   256,
+		},
 		Keys: []KeyConfig{},
 	}
 }
@@ -235,6 +276,13 @@ func (c *Config) applyDefaults() {
 	if caps.FileWriteMB <= 0 {
 		caps.FileWriteMB = d.Caps.FileWriteMB
 	}
+	pkgs := &c.Packages
+	if pkgs.InstallTimeoutSec <= 0 {
+		pkgs.InstallTimeoutSec = d.Packages.InstallTimeoutSec
+	}
+	if pkgs.InstallOutputKB <= 0 {
+		pkgs.InstallOutputKB = d.Packages.InstallOutputKB
+	}
 }
 
 func rawDefaults() []byte {
@@ -270,5 +318,11 @@ caps:
   upload_mb: 50
   file_read_mb: 5
   file_write_mb: 10
+packages:
+  shared_dir: ""
+  shared_enabled: true
+  shared_requirements: ""
+  install_timeout_sec: 120
+  install_output_kb: 256
 `)
 }

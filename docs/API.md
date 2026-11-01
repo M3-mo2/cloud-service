@@ -432,6 +432,219 @@ Report the workspace's actual disk use, run counters and effective limits.
 curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/workspaces/$WS/usage
 ```
 
+### GET /v1/workspaces/{workspaceID}/packages
+
+List what is installed in the workspace's **private** package tier, and report
+whether the shared tier is available.
+
+- **Path parameter:** `workspaceID`.
+- **Response 200:**
+
+  ```json
+  {"packages":[{"name":"requests","version":"2.31.0"},
+               {"name":"Flask","version":"3.0.0"}],
+   "count":2,"truncated":false,
+   "shared_enabled":true,"shared_available":true,
+   "shared_path":"/opt/python/shared","private_path":"/opt/python/private"}
+  ```
+
+  `packages` is sorted by name and lists only the workspace's own private
+  distributions (read from `*.dist-info`/`*.egg-info` metadata). `count` mirrors
+  the array length. `truncated` is `true` when the enumeration hit its bound
+  (**1000** distributions), in which case the list is a prefix.
+  `shared_enabled` reflects config; `shared_available` is a live probe (the
+  shared directory exists and is a readable directory).   `shared_path` is
+  `""` when the shared tier is unavailable, `private_path` is always
+  `/opt/python/private`.
+- **Errors:** 401 `unauthorized`, 403 `forbidden`, 404 `not_found`, 409
+  `workspace_suspended`.
+- **Semantics:** the endpoint is a bounded read (`maxListedPackages` = 1000) so
+  a workspace cannot make the service walk an unbounded directory. It never
+  resolves the sandbox path on the host. All three package endpoints — unlike
+  file/run reads — are refused with **409 `workspace_suspended`** while the
+  workspace is suspended (package management is workspace *management*, not a
+  passive read).
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" \
+  localhost:8080/v1/workspaces/$WS/packages
+```
+
+### POST /v1/workspaces/{workspaceID}/packages/install
+
+Install one or more requirement specifiers into the workspace's **private**
+tier, without a shell.
+
+- **Path parameter:** `workspaceID`.
+- **Request body (`installPackagesRequest`):**
+
+  | Field | Go type | JSON | Required | Validation |
+  |-------|---------|------|----------|------------|
+  | `packages` | `[]string` | `packages` | yes | non-empty; each element must be a plausible requirement specifier (below) |
+
+- **Response 200:**
+
+  ```json
+  {"exit_code":0,
+   "output":"Collecting requests==2.31.0\nSuccessfully installed requests-2.31.0\n",
+   "stdout":"... (alias of output) ...",
+   "timed_out":false,"truncated":false,"duration_ms":4123,
+   "target":"/opt/python/private"}
+  ```
+
+  `output` carries the combined stdout+stderr, capped at
+  `packages.install_output_kb` (default 256 KiB); `truncated` is `true` when the
+  cap was hit. `timed_out` is `true` when the wall-clock bound
+  (`packages.install_timeout_sec`, default 120 s) was reached. `exit_code` is
+  `pip`'s exit code (pipeline failures, including "no network", surface here,
+  not as an HTTP error).
+- **Errors:** 400 `validation` (bad JSON / unknown field), 401 `unauthorized`,
+  403 `forbidden`, 404 `not_found`, 409 `workspace_suspended`, 422
+  `unprocessable` (empty list, or a requirement that fails validation),
+  413 `payload_too_large` (body > `json_body_mb`), 503 `unavailable` (nsjail
+  missing or a sandbox launch failure).
+- **Validation rules (each hostile input rejected with 422, never reaching a
+  command line):** empty; whitespace-only; longer than 200 characters; first
+  character not a letter or digit (rejects `-e`, `--upgrade`, `-r ...`,
+  `../../etc/passwd`); any character outside `[A-Za-z0-9._+~*=<>,!\[\]-]`
+  (rejects `;`, spaces, tabs, newlines, `/`, `\`, `|`, `&`, `$(`, backticks,
+  quotes, parentheses …); unbalanced `[` / `]`. The accepted specifiers are
+  also passed to `pip` as individual **argv** elements, never through a shell.
+- **Semantics:** the install runs `python3 -m pip install --target
+  /opt/python/private <reqs...>` **inside the workspace's own sandbox** (the
+  same nsjail isolation as any run), so package build code executes as the
+  unprivileged sandbox uid and cannot write outside the workspace or into the
+  shared read-only tier. Installation needs network; a workspace with
+  `allow_net:false` fails at the index fetch and reports it via `exit_code` and
+  `output`.
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"packages":["requests==2.31.0"]}' \
+  localhost:8080/v1/workspaces/$WS/packages/install
+```
+
+### DELETE /v1/workspaces/{workspaceID}/packages
+
+Remove one package, or all packages, from the workspace's private tier.
+
+- **Path parameter:** `workspaceID`.
+- **Query parameters:**
+  - `name` (string) — remove a single distribution by normalized name.
+  - `all` (string) — the exact value `true` removes **every** entry in the
+    private tier.
+- **Response 204:** empty body, when `name` addressed one distribution.
+- **Response 200 (`?all=true`):** `{"removed":3,"all":true}` — the number of
+  top-level entries removed.
+- **Errors:** 400 `validation` (neither `name` nor `all=true`; or both given),
+  401, 403, 404 `not_found` (no such package), 409 `workspace_suspended`.
+- **Semantics:**
+  - `?name=` removes only the files that belong to that distribution (its
+    `RECORD`, or the `egg-info` plus same-named top-level module), then its
+    metadata directory. Matching is PEP 503 name normalization
+    (`My_Package` ≡ `my-package`).
+  - **Remove-all requires the explicit flag.** A bare `DELETE .../packages`
+    with no parameters is a **400**, and `?name=` together with `?all=true` is
+    also a **400**, so "remove everything" can never be a footgun.
+  - Removal is refused while the workspace is suspended (`409`).
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE -H "Authorization: Bearer $KEY" \
+  "localhost:8080/v1/workspaces/$WS/packages?name=requests"
+# 204
+
+curl -s -X DELETE -H "Authorization: Bearer $KEY" \
+  "localhost:8080/v1/workspaces/$WS/packages?all=true"
+# {"all":true,"removed":2}
+```
+
+### Two-tier Python packages
+
+A workload running in a workspace can `import` packages from **two tiers**,
+without exporting anything:
+
+| Tier | Sandbox path | Host location | Writable | Visible to |
+|------|--------------|---------------|----------|------------|
+| **Shared** | `/opt/python/shared` | `packages.shared_dir` (e.g. `/opt/sandboxd/packages`) | **no** (`rw:false`) | every workspace |
+| **Private** | `/opt/python/private` | `{data_dir}/workspaces/{ws_id}/packages` | yes (sandbox uid only) | one workspace |
+
+The two paths are added to the interpreter's search path via the **`PYTHONPATH`**
+variable, **shared first, private second**. This works identically for
+`python3 -c 'import x'`, `python3 file.py` and `python3 -m module`; no
+`.pth`, `sitecustomize.py` or interpreter mutation is involved (see
+[DECISIONS.md](DECISIONS.md) §36). The ordering means a private package of the
+same name shadows the shared one **only for that workspace** — the shared set
+can never be shadowed across workspaces, because no other workspace can write
+it.
+
+**Precedence and isolation.**
+
+- A package present in the **shared** tier is importable with **no installation
+  step** in every workspace.
+- A package installed in workspace A's **private** tier is **not** importable in
+  workspace B: the private directory lives in A's own data tree and is owned by
+  A's sandbox uid.
+- If both tiers contain the same distribution, the private copy wins **for that
+  workspace only**.
+
+**Security guarantees.**
+
+- The shared tier is bind-mounted **read-only** (`rw:false` in the nsjail
+  config): a workspace cannot modify or poison it.
+- The private tier is bind-mounted writable and is the workspace's own
+  directory; its host path goes through the workspace path-safety helpers and is
+  never the shared location. It is deleted with the workspace.
+- A missing, empty or unreadable shared directory **never blocks a run**: the
+  run degrades to the private tier and still works. `/readyz` is unaffected.
+- Installation runs inside the workspace's sandbox as the unprivileged sandbox
+  uid and cannot write to the shared tier. `pip` setup code therefore never runs
+  as the orchestrator.
+
+**Configuration** (`packages:` in config):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `packages.shared_dir` | `""` | host directory bind-mounted read-only as the shared tier; empty disables the mount |
+| `packages.shared_enabled` | `true` | toggle the shared tier |
+| `packages.shared_requirements` | `""` | optional path to a requirements file documenting the image; informational only |
+| `packages.install_timeout_sec` | `120` | pip install wall-clock bound |
+| `packages.install_output_kb` | `256` | pip install captured-output cap |
+
+**Worked example.**
+
+```sh
+KEY=dev-key-please-rotate
+AUTH="Authorization: Bearer $KEY"
+JSON="Content-Type: application/json"
+BASE=http://127.0.0.1:8080
+
+# workspace A (owner user_dev)
+A=$(curl -s -H "$AUTH" -H "$JSON" -d '{"name":"a"}' \
+      $BASE/v1/workspaces | python3 -c 'import json,sys;print(json.load(sys.stdin)["workspace"]["id"])')
+
+# install a package privately (needs allow_net:true to reach an index)
+curl -s -H "$AUTH" -H "$JSON" -d '{"packages":["six==1.16.0"]}' \
+  $BASE/v1/workspaces/$A/packages/install
+# {"exit_code":0,"output":"... Successfully installed six-1.16.0 ...","target":"/opt/python/private"}
+
+# it imports with no further setup
+curl -s -H "$AUTH" -H "$JSON" -d '{"cmd":["python3","-c","import six; print(six.__version__)"]}' \
+  $BASE/v1/workspaces/$A/exec
+# {"exit_code":0,"stdout":"1.16.0\n", ...}
+
+# a second workspace does NOT see it (isolation)
+B=$(curl -s -H "$AUTH" -H "$JSON" -d '{"name":"b"}' \
+      $BASE/v1/workspaces | python3 -c 'import json,sys;print(json.load(sys.stdin)["workspace"]["id"])')
+curl -s -H "$AUTH" -H "$JSON" -d '{"cmd":["python3","-c","import six"]}' \
+  $BASE/v1/workspaces/$B/exec
+# {"exit_code":1,"stderr":"ModuleNotFoundError: No module named 'six'\n", ...}
+
+# a package already in the shared tier imports everywhere with no install step
+curl -s -H "$AUTH" -H "$JSON" -d '{"cmd":["python3","-c","import requests; print(requests.__version__)"]}' \
+  $BASE/v1/workspaces/$B/exec
+# {"exit_code":0,"stdout":"2.31.0\n", ...}   (when requests is present in shared_dir)
+```
+
 ### GET /v1/workspaces/{workspaceID}/files
 
 List a directory.

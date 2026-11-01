@@ -152,6 +152,35 @@ mount {
   rw: true
 }
 
+{{- if .SharedPackagesDir }}
+
+# Shared package tier: ONE package set on the host, visible read-only to every
+# workspace. rw:false is the security core: no workspace can modify or poison
+# it for the others. Omitted entirely when the tier is not mounted.
+# mandatory:false so a directory that disappears after the config is rendered
+# cannot abort an otherwise valid run.
+mount {
+  src: "{{ .SharedPackagesDir }}"
+  dst: "/opt/python/shared"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+{{- end }}
+
+{{- if .PrivatePackagesDir }}
+
+# Private package tier: per-workspace, writable, isolated from every other
+# workspace. The host directory is chowned to the sandbox uid by the runner,
+# so only this workspace's workload can write it.
+mount {
+  src: "{{ .PrivatePackagesDir }}"
+  dst: "/opt/python/private"
+  is_bind: true
+  rw: true
+}
+{{- end }}
+
 cwd: "{{ .Cwd }}"
 
 # Run as the sandbox user inside the namespace.

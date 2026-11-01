@@ -64,6 +64,13 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		s.logger.Warn("prune runs failed", "workspace_id", w.ID, "error", err)
 	}
 
+	// Resolve the two package tiers before the run starts. A failure to
+	// prepare the private tier is fatal; a missing shared tier is not.
+	sharedHost, privateHost, err := s.packageDirs(w)
+	if err != nil {
+		return nil, err
+	}
+
 	now := time.Now().UTC()
 	run := &model.Run{
 		ID:          model.NewRunID(),
@@ -97,6 +104,9 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		StderrPath:    stderrPath,
 		StdoutCap:     caps.RunLogBytes(),
 		StderrCap:     caps.RunLogBytes(),
+
+		SharedPackagesDir:  sharedHost,
+		PrivatePackagesDir: privateHost,
 	}
 
 	rr := &runningRun{runID: run.ID, wsID: w.ID, cancel: cancel, done: make(chan struct{})}

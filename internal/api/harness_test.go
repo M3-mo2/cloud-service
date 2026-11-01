@@ -76,6 +76,24 @@ func newHarnessAt(t *testing.T, dataDir string) *harness {
 	}
 }
 
+// rebuild reconstructs the service, server and router over the current
+// harness state. It is used when a test mutates h.cfg after construction (the
+// service copies the config), so config-dependent behaviour can be exercised.
+func (h *harness) rebuild() {
+	h.t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(h.cfg, h.store, h.runner, logger)
+	authn := auth.New([]config.KeyConfig{
+		{Key: keyA, PrincipalID: usrA},
+		{Key: keyB, PrincipalID: usrB},
+	})
+	srv := NewServer(svc, authn, logger)
+	h.svc = svc
+	h.server = srv
+	h.router = srv.Router()
+	h.t.Cleanup(svc.WaitAll)
+}
+
 type reqOpts struct {
 	key     string
 	body    []byte

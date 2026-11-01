@@ -60,6 +60,15 @@ type Request struct {
 	StderrPath string
 	StdoutCap  int64
 	StderrCap  int64
+
+	// SharedPackagesDir, when non-empty, is a host directory mounted read-only
+	// into the sandbox as the shared package tier. A missing/unreadable dir is
+	// resolved by the service before the request reaches the runner.
+	SharedPackagesDir string
+	// PrivatePackagesDir, when non-empty, is the workspace's own writable
+	// package directory, mounted read-write into the sandbox as the private
+	// tier. It is never the shared, read-only location.
+	PrivatePackagesDir string
 }
 
 // Result is the outcome of an execution.

@@ -63,6 +63,15 @@ func (s *Store) WorkspaceRoot(id string) string {
 	return filepath.Join(s.WorkspaceDir(id), "files")
 }
 
+// WorkspacePackagesDir returns the workspace's private, writable package
+// directory (the private tier). It lives inside the workspace's own data
+// directory -- never in the shared, read-only location -- so it is created,
+// backed up and deleted with the workspace. It is bind-mounted writable into
+// the sandbox at /opt/python/private.
+func (s *Store) WorkspacePackagesDir(id string) string {
+	return filepath.Join(s.WorkspaceDir(id), "packages")
+}
+
 // WorkspaceMetaPath returns the path to a workspace's meta.json.
 func (s *Store) WorkspaceMetaPath(id string) string {
 	return filepath.Join(s.WorkspaceDir(id), "meta.json")
@@ -123,6 +132,9 @@ func readJSON(path string, v any) error {
 // CreateWorkspace creates the workspace metadata and files root.
 func (s *Store) CreateWorkspace(w *model.Workspace) error {
 	if err := os.MkdirAll(s.WorkspaceRoot(w.ID), 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.WorkspacePackagesDir(w.ID), 0o755); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(s.runsDir(w.ID), 0o755); err != nil {

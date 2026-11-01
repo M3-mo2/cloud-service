@@ -166,6 +166,139 @@ func TestRenderConfigRlimitUnits(t *testing.T) {
 	}
 }
 
+// TestRenderConfigPackageTiers proves the two-tier mount semantics are present
+// in the generated nsjail config: the shared tier is mounted read-only and the
+// private tier writable, both with the expected target paths and the combined
+// PYTHONPATH. This is the unprivileged-environment assertion for the security
+// core (the real bind mount cannot run without nsjail/root here).
+func TestRenderConfigPackageTiers(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+	path, err := r.renderConfig(Request{
+		Workspace:          ws,
+		WorkspaceRoot:      "/tmp/wsroot",
+		Argv:               []string{"/bin/true"},
+		SharedPackagesDir:  "/host/shared-pkgs",
+		PrivatePackagesDir: "/host/ws/packages",
+	}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+
+	sharedMount := `src: "/host/shared-pkgs"
+  dst: "/opt/python/shared"
+  is_bind: true
+  rw: false`
+	if !strings.Contains(out, sharedMount) {
+		t.Errorf("shared tier must be mounted read-only at /opt/python/shared:\n%s", out)
+	}
+	privateMount := `src: "/host/ws/packages"
+  dst: "/opt/python/private"
+  is_bind: true
+  rw: true`
+	if !strings.Contains(out, privateMount) {
+		t.Errorf("private tier must be mounted writable at /opt/python/private:\n%s", out)
+	}
+	if !strings.Contains(out, "PYTHONPATH=/opt/python/shared:/opt/python/private") {
+		t.Errorf("PYTHONPATH must expose shared then private tier, got:\n%s", out)
+	}
+}
+
+// TestRenderConfigNoPackageTiers proves a request without tier dirs renders no
+// package mounts and no injected PYTHONPATH, so the private-only / shared-only
+// degradation paths are clean.
+func TestRenderConfigNoPackageTiers(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+	path, err := r.renderConfig(Request{Workspace: ws, WorkspaceRoot: "/tmp/x", Argv: []string{"/bin/true"}}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+	if strings.Contains(out, "/opt/python/shared") || strings.Contains(out, "/opt/python/private") {
+		t.Errorf("no tier dirs given, so no package mounts may be rendered:\n%s", out)
+	}
+	if strings.Contains(out, "PYTHONPATH=") {
+		t.Errorf("no tiers mounted, so PYTHONPATH must not be injected:\n%s", out)
+	}
+}
+
+// TestRenderConfigSharedOnly proves a missing/disabled private tier renders the
+// shared mount (read-only) and exposes only the shared path.
+func TestRenderConfigSharedOnly(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+	path, err := r.renderConfig(Request{
+		Workspace:         ws,
+		WorkspaceRoot:     "/tmp/x",
+		Argv:              []string{"/bin/true"},
+		SharedPackagesDir: "/host/shared-pkgs",
+	}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+	if !strings.Contains(out, `dst: "/opt/python/shared"`) {
+		t.Errorf("shared mount missing:\n%s", out)
+	}
+	if strings.Contains(out, `/opt/python/private`) {
+		t.Errorf("private mount must be absent when no private dir is given:\n%s", out)
+	}
+	if !strings.Contains(out, `envar: "PYTHONPATH=/opt/python/shared"`) {
+		t.Errorf("PYTHONPATH should be exactly the shared path:\n%s", out)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestPackageSearchPath(t *testing.T) {
+	cases := []struct {
+		shared, private string
+		want            string
+	}{
+		{"", "", ""},
+		{"/s", "", "/opt/python/shared"},
+		{"", "/p", "/opt/python/private"},
+		{"/s", "/p", "/opt/python/shared:/opt/python/private"},
+	}
+	for _, c := range cases {
+		got := packageSearchPath(sharedPackagesMount, privatePackagesMount, c.shared, c.private)
+		if got != c.want {
+			t.Errorf("packageSearchPath(%q,%q) = %q, want %q", c.shared, c.private, got, c.want)
+		}
+	}
+}
+
+func TestWithPackagePath(t *testing.T) {
+	// No package path leaves the env untouched.
+	base := []string{"LANG=C.UTF-8"}
+	if got := withPackagePath(base, ""); len(got) != 1 || got[0] != "LANG=C.UTF-8" {
+		t.Fatalf("empty pkg path changed env: %v", got)
+	}
+	// A caller PYTHONPATH is preserved and the tiers follow it.
+	got := withPackagePath([]string{"PYTHONPATH=/workspace/lib", "TZ=UTC"}, "/opt/python/shared")
+	joined := strings.Join(got, " ")
+	if !strings.Contains(joined, "PYTHONPATH=/workspace/lib:/opt/python/shared") {
+		t.Fatalf("caller PYTHONPATH not preserved: %v", got)
+	}
+	// With no caller PYTHONPATH a new entry is appended.
+	got = withPackagePath([]string{"TZ=UTC"}, "/opt/python/shared")
+	if strings.Join(got, " ") != "PYTHONPATH=/opt/python/shared TZ=UTC" {
+		t.Fatalf("unexpected env: %v", got)
+	}
+}
+
 func TestFormatEnvAllowlist(t *testing.T) {
 	got := formatEnv(map[string]string{
 		"TZ":                    "UTC",

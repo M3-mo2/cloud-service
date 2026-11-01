@@ -466,6 +466,8 @@ erDiagram
         ├── meta.json                     workspace metadata (atomic write)
         ├── files/                        the workspace root (bind-mounted at /workspace)
         │   └── ...                        user files
+        ├── packages/                     PRIVATE package tier (bind-mounted
+        │   └── ...                        writable at /opt/python/private)
         └── runs/
             └── {run_id}/
                 ├── meta.json             run metadata (atomic on every transition)
@@ -495,6 +497,7 @@ flowchart LR
         W["GET/PATCH/DELETE /workspaces/{id}"]
         LIFECYCLE["POST .../{suspend,resume,stop}"]
         USAGE["GET /workspaces/{id}/usage"]
+        PKG["GET/DELETE /workspaces/{id}/packages\nPOST .../packages/install"]
         F["GET/DELETE /files · /files/content\nPOST /files/{mkdir,rename,upload}"]
         EX["POST /exec (sync, ≤60s)"]
         RN["POST/GET/DELETE /runs · /runs/{id}\nPOST /runs/{id}/stop\nDELETE /runs/{id}\nGET /runs/{id}/logs"]
@@ -516,6 +519,9 @@ flowchart LR
 | `POST .../{id}/resume` | accept work again | 200 | 404 |
 | `POST .../{id}/stop` | stop all runs, stay active | 200 | 404 |
 | `GET .../{id}/usage` | disk bytes, run counters, limits | 200 | 404 |
+| `GET .../{id}/packages` | private-tier packages + shared status | 200 | 403, 404 |
+| `POST .../{id}/packages/install` | pip install into private tier | 200 | 422 bad req, 409 suspended, 503 |
+| `DELETE .../{id}/packages` | remove one (`?name=`) / all (`?all=true`) | 204 / 200 | 400, 404 |
 | `GET .../files?path=` | list dir | 200 | 422 unsafe |
 | `GET .../files/content?path=` | read (raw / `?meta=true`) | 200 | 404, 422, 413 |
 | `PUT .../files/content?path=` | write text/base64 | 204 | 507 quota |
@@ -570,6 +576,12 @@ caps:                        # hard ceilings, never overridable per request
   upload_mb: 50
   file_read_mb: 5
   file_write_mb: 10
+packages:                    # two-tier Python packages
+  shared_dir: "/opt/sandboxd/packages"       # RO bind; empty disables
+  shared_enabled: true
+  shared_requirements: ""    # optional, informational only
+  install_timeout_sec: 120
+  install_output_kb: 256
 keys:                        # static bearer keys → principal_id (1:N allowed)
   - { key: "dev-key-please-rotate", principal_id: "user_dev" }
 ```
