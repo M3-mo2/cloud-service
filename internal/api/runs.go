@@ -21,6 +21,10 @@ type runJSON struct {
 	ExitCode    *int        `json:"exit_code"`
 	StartedAt   string      `json:"started_at"`
 	EndedAt     string      `json:"ended_at"`
+	Cwd         string      `json:"cwd"`
+	TimeoutSec  *int        `json:"timeout_sec"`
+	Unlimited   bool        `json:"unlimited"`
+	Interpreter string      `json:"interpreter,omitempty"`
 	Logs        runLogsJSON `json:"logs"`
 }
 
@@ -31,6 +35,10 @@ type runLogsJSON struct {
 }
 
 func toRunJSON(r *model.Run) runJSON {
+	cwd := r.Cwd
+	if cwd == "" {
+		cwd = "/"
+	}
 	j := runJSON{
 		ID:          r.ID,
 		WorkspaceID: r.WorkspaceID,
@@ -39,6 +47,10 @@ func toRunJSON(r *model.Run) runJSON {
 		Status:      string(r.Status),
 		ExitCode:    r.ExitCode,
 		StartedAt:   r.StartedAt.UTC().Format(time.RFC3339),
+		Cwd:         cwd,
+		TimeoutSec:  r.TimeoutSec,
+		Unlimited:   r.Unlimited,
+		Interpreter: r.Interpreter,
 		Logs: runLogsJSON{
 			StdoutBytes: r.Logs.StdoutBytes,
 			StderrBytes: r.Logs.StderrBytes,
@@ -52,12 +64,15 @@ func toRunJSON(r *model.Run) runJSON {
 }
 
 type createRunRequest struct {
-	Kind       string            `json:"kind" validate:"required,oneof=file command"`
-	File       string            `json:"file"`
-	Args       []string          `json:"args"`
-	Argv       []string          `json:"argv"`
-	Env        map[string]string `json:"env"`
-	TimeoutSec int               `json:"timeout_sec"`
+	Kind        string            `json:"kind" validate:"required,oneof=file command"`
+	File        string            `json:"file"`
+	Args        []string          `json:"args"`
+	Argv        []string          `json:"argv"`
+	Env         map[string]string `json:"env"`
+	TimeoutSec  int               `json:"timeout_sec"`
+	Cwd         string            `json:"cwd"`
+	Interpreter string            `json:"interpreter"`
+	NoTimeout   bool              `json:"no_timeout"`
 }
 
 func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
@@ -75,12 +90,15 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec := service.StartRunSpec{
-		Kind:    model.RunKind(req.Kind),
-		File:    req.File,
-		Args:    req.Args,
-		Argv:    req.Argv,
-		Env:     req.Env,
-		Timeout: req.TimeoutSec,
+		Kind:        model.RunKind(req.Kind),
+		File:        req.File,
+		Args:        req.Args,
+		Argv:        req.Argv,
+		Env:         req.Env,
+		Timeout:     req.TimeoutSec,
+		Cwd:         req.Cwd,
+		Interpreter: req.Interpreter,
+		NoTimeout:   req.NoTimeout,
 	}
 	if err := validateRunSpec(spec); err != nil {
 		writeErrorWithCode(w, err)
@@ -100,6 +118,13 @@ func validateRunSpec(spec service.StartRunSpec) error {
 	case model.RunKindFile:
 		if spec.File == "" {
 			return model.Wrap(400, model.CodeValidation, "file is required for kind=file", nil)
+		}
+		// argv (a raw command) and kind=file are mutually exclusive: a file run
+		// already selects an interpreter, so supplying argv too is ambiguous.
+		if len(spec.Argv) > 0 {
+			return model.Wrap(422, model.CodeUnprocessable,
+				"argv cannot be combined with kind=file; use args, or kind=command",
+				map[string]string{"field": "argv"})
 		}
 	case model.RunKindCommand:
 		if len(spec.Argv) == 0 {

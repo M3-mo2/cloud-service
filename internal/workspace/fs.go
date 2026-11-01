@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"sandboxd/internal/model"
 )
 
 // Entry describes a directory child.
@@ -24,7 +26,8 @@ import (
 // Mode is the octal permission string (e.g. "0644"). Target is set only for
 // symlinks and is the raw link target; TargetInside reports whether that target
 // resolves inside the workspace root (false when it escapes or is dangling and
-// lexically outside).
+// lexically outside). Runnable names the interpreter that runs a regular file
+// by its extension (empty when no interpreter is registered for it).
 type Entry struct {
 	Name         string    `json:"name"`
 	Path         string    `json:"path"`
@@ -34,6 +37,7 @@ type Entry struct {
 	ModTime      time.Time `json:"mod_time"`
 	Target       string    `json:"target,omitempty"`
 	TargetInside bool      `json:"target_inside,omitempty"`
+	Runnable     string    `json:"runnable,omitempty"`
 }
 
 // Listing is one bounded page of a directory listing.
@@ -58,6 +62,10 @@ type FileInfo struct {
 	Binary       bool      `json:"binary"`
 	Target       string    `json:"target,omitempty"`
 	TargetInside bool      `json:"target_inside,omitempty"`
+	// Runnable names the interpreter that runs this regular file by extension
+	// (empty when no interpreter is registered). A UI can offer "run this file"
+	// only on files where it is set.
+	Runnable string `json:"runnable,omitempty"`
 }
 
 // binarySampleSize bounds how many leading bytes are inspected for binary
@@ -287,6 +295,7 @@ func (f *Fs) entryFor(dir string, c os.DirEntry) (Entry, error) {
 		e.Size = 0
 	default:
 		e.Type = "file"
+		e.Runnable = model.InterpreterForFile(c.Name())
 	}
 	return e, nil
 }
@@ -384,6 +393,7 @@ func (f *Fs) Stat(userPath string) (FileInfo, error) {
 	info.ContentType = ct
 	info.SHA256 = sum
 	info.Binary = isBinaryFile(abs)
+	info.Runnable = model.InterpreterForFile(li.Name())
 	return info, nil
 }
 

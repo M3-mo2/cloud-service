@@ -71,7 +71,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **253** (250 unit + 3 `integration`-tagged), including regression
+Test functions: **273** (270 unit + 3 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -91,14 +91,23 @@ browsing/viewing (`TestListFileNotDirectory`, `TestPutOverDirectoryRejected`,
 `TestRangeReadHonestHash`, `TestRangeReadBadParams`,
 `TestRangeReadLimitAboveCapRejected`, `TestLineRangeRead`,
 `TestBinaryDetectionAndEncoding`, `TestDownloadFileExemptFromReadCap`,
-`TestStatSymlink`, `TestReadRangeHonestHash`, `TestReadLines`; see §9c).
+`TestStatSymlink`, `TestReadRangeHonestHash`, `TestReadLines`; see §9c), and for
+native file execution / unbounded runs / workspace stop
+(`TestStartRunFileInterpreterByExtension`,
+`TestStartRunFileUnsupportedExtensionRejected`,
+`TestStartRunExplicitInterpreterOverride`, `TestStartRunCwdValidation`,
+`TestStartRunArgvAndFileConflict`, `TestStartRunUnlimited*`,
+`TestRunFileUsesCwdAndInterpreter`, `TestRunFileExtensionSelection`,
+`TestRunCwdMissingIs422Not503`, `TestRunNoTimeoutDeniedByDefault`,
+`TestRunNoTimeoutAllowedRecordsUnlimited`, `TestFileStatAndListingRunnable`,
+`TestStopWorkspaceStopsRunsAndSessions`; see §9d–§9e).
 
 The count is the number of `^func Test` declarations across every `*_test.go`
 file (the same measure `scripts/docs-consistency.sh` asserts against):
 
 ```
 $ find . -name '*_test.go' -exec grep -hE '^func Test' {} + | wc -l
-253
+273
 ```
 
 ## 2. Probes
@@ -130,7 +139,7 @@ ok   healthz.status               ok
 ### 2. meta
 ok   meta.version                 0.0.5
 ### 3. create workspace
-workspace id: ws_01M69M8Y86VCFBX9291SA7ZWHY
+workspace id: ws_01M6BNEZGVE2AFRADVKB01FFC2
 ### 4. mkdir /src
 ok   mkdir.src                    201
 ### 5. PUT /main.py
@@ -139,15 +148,75 @@ ok   put.main.py                  204
 ok   upload.status                201
 ### 7. read /main.py (meta)
 ok   read.main.py                 0ca9091eb4e31fb1ab24c8c5de92a08e4e5f402919f82ea3ca784f38534f03f3
+### 7b. first-class file browsing and viewing
+ok   list.file_422                422
+ok   list.order                   zdir,a.txt,b.txt
+ok   list.first_type              dir
+ok   list.total                   3
+ok   list.count_eq_total          3
+ok   list.not_truncated           False
+ok   list.metadata                True
+ok   list.page_count              1
+ok   list.page_truncated          True
+ok   stat.file_type               file
+ok   stat.file_sha                0ca9091eb4e31fb1ab24c8c5de92a08e4e5f402919f82ea3ca784f38534f03f3
+ok   stat.file_size               12
+ok   stat.missing_404             404
+ok   put.over_dir_422             422
+ok   put.no_content_4xx           400
+ok   put.no_content_no_file       404
+ok   read.dir_422                 422
+ok   range.content                print
+ok   range.length                 5
+ok   range.offset                 0
+ok   range.total_size             12
+ok   range.whole_file             False
+ok   range.truncated              True
+ok   range.partial_hash           ce953a0eb08246617b7f849486c4b26a7af37e9d2e8f0e13b3ae1bf0da8a70a2
+ok   range.partial_ne_full        DIFF
+ok   range.full_eq_file           0ca9091eb4e31fb1ab24c8c5de92a08e4e5f402919f82ea3ca784f38534f03f3
+ok   range.full_whole_file        True
+ok   binary.flag                  True
+ok   binary.encoding              base64
+ok   lines.content                twothree
+ok   lines.start_line             2
+ok   lines.end_line               3
+ok   lines.line_count             2
+ok   lines.total_lines            4
+ok   download.big_upload          201
+ok   download.big_code            200
+ok   download.big_len             6291456
+ok   download.content_length      6291456
+ok   download.dir_422             422
+ok   download.stat_size           6291456
 ### 8. exec (sync) -- a successful execution
 ok   exec.exit_code               0
 ok   exec.stdout                  hi
 ### 9. cwd is honored
 ok   exec.cwd                     /workspace/src
 ### 10. start run (file)
-run id: run_01M69M8YFKZ2V4XDX5GFXSV2ZV
+run id: run_01M6BNF0Y860R5XE18QNW4ESMC
 ok   run.status                   exited
 ok   run.logs.stdout              hi
+### 10b. runs: cwd, interpreter selection, runnable metadata
+ok   run.cwd_recorded             /rundir
+ok   run.cwd_status               exited
+ok   run.cwd_is_realdir           /workspace/rundir
+ok   run.cwd_missing_422          422
+ok   exec.cwd_missing_422         422
+ok   run.py_backcompat_interpreter python3
+ok   run.py_backcompat_status     exited
+ok   stat.runnable_py             python3
+ok   stat.runnable_txt_none       None
+ok   run.sh_by_extension          bash
+ok   run.sh_by_extension_status   exited
+ok   run.sh_by_extension_out      ext-sh
+ok   run.interpreter_override     bash
+ok   run.interpreter_override_status exited
+ok   run.interpreter_override_out sh-ok
+ok   run.unsupported_ext_code     unprocessable
+ok   run.unsupported_ext_names_set contains .py
+ok   run.argv_file_conflict_422   422
 ### 11. security: traversal rejected (expect 422)
 ok   traversal.read               422
 ok   traversal.write              422
@@ -168,16 +237,44 @@ ok   shadow.denied                SHADOW_DENIED: FileNotFoundError
 ok   seccomp.mount                159
 ### 18. isolation: fork bomb limited by cgroup pids.max
 ok   cgroup.fork_limit            contains FORK_LIMITED
-### 19. resource ceiling: memory limit enforced
+### 19. resource ceiling: memory limit enforced (F-1)
 ok   rlimit.memory                contains MEMORY_DENIED
 ### 20. stop long run kills process group
 ok   stop.run_status              killed
 ok   stop.no_survivors            0
-### 21. delete workspace (expect 204) and get after delete (expect 404)
+### 20b. unbounded runs: opt-in, honest record, real survival, zero survivors
+ok   unlimited.denied_code        unprocessable
+ok   unlimited.denied_config      limits.allow_unlimited_runs
+ok   unlimited.recorded_flag      True
+ok   unlimited.recorded_timeout_null None
+ok   finite.recorded_timeout      2
+ok   finite.times_out             timeout
+ok   unlimited.survives_past_ceiling running
+ok   unlimited.stop_status        killed
+ok   unlimited.stop_no_survivors  0
+### 21. terminal session: a real PTY inside the sandbox
+ok   session.start_status         running
+ok   session.tty_device           contains /dev/pts/
+ok   session.is_a_tty             contains TTY_OK
+ok   session.no_pty_error         no PTY error / traceback
+ok   session.offset_suffix        contains $'\r\n$ '
+ok   session.delete               200
+### 21b. workspace stop stops runs AND sessions, leaving zero processes
+ok   stop.runs_count              1
+ok   stop.sessions_count          1
+ok   stop.run_id_reported         run_01M6BNHBYHPKD8MTFK2KB1SE4E
+ok   stop.session_id_reported     ses_01M6BNHBZHGRKCPVC739DKRMTF
+ok   stop.run_status              killed
+ok   stop.session_status          killed
+ok   stop.session_reason          workspace_stopped
+ok   stop.zero_survivors          0
+ok   stop.workspace_active        active
+ok   stop.delete_ws               204
+### 22. delete workspace (expect 204) and get after delete (expect 404)
 ok   delete.workspace             204
 ok   get.after_delete             404
 
-passed=30 failed=0
+passed=113 failed=0
 ```
 
 Every step asserts on content, not merely on the absence of a crash: a
@@ -739,11 +836,197 @@ read's hash = the file's `sha256sum`), `binary.flag`/`binary.encoding`,
 and `download.big_code`/`download.big_len`/`download.content_length`
 (6 MiB, larger than the 5 MiB read cap) plus `download.dir_422`.
 
+## 9d. Native file execution: cwd, interpreters, runnable (Deliverable A)
+
+The runs path was made able to run a chosen file, in a chosen directory, with a
+chosen interpreter. The measured defects before the change (live server, real
+nsjail):
+
+- `kind:"file"` was hardcoded to Python: `runs.go` built
+  `append([]string{"python3", file}, spec.Args...)` with no extension awareness.
+- there was **no `cwd` on runs at all** — `cwd` on `POST /runs` was an unknown
+  field → `400`, so "run this in this directory" was unsupported.
+- a `cwd` (or any run target) that did not resolve produced **`503 sandbox
+  unavailable`** (defect N-1), falsely implying the isolation layer was broken.
+
+The change adds `cwd` (validated to exist and be a directory), interpreter
+selection by extension with an explicit allowlist override, and a `runnable`
+field on file `stat`/listing metadata.
+
+### 9d.1 Defect N-1 — bad `cwd` was 503, now 422 (before/after)
+
+Before (real nsjail, live server on 8099):
+
+```
+$ curl -s -w '\nHTTP %{http_code}\n' -H "$A" -H "$J" \
+    -d '{"cmd":["pwd"],"cwd":"/nope"}' "$BASE/v1/workspaces/$WS/exec"
+{"error":{"code":"unavailable","message":"sandbox unavailable: nsjail could not set up or launch the sandbox","details":{"nsjail":"[F][2026-11-01T13:25:35+0000][1] runChild():486 Launching child process failed"}}}
+HTTP 503
+```
+
+The root cause was nsjail failing its own `chdir` inside the sandbox:
+
+```
+[E][…][1] initNsInternal():499 chdir('/workspace/does-not-exist'): No such file or directory
+[F][…][1] runChild():486 Launching child process failed
+```
+
+After (real nsjail): the executor now classifies a `chdir` failure as
+`ErrInvalidCwd` → `422`, and the service validates `cwd` at request time:
+
+```
+$ curl -s -w '\nHTTP %{http_code}\n' -H "$A" -H "$J" \
+    -d '{"cmd":["pwd"],"cwd":"/nope"}' "$BASE/v1/workspaces/$WS/exec"
+{"error":{"code":"unprocessable","message":"cwd does not exist","details":{"cwd":"/nope"}}}
+HTTP 422
+```
+
+The acceptance suite asserts both directions: `run.cwd_missing_422` and
+`exec.cwd_missing_422` are `422` (never `503`). A genuine sandbox setup failure
+(e.g. a host without `--cgroupns=host`) is still `503 unavailable`.
+
+### 9d.2 cwd is a real working directory
+
+`run.cwd_is_realdir` runs `/rundir/whereami.py` with `cwd:/rundir`; the file
+prints `os.getcwd()` and the assertion is `/workspace/rundir` — i.e. the process
+really chdir'd into the requested directory. The file is passed to the
+interpreter as an **absolute** sandbox path (`/workspace/rundir/whereami.py`),
+so `cwd` is a working directory and **not** a relative-path prefix for `file`:
+
+```
+$ run.cwd_recorded            /rundir
+$ run.cwd_is_realdir          /workspace/rundir
+```
+
+### 9d.3 Interpreter selection and runnable metadata
+
+```
+$ run.py_backcompat_interpreter   python3      # {"kind":"file","file":"/main.py"} still Python
+$ run.sh_by_extension             bash         # .sh → bash, no interpreter field
+$ run.sh_by_extension_out         ext-sh
+$ run.interpreter_override        bash         # /runme.txt + {"interpreter":"bash"}
+$ run.interpreter_override_out    sh-ok
+$ run.unsupported_ext_code        unprocessable
+$ run.unsupported_ext_names_set   contains .py
+$ run.argv_file_conflict_422      422          # argv + kind=file is a hard conflict
+$ stat.runnable_py                python3
+$ stat.runnable_txt_none          None
+```
+
+Unit coverage (unprivileged): `TestStartRunFileInterpreterByExtension`,
+`TestStartRunFileUnsupportedExtensionRejected`,
+`TestStartRunExplicitInterpreterOverride`, `TestStartRunCwdValidation`,
+`TestStartRunArgvAndFileConflict`, `TestRunFileUsesCwdAndInterpreter`,
+`TestRunFileExtensionSelection`, `TestRunFileUnsupportedExtension422`,
+`TestRunFileExplicitInterpreterOverride`, `TestRunCwdMissingIs422Not503`,
+`TestRunArgvAndFileConflict422`, `TestFileStatAndListingRunnable`,
+`TestMetaReportsInterpreters`.
+
+## 9e. Unbounded runs and workspace stop (Deliverables B and C)
+
+### 9e.1 Which interpreters exist in the sandbox (measured)
+
+Interpreter selection is an **allowlist**, and every entry was measured
+executable **inside the real sandbox** (not the host shell) with
+`{"cmd":["<bin>","--version"]}` through `POST …/exec`:
+
+| Binary | In the sandbox? | Evidence |
+|--------|-----------------|----------|
+| `python3` | yes | `Python 3.12.3` |
+| `node` | yes | `v24.22.2` |
+| `perl` | yes | `This is perl 5, version 38, subversion 2 (v5.38.2)` |
+| `bash` | yes | `GNU bash, version 5.2.21(1)-release` |
+| `python` | **no** | `422 command not found` |
+| `ruby`, `php`, `lua` | **no** | `422 command not found` |
+
+The allowlist is therefore `python3` (`.py`), `node` (`.js`/`.mjs`/`.cjs`),
+`bash` (`.sh`/`.bash`) and `perl` (`.pl`/`.pm`) — matching the sandbox image's
+verified set. `python3 -c`, `python3 file.py` and `bash file.sh` were each run to
+prove the interpreters actually execute a script, not just print a version.
+
+### 9e.2 nsjail `time_limit: 0` means "no limit" (measured)
+
+The unbounded mechanism relies on nsjail's `time_limit`. Measured on this host
+with the exact per-run mounts:
+
+```
+# time_limit: 0
+$ sudo /usr/local/bin/nsjail -q -L 3 --config <time_limit_0>.cfg
+SURVIVED                # a 6 s sleep ran to completion
+# time_limit: 3
+$ sudo /usr/local/bin/nsjail -q -L 3 --config <time_limit_3>.cfg
+rc=137                  # killed at 3 s
+```
+
+So `no_timeout:true` renders `time_limit: 0` and layers no timeout context; the
+run ends only on exit or an explicit stop.
+
+### 9e.3 Unbounded runs (acceptance, real nsjail)
+
+The suite creates a workspace with a deliberately small `max_wall_time_sec: 5`
+so survival past the ceiling is provable without an hour-long test, and with
+`allow_unlimited_runs: true` (the server-level switch is enabled in the
+acceptance config):
+
+```
+$ unlimited.denied_code            unprocessable   # default WS (no workspace opt-in)
+$ unlimited.denied_config          limits.allow_unlimited_runs
+$ unlimited.recorded_flag          True
+$ unlimited.recorded_timeout_null  None            # no fake 3600
+$ finite.recorded_timeout          2
+$ finite.times_out                 timeout         # the 5 s ceiling is real
+$ unlimited.survives_past_ceiling  running         # alive 8 s later
+$ unlimited.stop_status            killed
+$ unlimited.stop_no_survivors      0
+```
+
+The same workspace's **finite** run (`timeout_sec: 2`) reaches `timeout`, proving
+the ceiling still binds and that `no_timeout` is exactly what bypasses it; the
+**unbounded** run is still `running` after 8 s and, once stopped, leaves **zero**
+surviving processes and status `killed` — the kill path is proven, not assumed.
+An unbounded run still holds a `max_runs` slot and its cgroup share (CPU /
+memory / pids ceilings unchanged — the fork-bomb and memory-ceiling checks still
+pass).
+
+Unit coverage: `TestStartRunUnlimitedForbiddenByServerDefault`,
+`TestStartRunUnlimitedForbiddenByWorkspace`,
+`TestStartRunUnlimitedAllowedRecordsHonestly`,
+`TestCreateWorkspaceUnlimitedAboveServerMaxima`, `TestRunNoTimeoutDeniedByDefault`,
+`TestRunNoTimeoutAllowedRecordsUnlimited`.
+
+### 9e.4 Workspace stop now stops runs *and* sessions (acceptance)
+
+The gap (found by reading `service/control.go`): `StopWorkspace` called
+`StopAllRuns` only, so stopping a workspace left its terminal sessions running.
+Fixed to stop both and report both counts. The suite creates a long run and a
+live session on a workspace, then:
+
+```
+$ stop.runs_count              1
+$ stop.sessions_count          1
+$ stop.run_id_reported         run_…
+$ stop.session_id_reported     ses_…
+$ stop.run_status              killed
+$ stop.session_status          killed
+$ stop.session_reason          workspace_stopped
+$ stop.zero_survivors          0     # no process of the workspace's tree survives
+$ stop.workspace_active        active
+```
+
+`suspend` and `delete` were audited too: both already stopped sessions
+(`SuspendWorkspace` calls `StopWorkspaceSessions`; `DeleteWorkspace` does as
+well), and the suite confirms `session.reason workspace_stopped` and the delete
+path leaves nothing behind — no known limitation remains. Unit coverage:
+`TestStopWorkspaceStopsRunsAndSessions` (and the existing
+`TestStopWorkspaceKillsRuns`/`TestSuspendStopsRunningRuns`).
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **58** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **62** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
-frontend product boundary, and #55–58, the file browsing/viewing contract).
+frontend product boundary, #55–58, the file browsing/viewing contract, and
+#59–62, native file execution / unbounded runs / workspace stop / the named-
+service non-goal).
 
 ## 11. OpenAPI
 

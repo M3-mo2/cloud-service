@@ -1073,6 +1073,14 @@ components:
           type: array
           items: { type: string }
           examples: [[python3]]
+        interpreters:
+          type: array
+          description: "Allowlist of interpreters a kind=file run may use (with an explicit interpreter field)."
+          items: { type: string }
+        runnable_extensions:
+          type: array
+          description: "File extensions that map to an allowlisted interpreter (what a file's `runnable` field reports)."
+          items: { type: string }
         limits_defaults: { $ref: "#/components/schemas/Limits" }
         limits_maxima:
           allOf: [{ $ref: "#/components/schemas/Limits" }]
@@ -1086,6 +1094,9 @@ components:
         max_wall_time_sec: { type: integer }
         max_runs: { type: integer }
         allow_net: { type: boolean }
+        allow_unlimited_runs:
+          type: boolean
+          description: "Workspace opt-in for wall-clock-unbounded runs (no_timeout:true). A true value is rejected with 422 unless max_limits.allow_unlimited_runs is also true."
     Workspace:
       type: object
       required: [id, owner_id, name, created_at, status, limits]
@@ -1113,6 +1124,7 @@ components:
         max_wall_time_sec: { type: [integer, "null"] }
         max_runs: { type: [integer, "null"] }
         allow_net: { type: [boolean, "null"] }
+        allow_unlimited_runs: { type: [boolean, "null"] }
     PatchWorkspaceRequest:
       type: object
       description: "Partial workspace update; absent fields keep their current value."
@@ -1131,6 +1143,11 @@ components:
           type: array
           items: { type: string }
         stopped_run_count: { type: integer }
+        stopped_session_ids:
+          type: array
+          description: "Live terminal sessions ended by this action (stop; also suspend)."
+          items: { type: string }
+        stopped_session_count: { type: integer }
     WorkspaceUsage:
       type: object
       required: [workspace_id, status, disk_bytes, disk_mb, runs_total, active_runs, max_runs, limits]
@@ -1164,6 +1181,9 @@ components:
         mod_time: { type: string, format: date-time }
         target: { type: string, description: "Raw link target; only for a symlink." }
         target_inside: { type: boolean, description: "Whether a symlink resolves inside the workspace; only for a symlink." }
+        runnable:
+          type: string
+          description: "Interpreter that runs this regular file by extension (e.g. python3); omitted when no interpreter is registered. A UI can offer \"run this file\" only where it is present."
     DirectoryListing:
       type: object
       required: [path, entries, count, total, truncated]
@@ -1194,6 +1214,9 @@ components:
         binary:
           type: boolean
           description: "Bounded binary detection (NUL or invalid UTF-8 in a leading sample); only for a regular file."
+        runnable:
+          type: string
+          description: "Interpreter that runs this regular file by extension (e.g. python3); omitted when none is registered."
     FileContentMeta:
       type: object
       required: [path, content, encoding, size, total_size, range, whole_file, sha256, truncated, binary]
@@ -1269,15 +1292,20 @@ components:
       required: [kind, file]
       properties:
         kind: { type: string, const: file }
-        file: { type: string }
+        file: { type: string, description: "Path relative to the workspace root. Its extension must map to an allowlisted interpreter, or `interpreter` must be given." }
         args:
           type: array
           items: { type: string }
+        cwd: { type: string, description: "Working directory relative to the workspace root; must exist and be a directory at request time (else 422). Not a relative-path prefix for file." }
+        interpreter: { type: string, description: "Override the extension-derived interpreter; must be in the allowlist (see /v1/meta interpreters)." }
         env:
           type: object
           description: "User environment variables; only the allowlist is passed through (see ExecRequest)."
           additionalProperties: { type: string }
         timeout_sec: { type: integer }
+        no_timeout:
+          type: boolean
+          description: "Request a wall-clock-unbounded run (distinct from timeout_sec:0). Permitted only when both max_limits.allow_unlimited_runs and the workspace limits.allow_unlimited_runs are true; else 422."
     CreateRunCommand:
       type: object
       required: [kind, argv]
@@ -1287,11 +1315,15 @@ components:
           type: array
           minItems: 1
           items: { type: string }
+        cwd: { type: string, description: "Working directory relative to the workspace root; must exist and be a directory at request time (else 422)." }
         env:
           type: object
           description: "User environment variables; only the allowlist is passed through (see ExecRequest)."
           additionalProperties: { type: string }
         timeout_sec: { type: integer }
+        no_timeout:
+          type: boolean
+          description: "Request a wall-clock-unbounded run (distinct from timeout_sec:0). Permitted only when both max_limits.allow_unlimited_runs and the workspace limits.allow_unlimited_runs are true; else 422."
     Run:
       type: object
       required: [id, workspace_id, kind, argv, status, started_at, logs]
@@ -1302,6 +1334,10 @@ components:
         argv:
           type: array
           items: { type: string }
+        cwd: { type: string, description: "Working directory relative to the workspace root (leading-slash normalized; / is the root)." }
+        interpreter: { type: string, description: "Interpreter used for a kind=file run; omitted otherwise." }
+        timeout_sec: { type: [integer, "null"], description: "Effective wall-clock limit in seconds; null exactly when unlimited is true (an unbounded run is never stored with a fake finite number)." }
+        unlimited: { type: boolean, description: "True when the run has no wall-clock limit." }
         status:
           type: string
           enum: [queued, running, exited, killed, timeout, failed, interrupted]
@@ -1407,7 +1443,7 @@ components:
         exit_code: { type: [integer, "null"] }
         reason:
           type: string
-          description: "Terminal reason: shell_exited, user_closed, idle_timeout, lifetime, workspace_deleted, workspace_suspended, service_shutdown, interrupted, sandbox_unavailable."
+          description: "Terminal reason: shell_exited, user_closed, idle_timeout, lifetime, workspace_deleted, workspace_suspended, workspace_stopped, service_shutdown, interrupted, sandbox_unavailable."
         diagnostic:
           type: string
           description: "Only on a failed session: the actionable cause (e.g. a PTY allocation failure). A failed session never leaves a traceback in its output."

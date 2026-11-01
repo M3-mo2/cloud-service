@@ -63,6 +63,11 @@ Workspace JSON:
 {"id":"ws_...","owner_id":"user_...","name":"...","created_at":"...","status":"active","limits":{},"last_activity_at":"..."}
 ```
 
+`limits` is `{cpu_cores, memory_mb, disk_mb, max_wall_time_sec, max_runs,
+allow_net, allow_unlimited_runs}`; `allow_unlimited_runs` is a boolean switch
+(default false) that must be true (with the server switch) before a workspace
+may request `no_timeout:true` runs.
+
 `status` is `active` or `suspended` (`deleted` exists in the type vocabulary but
 is never persisted: a deleted workspace is removed outright). The status is
 persisted and survives a restart.
@@ -90,9 +95,10 @@ atomically and survives a restart.
 - `POST /v1/workspaces/{id}/resume` → 200 `{"workspace","changed"}`. Sets
   `status:"active"`; idempotent; does not restart stopped runs.
 - `POST /v1/workspaces/{id}/stop` → 200
-  `{"workspace","stopped_run_ids","stopped_run_count"}`. Kills every tracked run
-  but leaves the workspace `active` (accepting new work). Idempotent; a no-op
-  success when nothing is running.
+  `{"workspace","stopped_run_ids","stopped_run_count","stopped_session_ids","stopped_session_count"}`.
+  Kills every tracked run **and** ends every live terminal session (reason
+  `workspace_stopped`) but leaves the workspace `active` (accepting new work).
+  Idempotent; a no-op success when nothing is running.
 
 **Usage.** `GET /v1/workspaces/{id}/usage` → 200 with `workspace_id`, `status`,
 `created_at`, `last_activity_at`, `disk_bytes`, `disk_bytes_complete`, `disk_mb`,
@@ -109,8 +115,8 @@ recent run/mutation (run start/stop, purge, PATCH, suspend/resume/stop).
 All paths relative to workspace root; leading `/` allowed and normalized. All
 endpoints enforce path safety. Browsing and viewing are first-class:
 
-- `GET /v1/workspaces/{id}/files?path=/?limit=&offset=` → `{"path","entries":[{"name","path","type":"file|dir|symlink","size","mode","mod_time","target?","target_inside?"}],"count","total","truncated"}`. Directories first, then files, each byte-wise by name; a bounded page (`caps.file_list_max`, default 1000) with `count`/`total`/`truncated`. Listing a file is `422 not_directory`, never an empty `200`.
-- `GET /v1/workspaces/{id}/files/stat?path=/main.py` → one entry's metadata (`type`, `size`, `mode`, `mod_time`, and for a file `content_type`/`sha256`/`binary`); `404` when missing.
+- `GET /v1/workspaces/{id}/files?path=/?limit=&offset=` → `{"path","entries":[{"name","path","type":"file|dir|symlink","size","mode","mod_time","target?","target_inside?","runnable?"}],"count","total","truncated"}`. Directories first, then files, each byte-wise by name; a bounded page (`caps.file_list_max`, default 1000) with `count`/`total`/`truncated`. Listing a file is `422 not_directory`, never an empty `200`. A regular file whose extension maps to an interpreter carries `runnable: "<interpreter>"`.
+- `GET /v1/workspaces/{id}/files/stat?path=/main.py` → one entry's metadata (`type`, `size`, `mode`, `mod_time`, and for a file `content_type`/`sha256`/`binary`/`runnable`); `404` when missing.
 - `GET /v1/workspaces/{id}/files/content?path=/main.py[&encoding=base64][&meta=true][&offset=&limit=][&start_line=&end_line=]` → file bytes (`Content-Type` detected, `Content-Disposition: attachment; filename=...`); JSON wrapper if `?meta=true`. Byte range (`offset`/`limit`, `limit` ≤ `file_read_mb`) and line range (`start_line`/`end_line`, 1-based inclusive) are mutually exclusive. `sha256` hashes exactly the returned bytes; `range`/`total_size`/`whole_file` make partial delivery explicit; binary content is detected (NUL/invalid UTF-8 in a bounded sample) and reported.
 - `GET /v1/workspaces/{id}/files/download?path=/big.bin` → streams the entire file (constant memory), exempt from `file_read_mb`, with `Content-Type`/`Content-Length`/`Content-Disposition`; a directory is `422`.
 - `PUT /v1/workspaces/{id}/files/content?path=/main.py` body `{"content":"...","encoding?":"text|base64"}` → 204 (missing `content` → 400; writing over a directory → 422 `not_directory`)
@@ -132,8 +138,8 @@ Hard cap timeout (default 60 s). Captures capped at §1.8.
 ### 2.5 Runs (async)
 
 - `POST /v1/workspaces/{id}/runs` body either:
-  - `{"kind":"file","file":"/main.py","args":[...],"env":{...},"timeout_sec":300}`
-  - `{"kind":"command","argv":["python3","main.py"],"env":{...},"timeout_sec":300}`
+  - `{"kind":"file","file":"/main.py","args":[...],"cwd":"/src","interpreter":"python3","env":{...},"timeout_sec":300,"no_timeout":false}`
+  - `{"kind":"command","argv":["python3","main.py"],"cwd":"/src","env":{...},"timeout_sec":300,"no_timeout":false}`
   → 202 `{run}`
 - `GET /v1/workspaces/{id}/runs?status=&kind=&limit=&offset=` →
   `{"runs":[...],"total":N,"limit":L,"offset":O}`
@@ -142,6 +148,41 @@ Hard cap timeout (default 60 s). Captures capped at §1.8.
 - `DELETE /v1/workspaces/{id}/runs/{runId}` → 204 (delete one finished run)
 - `POST /v1/workspaces/{id}/runs/{runId}/stop` → 202 (idempotent; SIGTERM→SIGKILL per §1.11)
 - `GET /v1/workspaces/{id}/runs/{runId}/logs?stream=stdout|stderr&offset=0&limit=65536` → `{"data":"...","offset":0,"next":123,"eof":false,"truncated":false}`
+
+**`cwd` (working directory).** Both kinds accept `cwd`, relative to the workspace
+root (leading `/` normalized), defaulting to the workspace root. It is validated
+at request time to exist and be a directory, else **`422`**; a bad `cwd` is
+never a deferred `503` (defect N-1). `cwd` is a *working directory*, not a
+relative-path prefix for `file`: the target file is always resolved against the
+workspace root and passed to the interpreter as an absolute sandbox path
+(`/workspace/<file>`).
+
+**Interpreter selection.** `kind=file` is no longer hardcoded to Python. The
+interpreter is chosen by file extension from an allowlist (`.py`→`python3`,
+`.js`/`.mjs`/`.cjs`→`node`, `.sh`/`.bash`→`bash`, `.pl`/`.pm`→`perl`), or by an
+explicit `interpreter` field that must itself be in the allowlist. An
+unsupported extension with no override is **`422`** naming the supported set; an
+interpreter outside the allowlist is **`422`**. The allowlist and the covered
+extensions are reported on `/v1/meta` (`interpreters`, `runnable_extensions`).
+The built argv is `[<interpreter>, /workspace/<file>, ...args]`.
+
+**Discoverability.** A file's `stat`/listing entry carries
+`runnable: "<interpreter>"` when its extension maps to one (absent otherwise), so
+a UI can offer "run this file" without guessing.
+
+**Precedence.** `argv` (raw command) and `kind=file` are mutually exclusive:
+supplying both is **`422`** (never a silent choice). `kind=file` builds argv from
+the interpreter, file and `args`; `kind=command` executes `argv` verbatim.
+
+**Unbounded runs.** `no_timeout:true` requests a run with **no wall-clock
+limit** (runs until it exits or is stopped), distinct from `timeout_sec:0`
+("use the workspace default"). It is gated twice — server
+`max_limits.allow_unlimited_runs` **and** workspace `limits.allow_unlimited_runs`
+must both be true — else **`422`** naming the level that refused. Default
+**deny**. The run record reports `unlimited:true` and `timeout_sec:null`; it is
+never stored with a fake finite number. An unbounded run still holds a slot of
+`max_runs` and its cgroup share, so a runaway process can occupy the workspace's
+capacity indefinitely until stopped (see §2.9 and DECISIONS.md #60).
 
 ### 2.5.2 Terminal sessions (interactive)
 
@@ -205,8 +246,11 @@ its `output` readable.
 Run JSON:
 
 ```json
-{"id":"run_...","workspace_id":"ws_...","kind":"file|command","argv":[...],"status":"queued|running|exited|killed|timeout|failed|interrupted","exit_code":0,"started_at":"...","ended_at":"...","logs":{"stdout_bytes":0,"stderr_bytes":0,"truncated":false}}
+{"id":"run_...","workspace_id":"ws_...","kind":"file|command","argv":[...],"cwd":"/","status":"queued|running|exited|killed|timeout|failed|interrupted","exit_code":0,"timeout_sec":300,"unlimited":false,"interpreter":"python3","started_at":"...","ended_at":"...","logs":{"stdout_bytes":0,"stderr_bytes":0,"truncated":false}}
 ```
+
+`cwd` is always present. `timeout_sec` is `null` exactly when `unlimited` is
+`true`. `interpreter` is present for a `kind=file` run and omitted otherwise.
 
 **`POST /exec` does not create a run record.** Only the asynchronous
 `POST .../runs` persists a `Run`; `exec` returns its output inline and leaves no
@@ -334,6 +378,31 @@ the table) is:
 
 The code is not always a 1:1 mirror of the status: a **405 method not allowed**
 carries `code:"validation"`.
+
+### 2.9 Named long-lived projects/services — NOT IMPLEMENTED
+
+The engine has **no notion of a named, long-lived "project" or "service"**. There
+is no way to declare a persistent process, no restart-on-crash, no autostart, and
+no lifecycle beyond a **single run** (§2.5) or a **single session** (§2.5.2):
+
+- A **run** is one process tree. It runs until it exits, is stopped, or (when
+  bounded) hits its wall-clock limit; then it is finished. It is not restarted.
+- A **session** is one interactive shell. It ends on shell exit, `DELETE`, idle
+  timeout or lifetime; it is not restarted.
+- A **workspace** is a container of files and runs. It has no "start"/"stop my
+  service" state — `suspend`/`stop` stop *current* work, they do not define a
+  service to bring back up.
+- There is **no supervisor**: nothing re-launches a crashed workload, nothing
+  keeps a workload running across a service restart (a restart moves any
+  queued/running run to `interrupted` and any running session to `killed`), and
+  there is no autostart on workspace resume.
+
+This is a **documented non-goal for the current version** (v0.0.5): a
+frontend that wants a "project that stays up" must implement it by re-issuing
+runs/sessions (and retrying on crash) on its side. Where such a capability would
+belong if built — an engine-level supervisor versus the frontend restarting runs
+— is recorded in [DECISIONS.md](DECISIONS.md) #61. **It is deliberately not
+implemented in this version.**
 
 ## 3. SECURITY / NSJAIL
 

@@ -24,12 +24,13 @@ func WorkspaceSuspendedError() error {
 // the current value; this is why every field is a pointer (so an omitted JSON
 // field and an explicit null both leave the value untouched).
 type LimitUpdate struct {
-	CPUCores       *float64
-	MemoryMB       *int
-	DiskMB         *int
-	MaxWallTimeSec *int
-	MaxRuns        *int
-	AllowNet       *bool
+	CPUCores           *float64
+	MemoryMB           *int
+	DiskMB             *int
+	MaxWallTimeSec     *int
+	MaxRuns            *int
+	AllowNet           *bool
+	AllowUnlimitedRuns *bool
 }
 
 // WorkspaceUpdate is a partial update of a workspace.
@@ -42,12 +43,13 @@ type WorkspaceUpdate struct {
 func (s *Service) maxLimits() model.Limits {
 	m := s.cfg.MaxLimits
 	return model.Limits{
-		CPUCores:       m.CPUCores,
-		MemoryMB:       m.MemoryMB,
-		DiskMB:         m.DiskMB,
-		MaxWallTimeSec: m.MaxWallTimeSec,
-		MaxRuns:        m.MaxRuns,
-		AllowNet:       m.AllowNet,
+		CPUCores:           m.CPUCores,
+		MemoryMB:           m.MemoryMB,
+		DiskMB:             m.DiskMB,
+		MaxWallTimeSec:     m.MaxWallTimeSec,
+		MaxRuns:            m.MaxRuns,
+		AllowNet:           m.AllowNet,
+		AllowUnlimitedRuns: m.AllowUnlimitedRuns,
 	}
 }
 
@@ -145,6 +147,9 @@ func applyLimitUpdate(cur *model.Limits, upd LimitUpdate, max model.Limits) erro
 	if upd.AllowNet != nil {
 		cur.AllowNet = *upd.AllowNet
 	}
+	if upd.AllowUnlimitedRuns != nil {
+		cur.AllowUnlimitedRuns = *upd.AllowUnlimitedRuns
+	}
 	return nil
 }
 
@@ -204,13 +209,19 @@ func (s *Service) ResumeWorkspace(id string) (*model.Workspace, bool, error) {
 	return s.SetSuspended(id, false)
 }
 
-// StopWorkspace stops every running/queued run of the workspace and leaves the
-// workspace active. It returns the IDs of the runs that were signalled. It is
-// idempotent and a no-op success when nothing is running.
-func (s *Service) StopWorkspace(id string) ([]string, error) {
-	stopped := s.runningRunIDs(id)
+// StopWorkspace stops every running/queued run of the workspace **and** every
+// live terminal session, leaving the workspace active. It returns the IDs of
+// the runs and the sessions that were signalled. It is idempotent and a no-op
+// success when nothing is running.
+//
+// Stopping sessions here closes a gap: a workspace "stop its operations"
+// control that left terminal sessions running would not actually stop the
+// workspace's work (see docs/VERIFICATION.md §9d and docs/DECISIONS.md).
+func (s *Service) StopWorkspace(id string) ([]string, []string, error) {
+	stoppedRuns := s.runningRunIDs(id)
 	s.StopAllRuns(id)
-	return stopped, nil
+	stoppedSessions := s.StopWorkspaceSessions(id, model.SessionReasonWorkspaceStopped)
+	return stoppedRuns, stoppedSessions, nil
 }
 
 // runningRunIDs returns the IDs of runs currently tracked for a workspace.

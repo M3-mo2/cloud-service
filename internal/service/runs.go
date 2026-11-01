@@ -4,12 +4,14 @@ import (
 	"context"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"sandboxd/internal/executor"
 	"sandboxd/internal/model"
 	"sandboxd/internal/storage"
+	"sandboxd/internal/workspace"
 )
 
 // StartRunSpec describes an asynchronous run request.
@@ -20,6 +22,102 @@ type StartRunSpec struct {
 	Argv    []string
 	Env     map[string]string
 	Timeout int
+	// Cwd is the working directory, relative to the workspace root. Empty means
+	// the workspace root. It is validated to exist and be a directory before the
+	// run is accepted.
+	Cwd string
+	// Interpreter overrides the extension-derived interpreter for a kind=file
+	// run. It must be in the allowlist (model.Interpreters).
+	Interpreter string
+	// NoTimeout requests a wall-clock-unbounded run. It is distinct from
+	// Timeout<=0 (which means "use the workspace default") and must be permitted
+	// at both the server and the workspace level.
+	NoTimeout bool
+}
+
+// workspaceFilePath renders a workspace-relative file as the absolute sandbox
+// path (/workspace/<rel>). The workspace is bind-mounted at /workspace inside
+// the sandbox, so this path is valid regardless of the run's cwd. Passing the
+// file as an absolute sandbox path (rather than a cwd-relative one) is what
+// keeps `cwd` purely a working directory rather than a relative-path prefix.
+func workspaceFilePath(file string) string {
+	p := strings.ReplaceAll(file, "\\", "/")
+	parts := make([]string, 0, 4)
+	for _, part := range strings.Split(p, "/") {
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if len(parts) > 0 {
+				parts = parts[:len(parts)-1]
+			}
+		default:
+			parts = append(parts, part)
+		}
+	}
+	return "/workspace/" + strings.Join(parts, "/")
+}
+
+// resolveFileInterpreter chooses the interpreter for a kind=file run: an
+// explicit, allowlisted override wins; otherwise the file extension maps to
+// its interpreter. An unsupported extension with no override is 422 naming the
+// supported set.
+func resolveFileInterpreter(file, explicit string) (string, error) {
+	if explicit != "" {
+		if !model.IsAllowedInterpreter(explicit) {
+			return "", model.Wrap(422, model.CodeUnprocessable,
+				"interpreter is not in the supported set",
+				map[string]string{
+					"interpreter": explicit,
+					"supported":   strings.Join(model.SupportedInterpreters(), ","),
+				})
+		}
+		return explicit, nil
+	}
+	if in := model.InterpreterForFile(file); in != "" {
+		return in, nil
+	}
+	return "", model.Wrap(422, model.CodeUnprocessable,
+		"no interpreter is registered for this file extension",
+		map[string]string{
+			"file":                 file,
+			"supported_extensions": strings.Join(model.SupportedExtensions(), ","),
+		})
+}
+
+// resolveRunCwd validates a run working directory against the workspace root
+// and returns its normalized workspace-rooted path (leading slash; "/" is the
+// root). A path that escapes the root, does not exist, or is not a directory is
+// rejected with 422 -- never deferred to execution, where a missing cwd would
+// otherwise surface as a misleading 503 sandbox-unavailable error.
+func (s *Service) resolveRunCwd(fs *workspace.Fs, cwd string) (string, error) {
+	if strings.TrimSpace(cwd) == "" {
+		return "/", nil
+	}
+	abs, err := fs.Resolve(cwd)
+	if err != nil {
+		return "", err
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", model.Wrap(422, model.CodeUnprocessable, "cwd does not exist",
+				map[string]string{"cwd": cwd})
+		}
+		return "", err
+	}
+	if !fi.IsDir() {
+		return "", model.Wrap(422, model.CodeUnprocessable, "cwd is not a directory",
+			map[string]string{"cwd": cwd})
+	}
+	rel, err := filepath.Rel(fs.Root(), abs)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." {
+		return "/", nil
+	}
+	return "/" + filepath.ToSlash(rel), nil
 }
 
 // StartRun creates and launches an asynchronous run.
@@ -27,23 +125,45 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 	if err := s.ensureActive(w); err != nil {
 		return nil, err
 	}
-	timeout := spec.Timeout
-	if timeout <= 0 || timeout > w.Limits.MaxWallTimeSec {
-		timeout = w.Limits.MaxWallTimeSec
+	// raw argv and kind=file are mutually exclusive; the precedence is explicit
+	// and documented (docs/API.md). Rejecting the combination is safer than
+	// silently picking one.
+	if spec.Kind == model.RunKindFile && len(spec.Argv) > 0 {
+		return nil, model.Wrap(422, model.CodeUnprocessable,
+			"argv cannot be combined with kind=file; use args, or kind=command",
+			map[string]string{"field": "argv"})
 	}
+
+	fs, err := s.WorkspaceFs(w)
+	if err != nil {
+		return nil, err
+	}
+
+	// cwd applies to both kinds and is a working directory, not a relative-path
+	// prefix for file.
+	cwd, err := s.resolveRunCwd(fs, spec.Cwd)
+	if err != nil {
+		return nil, err
+	}
+
 	argv := spec.Argv
+	interpreter := ""
 	if spec.Kind == model.RunKindFile {
-		// Validate the target file resolves inside the workspace and exists
-		// before accepting the run, rather than deferring the failure to
-		// execution time.
-		fs, err := s.WorkspaceFs(w)
-		if err != nil {
-			return nil, err
-		}
+		// Path safety is checked first so a traversal/escape is reported as
+		// unsafe (422) regardless of the file's extension.
 		resolved, err := fs.Resolve(spec.File)
 		if err != nil {
 			return nil, err
 		}
+		// Resolve the interpreter next (a pure request-level check) so an
+		// unsupported extension or a non-allowlisted override is reported as 422
+		// even when the file does not exist.
+		interpreter, err = resolveFileInterpreter(spec.File, spec.Interpreter)
+		if err != nil {
+			return nil, err
+		}
+		// Validate the target file exists before accepting the run, rather than
+		// deferring the failure to execution time.
 		if fi, err := os.Stat(resolved); err != nil {
 			if os.IsNotExist(err) {
 				return nil, model.ErrNotFound
@@ -52,11 +172,29 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		} else if fi.IsDir() {
 			return nil, model.New(422, model.CodeUnprocessable, "file run target is a directory")
 		}
-		// A file run executes the default runtime (python3) against the file,
-		// whose path is relative to the workspace root (bind-mounted at
-		// /workspace, which is the sandbox CWD).
-		file := strings.TrimPrefix(spec.File, "/")
-		argv = append([]string{"python3", file}, spec.Args...)
+		// A file run executes the chosen interpreter against the file. The file
+		// is resolved relative to the workspace root and passed as an absolute
+		// sandbox path (/workspace is the fixed mount point), so it is found
+		// regardless of the requested working directory: cwd is a working
+		// directory, NOT a relative-path prefix for file.
+		file := workspaceFilePath(spec.File)
+		argv = append([]string{interpreter, file}, spec.Args...)
+	}
+
+	// Wall-clock policy. An explicit unbounded request must be permitted at both
+	// the server and the workspace level; a finite request is clamped to the
+	// workspace maximum (Timeout <= 0 means "use the workspace default").
+	unlimited := spec.NoTimeout
+	timeout := 0
+	if unlimited {
+		if err := s.UnlimitedAllowed(w); err != nil {
+			return nil, err
+		}
+	} else {
+		timeout = spec.Timeout
+		if timeout <= 0 || timeout > w.Limits.MaxWallTimeSec {
+			timeout = w.Limits.MaxWallTimeSec
+		}
 	}
 
 	// Prune old runs before starting a new one (retention policy).
@@ -79,6 +217,12 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		Argv:        argv,
 		Status:      model.RunQueued,
 		StartedAt:   now,
+		Cwd:         cwd,
+		Unlimited:   unlimited,
+		Interpreter: interpreter,
+	}
+	if !unlimited {
+		run.SetTimeoutSec(timeout)
 	}
 	if err := s.store.CreateRun(w.ID, run); err != nil {
 		return nil, err
@@ -95,9 +239,10 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		Workspace:     w,
 		WorkspaceRoot: s.store.WorkspaceRoot(w.ID),
 		Argv:          argv,
-		Cwd:           "/",
+		Cwd:           cwd,
 		Env:           spec.Env,
 		Timeout:       time.Duration(timeout) * time.Second,
+		NoTimeout:     unlimited,
 		Context:       ctx,
 		RunID:         run.ID,
 		StdoutPath:    stdoutPath,
@@ -129,6 +274,10 @@ func cloneRun(r *model.Run) *model.Run {
 	if r.ExitCode != nil {
 		code := *r.ExitCode
 		cp.ExitCode = &code
+	}
+	if r.TimeoutSec != nil {
+		t := *r.TimeoutSec
+		cp.TimeoutSec = &t
 	}
 	return &cp
 }

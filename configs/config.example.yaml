@@ -27,6 +27,11 @@ limits:
   max_wall_time_sec: 300
   max_runs: 3
   allow_net: false
+  # Default workspace opt-in for wall-clock-unbounded runs (no_timeout:true).
+  # A run is unbounded only if BOTH this workspace-level value and the
+  # server-level max_limits.allow_unlimited_runs are true. Default false (deny):
+  # a workspace cannot ask for unlimited by omission.
+  allow_unlimited_runs: false
 
 # Server-level maxima. No workspace may exceed these at creation or via PATCH;
 # a request above a maximum is rejected with 422 (never silently clamped).
@@ -37,6 +42,11 @@ max_limits:
   max_wall_time_sec: 3600
   max_runs: 64
   allow_net: true
+  # Server-level switch an operator uses to forbid wall-clock-unbounded runs
+  # everywhere. When false, no workspace may request `no_timeout:true`; when
+  # true, an individual workspace still has to opt in via its own
+  # limits.allow_unlimited_runs (or a PATCH). Default false (deny).
+  allow_unlimited_runs: false
 
 # Output and body caps (bytes / sizes). These are hard ceilings.
 caps:

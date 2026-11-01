@@ -48,6 +48,18 @@ check_contains() {
 jsonfield() { python3 -c "import json,sys;print(json.load(sys.stdin)$1)"; }
 httpcode() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
+# wait_run_terminal WS RUN_ID [attempts] -- poll a run until it reaches a
+# terminal status and print that status (or the last observed one on timeout).
+wait_run_terminal() { # ws runID [attempts]
+  st=""
+  for _ in $(seq 1 "${3:-120}"); do
+    st=$(curl -s -H "$K" "$B/v1/workspaces/$1/runs/$2" | jsonfield "['run']['status']")
+    case "$st" in exited|killed|timeout|failed|interrupted) break;; esac
+    sleep 0.1
+  done
+  printf '%s' "$st"
+}
+
 echo "### 0. environment"
 echo "base=$B data_dir=${DATA_DIR:-<unset>}"
 
@@ -195,6 +207,57 @@ done
 check "run.status" "$st" "exited"
 check "run.logs.stdout" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$RUN/logs?stream=stdout&offset=0&limit=65536" | jsonfield "['data']" | tr -d '\n')" "hi"
 
+echo "### 10b. runs: cwd, interpreter selection, runnable metadata (Deliverable A)"
+# A file that prints its own cwd, run in a subdirectory, proves the real
+# working directory (the sandbox sees the workspace at /workspace).
+curl -s -o /dev/null -H "$K" -H "$JSON" -d '{"path":"/rundir"}' "$B/v1/workspaces/$WS/files/mkdir"
+curl -s -o /dev/null -X PUT -H "$K" -H "$JSON" \
+  -d '{"content":"import os\nprint(os.getcwd())\n"}' \
+  "$B/v1/workspaces/$WS/files/content?path=/rundir/whereami.py"
+CWD_RUN=$(curl -s -H "$K" -H "$JSON" -d '{"kind":"file","file":"/rundir/whereami.py","cwd":"/rundir"}' "$B/v1/workspaces/$WS/runs" | jsonfield "['run']['id']")
+check "run.cwd_recorded" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$CWD_RUN" | jsonfield "['run']['cwd']")" "/rundir"
+check "run.cwd_status" "$(wait_run_terminal "$WS" "$CWD_RUN")" "exited"
+check "run.cwd_is_realdir" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$CWD_RUN/logs?stream=stdout&offset=0&limit=65536" | jsonfield "['data']" | tr -d '\n')" "/workspace/rundir"
+
+# A cwd pointing at a missing path is 422, never 503 (defect N-1).
+check "run.cwd_missing_422" "$(httpcode -H "$K" -H "$JSON" -d '{"kind":"file","file":"/rundir/whereami.py","cwd":"/nope"}' "$B/v1/workspaces/$WS/runs")" "422"
+check "exec.cwd_missing_422" "$(httpcode -H "$K" -H "$JSON" -d '{"cmd":["pwd"],"cwd":"/nope"}' "$B/v1/workspaces/$WS/exec")" "422"
+
+# Backward compatible: a .py file with no interpreter field still runs via python3.
+PYRUN=$(curl -s -H "$K" -H "$JSON" -d '{"kind":"file","file":"/main.py"}' "$B/v1/workspaces/$WS/runs" | jsonfield "['run']['id']")
+check "run.py_backcompat_interpreter" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$PYRUN" | jsonfield "['run']['interpreter']")" "python3"
+check "run.py_backcompat_status" "$(wait_run_terminal "$WS" "$PYRUN")" "exited"
+
+# runnable metadata on stat and listing, straight from the file extension.
+check "stat.runnable_py" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/stat?path=/rundir/whereami.py" | jsonfield "['runnable']")" "python3"
+check "stat.runnable_txt_none" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/stat?path=/lines.txt" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("runnable"))')" "None"
+
+# A .sh file selects bash by extension with no interpreter field.
+curl -s -o /dev/null -X PUT -H "$K" -H "$JSON" -d '{"content":"echo ext-sh\n"}' "$B/v1/workspaces/$WS/files/content?path=/ext.sh"
+SHJSON=$(curl -s -H "$K" -H "$JSON" -d '{"kind":"file","file":"/ext.sh"}' "$B/v1/workspaces/$WS/runs")
+SHRUN=$(printf '%s' "$SHJSON" | jsonfield "['run']['id']")
+check "run.sh_by_extension" "$(printf '%s' "$SHJSON" | jsonfield "['run']['interpreter']")" "bash"
+SHST=$(wait_run_terminal "$WS" "$SHRUN")
+check "run.sh_by_extension_status" "$SHST" "exited"
+check "run.sh_by_extension_out" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$SHRUN/logs?stream=stdout&offset=0&limit=65536" | jsonfield "['data']" | tr -d '\n')" "ext-sh"
+
+# An explicit allowlisted interpreter runs a non-.py file.
+curl -s -o /dev/null -X PUT -H "$K" -H "$JSON" -d '{"content":"echo sh-ok\n"}' "$B/v1/workspaces/$WS/files/content?path=/runme.txt"
+ISEL=$(curl -s -H "$K" -H "$JSON" -d '{"kind":"file","file":"/runme.txt","interpreter":"bash"}' "$B/v1/workspaces/$WS/runs")
+ISEL_RUN=$(printf '%s' "$ISEL" | jsonfield "['run']['id']")
+check "run.interpreter_override" "$(printf '%s' "$ISEL" | jsonfield "['run']['interpreter']")" "bash"
+ISELST=$(wait_run_terminal "$WS" "$ISEL_RUN")
+check "run.interpreter_override_status" "$ISELST" "exited"
+check "run.interpreter_override_out" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/runs/$ISEL_RUN/logs?stream=stdout&offset=0&limit=65536" | jsonfield "['data']" | tr -d '\n')" "sh-ok"
+
+# An unsupported extension with no interpreter is 422 naming the supported set.
+UNSUP=$(curl -s -H "$K" -H "$JSON" -d '{"kind":"file","file":"/lines.txt"}' "$B/v1/workspaces/$WS/runs")
+check "run.unsupported_ext_code" "$(printf '%s' "$UNSUP" | jsonfield "['error']['code']")" "unprocessable"
+check_contains "run.unsupported_ext_names_set" "$(printf '%s' "$UNSUP" | jsonfield "['error']['details']['supported_extensions']")" ".py"
+
+# argv + kind=file is an explicit conflict (422), never a silent precedence.
+check "run.argv_file_conflict_422" "$(httpcode -H "$K" -H "$JSON" -d '{"kind":"file","file":"/main.py","argv":["python3","main.py"]}' "$B/v1/workspaces/$WS/runs")" "422"
+
 echo "### 11. security: traversal rejected (expect 422)"
 check "traversal.read" "$(httpcode -H "$K" "$B/v1/workspaces/$WS/files/content?path=../etc/passwd")" "422"
 check "traversal.write" "$(httpcode -X PUT -H "$K" -H "$JSON" -d '{"content":"x"}' "$B/v1/workspaces/$WS/files/content?path=../evil")" "422"
@@ -297,6 +360,50 @@ else
 fi
 check "stop.no_survivors" "$([ -z "$n" ] && echo 0 || echo "$n")" "0"
 
+echo "### 20b. unbounded runs: opt-in, honest record, real survival, zero survivors (Deliverable B)"
+# A workspace with a small max_wall_time_sec (5 s) so survival past the ceiling
+# is provable without an hour-long test. It opts in to unbounded runs.
+WSUNL=$(curl -s -H "$K" -H "$JSON" -d '{"name":"unl","limits":{"max_wall_time_sec":5,"allow_unlimited_runs":true}}' "$B/v1/workspaces" | jsonfield "['workspace']['id']")
+curl -s -o /dev/null -X PUT -H "$K" -H "$JSON" \
+  -d '{"content":"import time\nprint(\"UNL_START\",flush=True)\ntime.sleep(30)\n"}' \
+  "$B/v1/workspaces/$WSUNL/files/content?path=/long.py"
+
+# Denied when the workspace config forbids it: the default workspace WS has
+# allow_unlimited_runs=false, so no_timeout is refused 422 naming the key.
+DEN=$(curl -s -H "$K" -H "$JSON" -d '{"kind":"file","file":"/long.py","no_timeout":true}' "$B/v1/workspaces/$WS/runs")
+check "unlimited.denied_code" "$(printf '%s' "$DEN" | jsonfield "['error']['code']")" "unprocessable"
+check "unlimited.denied_config" "$(printf '%s' "$DEN" | jsonfield "['error']['details']['config']")" "limits.allow_unlimited_runs"
+
+# An allowed unbounded run records unlimited honestly: no fake finite number.
+UNLJSON=$(curl -s -H "$K" -H "$JSON" -d '{"kind":"file","file":"/long.py","no_timeout":true}' "$B/v1/workspaces/$WSUNL/runs")
+UNL=$(printf '%s' "$UNLJSON" | jsonfield "['run']['id']")
+check "unlimited.recorded_flag" "$(printf '%s' "$UNLJSON" | jsonfield "['run']['unlimited']")" "True"
+check "unlimited.recorded_timeout_null" "$(printf '%s' "$UNLJSON" | jsonfield "['run']['timeout_sec']")" "None"
+
+# A finite run on the SAME workspace is bounded by max_wall_time_sec=5: a
+# timeout_sec of 2 must end in status timeout, proving the ceiling is real and
+# that `no_timeout` is what bypasses it.
+FINJSON=$(curl -s -H "$K" -H "$JSON" -d '{"kind":"file","file":"/long.py","timeout_sec":2}' "$B/v1/workspaces/$WSUNL/runs")
+FIN=$(printf '%s' "$FINJSON" | jsonfield "['run']['id']")
+check "finite.recorded_timeout" "$(printf '%s' "$FINJSON" | jsonfield "['run']['timeout_sec']")" "2"
+check "finite.times_out" "$(wait_run_terminal "$WSUNL" "$FIN" 80)" "timeout"
+
+# The unbounded run is still alive well past the 5 s ceiling.
+sleep 8
+check "unlimited.survives_past_ceiling" "$(curl -s -H "$K" "$B/v1/workspaces/$WSUNL/runs/$UNL" | jsonfield "['run']['status']")" "running"
+
+# Stopping it kills the whole process group and leaves zero survivors.
+curl -s -X POST -H "$K" "$B/v1/workspaces/$WSUNL/runs/$UNL/stop" >/dev/null
+sleep 1
+check "unlimited.stop_status" "$(curl -s -H "$K" "$B/v1/workspaces/$WSUNL/runs/$UNL" | jsonfield "['run']['status']")" "killed"
+if [ -n "${CONTAINER:-}" ]; then
+  un=$(docker exec "$CONTAINER" pgrep -fc "long.py" || true)
+else
+  un=$(pgrep -fc "long.py" || true)
+fi
+check "unlimited.stop_no_survivors" "$([ -z "$un" ] && echo 0 || echo "$un")" "0"
+curl -s -o /dev/null -X DELETE -H "$K" "$B/v1/workspaces/$WSUNL"
+
 echo "### 21. terminal session: a real PTY inside the sandbox"
 # Create a session, run `tty` and `test -t 1`, and read the output back through
 # the byte-offset reader. This is the real-nsjail fix guard: without the host
@@ -334,6 +441,38 @@ check_contains "session.offset_suffix" \
   "$(printf '%s' "$SES_OUT" | tail -c4)"
 curl -s -o /dev/null -X DELETE -H "$K" "$B/v1/workspaces/$WS/sessions/$SES"
 check "session.delete" "$(httpcode -X DELETE -H "$K" "$B/v1/workspaces/$WS/sessions/$SES")" "200"
+
+echo "### 21b. workspace stop stops runs AND sessions, leaving zero processes (Deliverable C)"
+# The control-plane gap: POST /workspaces/{id}/stop must stop the workspace's
+# runs *and* its live terminal sessions, and report both counts.
+WSSTP=$(curl -s -H "$K" -H "$JSON" -d '{"name":"stopall"}' "$B/v1/workspaces" | jsonfield "['workspace']['id']")
+curl -s -o /dev/null -X PUT -H "$K" -H "$JSON" \
+  -d '{"content":"import time\nprint(\"STOP_START\",flush=True)\ntime.sleep(60)\n"}' \
+  "$B/v1/workspaces/$WSSTP/files/content?path=/stopme.py"
+STP_RUN=$(curl -s -H "$K" -H "$JSON" -d '{"kind":"file","file":"/stopme.py"}' "$B/v1/workspaces/$WSSTP/runs" | jsonfield "['run']['id']")
+STP_SES=$(curl -s -H "$K" -H "$JSON" -d '{"cols":80,"rows":24}' "$B/v1/workspaces/$WSSTP/sessions" | jsonfield "['session']['id']")
+# Give the session a command that is definitely alive so the process tree exists.
+curl -s -o /dev/null -H "$K" -H "$JSON" -d '{"data":"sleep 600\n"}' "$B/v1/workspaces/$WSSTP/sessions/$STP_SES/input"
+sleep 2
+STOPJSON=$(curl -s -X POST -H "$K" "$B/v1/workspaces/$WSSTP/stop")
+check "stop.runs_count" "$(printf '%s' "$STOPJSON" | jsonfield "['stopped_run_count']")" "1"
+check "stop.sessions_count" "$(printf '%s' "$STOPJSON" | jsonfield "['stopped_session_count']")" "1"
+check "stop.run_id_reported" "$(printf '%s' "$STOPJSON" | jsonfield "['stopped_run_ids'][0]")" "$STP_RUN"
+check "stop.session_id_reported" "$(printf '%s' "$STOPJSON" | jsonfield "['stopped_session_ids'][0]")" "$STP_SES"
+sleep 1
+check "stop.run_status" "$(curl -s -H "$K" "$B/v1/workspaces/$WSSTP/runs/$STP_RUN" | jsonfield "['run']['status']")" "killed"
+check "stop.session_status" "$(curl -s -H "$K" "$B/v1/workspaces/$WSSTP/sessions/$STP_SES" | jsonfield "['session']['status']")" "killed"
+check "stop.session_reason" "$(curl -s -H "$K" "$B/v1/workspaces/$WSSTP/sessions/$STP_SES" | jsonfield "['session']['reason']")" "workspace_stopped"
+# Zero surviving processes belonging to that workspace's tree (the run's
+# interpreter and the session's shell both held stopme.py / sleep).
+if [ -n "${CONTAINER:-}" ]; then
+  sn=$(docker exec "$CONTAINER" pgrep -fc "stopme.py" || true)
+else
+  sn=$(pgrep -fc "stopme.py" || true)
+fi
+check "stop.zero_survivors" "$([ -z "$sn" ] && echo 0 || echo "$sn")" "0"
+check "stop.workspace_active" "$(curl -s -H "$K" "$B/v1/workspaces/$WSSTP" | jsonfield "['workspace']['status']")" "active"
+check "stop.delete_ws" "$(httpcode -X DELETE -H "$K" "$B/v1/workspaces/$WSSTP")" "204"
 
 echo "### 22. delete workspace (expect 204) and get after delete (expect 404)"
 check "delete.workspace" "$(httpcode -X DELETE -H "$K" "$B/v1/workspaces/$WS")" "204"

@@ -107,6 +107,37 @@ func checkMaxima(l, max model.Limits) error {
 		return maxExceeded("max_wall_time_sec", l.MaxWallTimeSec, max.MaxWallTimeSec)
 	case l.MaxRuns > max.MaxRuns:
 		return maxExceeded("max_runs", l.MaxRuns, max.MaxRuns)
+	case l.AllowUnlimitedRuns && !max.AllowUnlimitedRuns:
+		return UnlimitedForbiddenByServer()
+	}
+	return nil
+}
+
+// UnlimitedForbiddenByServer reports that the server-level configuration
+// forbids wall-clock-unbounded runs (max_limits.allow_unlimited_runs is false).
+func UnlimitedForbiddenByServer() error {
+	return model.Wrap(422, model.CodeUnprocessable,
+		"unlimited runs are forbidden by the server configuration",
+		map[string]string{"config": "max_limits.allow_unlimited_runs", "field": "no_timeout"})
+}
+
+// UnlimitedForbiddenByWorkspace reports that the workspace has not opted in to
+// wall-clock-unbounded runs (its limits.allow_unlimited_runs is false).
+func UnlimitedForbiddenByWorkspace() error {
+	return model.Wrap(422, model.CodeUnprocessable,
+		"unlimited runs are not permitted for this workspace",
+		map[string]string{"config": "limits.allow_unlimited_runs", "field": "no_timeout"})
+}
+
+// UnlimitedAllowed reports whether an unlimited run is permitted for the
+// workspace. It enforces both levels: the server maximum AND the workspace
+// opt-in. The returned error distinguishes which level refused.
+func (s *Service) UnlimitedAllowed(w *model.Workspace) error {
+	if !s.cfg.MaxLimits.AllowUnlimitedRuns {
+		return UnlimitedForbiddenByServer()
+	}
+	if !w.Limits.AllowUnlimitedRuns {
+		return UnlimitedForbiddenByWorkspace()
 	}
 	return nil
 }
@@ -114,12 +145,13 @@ func checkMaxima(l, max model.Limits) error {
 func (s *Service) defaultLimits() model.Limits {
 	l := s.cfg.Limits
 	return model.Limits{
-		CPUCores:       l.CPUCores,
-		MemoryMB:       l.MemoryMB,
-		DiskMB:         l.DiskMB,
-		MaxWallTimeSec: l.MaxWallTimeSec,
-		MaxRuns:        l.MaxRuns,
-		AllowNet:       l.AllowNet,
+		CPUCores:           l.CPUCores,
+		MemoryMB:           l.MemoryMB,
+		DiskMB:             l.DiskMB,
+		MaxWallTimeSec:     l.MaxWallTimeSec,
+		MaxRuns:            l.MaxRuns,
+		AllowNet:           l.AllowNet,
+		AllowUnlimitedRuns: l.AllowUnlimitedRuns,
 	}
 }
 
@@ -141,6 +173,7 @@ func applyLimits(base, over model.Limits) model.Limits {
 		base.MaxRuns = over.MaxRuns
 	}
 	base.AllowNet = over.AllowNet
+	base.AllowUnlimitedRuns = over.AllowUnlimitedRuns
 	return base
 }
 

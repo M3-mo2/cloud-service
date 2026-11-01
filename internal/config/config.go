@@ -148,6 +148,12 @@ type LimitsConfig struct {
 	MaxWallTimeSec int     `koanf:"max_wall_time_sec"`
 	MaxRuns        int     `koanf:"max_runs"`
 	AllowNet       bool    `koanf:"allow_net"`
+	// AllowUnlimitedRuns permits wall-clock-unbounded runs. In `limits:` it is
+	// the per-workspace default (opt-in); in `max_limits:` it is the server-level
+	// switch an operator uses to forbid unbounded runs everywhere. A request for
+	// an unlimited run is accepted only when both are true; otherwise 422.
+	// Default is false (deny).
+	AllowUnlimitedRuns bool `koanf:"allow_unlimited_runs"`
 }
 
 // CapsConfig holds hard output/body caps. Sizes are expressed in the unit named
@@ -215,20 +221,22 @@ func Default() Config {
 			KillGraceSec: 3,
 		},
 		Limits: LimitsConfig{
-			CPUCores:       1,
-			MemoryMB:       512,
-			DiskMB:         1024,
-			MaxWallTimeSec: 300,
-			MaxRuns:        3,
-			AllowNet:       false,
+			CPUCores:           1,
+			MemoryMB:           512,
+			DiskMB:             1024,
+			MaxWallTimeSec:     300,
+			MaxRuns:            3,
+			AllowNet:           false,
+			AllowUnlimitedRuns: false,
 		},
 		MaxLimits: LimitsConfig{
-			CPUCores:       8,
-			MemoryMB:       8192,
-			DiskMB:         51200,
-			MaxWallTimeSec: 3600,
-			MaxRuns:        64,
-			AllowNet:       true,
+			CPUCores:           8,
+			MemoryMB:           8192,
+			DiskMB:             51200,
+			MaxWallTimeSec:     3600,
+			MaxRuns:            64,
+			AllowNet:           true,
+			AllowUnlimitedRuns: false,
 		},
 		Caps: CapsConfig{
 			ExecStdoutKB: 256,
@@ -412,6 +420,7 @@ limits:
   max_wall_time_sec: 300
   max_runs: 3
   allow_net: false
+  allow_unlimited_runs: false
 max_limits:
   cpu_cores: 8
   memory_mb: 8192
@@ -419,6 +428,7 @@ max_limits:
   max_wall_time_sec: 3600
   max_runs: 64
   allow_net: true
+  allow_unlimited_runs: false
 caps:
   exec_stdout_kb: 256
   exec_stderr_kb: 256

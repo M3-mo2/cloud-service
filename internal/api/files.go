@@ -22,6 +22,7 @@ type entryJSON struct {
 	ModTime      string `json:"mod_time"`
 	Target       string `json:"target,omitempty"`
 	TargetInside bool   `json:"target_inside,omitempty"`
+	Runnable     string `json:"runnable,omitempty"`
 }
 
 func toEntryJSON(e workspace.Entry) entryJSON {
@@ -34,6 +35,7 @@ func toEntryJSON(e workspace.Entry) entryJSON {
 		ModTime:      e.ModTime.UTC().Format(time.RFC3339),
 		Target:       e.Target,
 		TargetInside: e.TargetInside,
+		Runnable:     e.Runnable,
 	}
 }
 
@@ -86,6 +88,7 @@ type statJSON struct {
 	ContentType  string `json:"content_type,omitempty"`
 	SHA256       string `json:"sha256,omitempty"`
 	Binary       bool   `json:"binary,omitempty"`
+	Runnable     string `json:"runnable,omitempty"`
 }
 
 func (s *Server) handleStatFile(w http.ResponseWriter, r *http.Request) {
@@ -115,6 +118,7 @@ func (s *Server) handleStatFile(w http.ResponseWriter, r *http.Request) {
 		ContentType:  info.ContentType,
 		SHA256:       info.SHA256,
 		Binary:       info.Binary,
+		Runnable:     info.Runnable,
 	})
 }
 

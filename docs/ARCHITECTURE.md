@@ -251,10 +251,12 @@ sequenceDiagram
     participant G as executeRun goroutine
     participant EX as executor
 
-    C->>API: POST /runs {kind, file or argv, env, timeout_sec}
+    C->>API: POST /runs {kind, file|argv, args, cwd, interpreter, env, timeout_sec, no_timeout}
     API->>SVC: StartRun(ws, spec)
+    SVC->>SVC: resolve+validate cwd; select interpreter (extension/override)
+    SVC->>SVC: gate no_timeout (server AND workspace allow_unlimited_runs)
     SVC->>ST: PruneRuns(keep=99)
-    SVC->>ST: CreateRun(meta.json + empty logs)
+    SVC->>ST: CreateRun(meta.json + empty logs, cwd/timeout/unlimited/interpreter)
     SVC->>SVC: ctx, cancel = WithCancel()
     SVC->>G: go executeRun(ctx, ...)
     SVC-->>API: *Run (status=queued)
@@ -509,7 +511,7 @@ flowchart TB
         J7["/etc/{resolv.conf,hosts}\nRO (allow_net only)"]
         J8["/opt/python/shared  ← RO bind\n(shared tier)"]
         J9["/opt/python/private ← RW bind\n(private tier)"]
-        J6["cwd = /workspace"]
+        J6["cwd = /workspace\n(or a validated subdirectory)"]
     end
 
     H1 --> J1

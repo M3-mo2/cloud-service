@@ -42,6 +42,11 @@ type Limits struct {
 	MaxWallTimeSec int     `json:"max_wall_time_sec"`
 	MaxRuns        int     `json:"max_runs"`
 	AllowNet       bool    `json:"allow_net"`
+	// AllowUnlimitedRuns opts a workspace in to wall-clock-unbounded runs
+	// (`no_timeout:true`). It is false by default. Both this workspace flag and
+	// the server-level max_limits.allow_unlimited_runs must be true for an
+	// unlimited run to be accepted; otherwise the request is refused with 422.
+	AllowUnlimitedRuns bool `json:"allow_unlimited_runs"`
 }
 
 // Workspace statuses.
@@ -109,10 +114,30 @@ type Run struct {
 	StartedAt   time.Time `json:"started_at"`
 	EndedAt     time.Time `json:"ended_at"`
 	Logs        RunLogs   `json:"logs"`
+
+	// Cwd is the working directory, relative to the workspace root (always
+	// leading-slash normalized; "/" is the workspace root). It is a working
+	// directory only: it never changes how File is resolved, which is always
+	// relative to the workspace root.
+	Cwd string `json:"cwd"`
+	// TimeoutSec is the effective wall-clock limit in seconds, or null when
+	// Unlimited is true. It lets a reader tell "no limit" (null) apart from a
+	// concrete number; an unlimited run is never recorded with a fake finite
+	// value.
+	TimeoutSec *int `json:"timeout_sec"`
+	// Unlimited is true when the run has no wall-clock limit (it runs until it
+	// exits or is stopped). It is distinct from a finite timeout.
+	Unlimited bool `json:"unlimited"`
+	// Interpreter, for a kind=file run, is the interpreter used to run File.
+	// Empty for a kind=command run or a file run performed with raw argv.
+	Interpreter string `json:"interpreter,omitempty"`
 }
 
 // SetExitCode records an exit code.
 func (r *Run) SetExitCode(code int) { r.ExitCode = &code }
+
+// SetTimeoutSec records a finite wall-clock limit.
+func (r *Run) SetTimeoutSec(sec int) { r.TimeoutSec = &sec; r.Unlimited = false }
 
 // SessionStatus is the lifecycle state of a terminal session.
 type SessionStatus string
@@ -185,6 +210,7 @@ const (
 	SessionReasonServiceShutdown    = "service_shutdown"
 	SessionReasonInterrupted        = "interrupted"
 	SessionReasonWorkspaceSuspended = "workspace_suspended"
+	SessionReasonWorkspaceStopped   = "workspace_stopped"
 	SessionReasonSandboxUnavailable = "sandbox_unavailable"
 )
 

@@ -55,6 +55,11 @@ type Request struct {
 	Env           map[string]string
 	Stdin         string
 	Timeout       time.Duration
+	// NoTimeout, when set, requests a wall-clock-unbounded run: nsjail is
+	// rendered with `time_limit: 0` (no limit) and no timeout context is
+	// layered. A run then ends only when it exits or its context is cancelled
+	// (an explicit stop). Timeout is ignored when NoTimeout is set.
+	NoTimeout bool
 
 	// Context, when non-nil, dictates cancellation of the process tree. A
 	// cancelled context is classified as a kill (e.g. explicit stop).

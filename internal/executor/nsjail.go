@@ -181,14 +181,15 @@ func (r *NsjailRunner) Run(req Request) (Result, error) {
 	}
 
 	// Base the run on the caller's context so an explicit stop cancels the
-	// process tree, then layer the wall-clock timeout on top.
+	// process tree, then layer the wall-clock timeout on top. An unbounded run
+	// (NoTimeout) layers no timeout: only an explicit stop ends it.
 	base := context.Background()
 	if req.Context != nil {
 		base = req.Context
 	}
 	ctx := base
 	var cancel context.CancelFunc
-	if req.Timeout > 0 {
+	if !req.NoTimeout && req.Timeout > 0 {
 		ctx, cancel = context.WithTimeout(base, req.Timeout)
 		defer cancel()
 	}
@@ -362,6 +363,16 @@ func (r *NsjailRunner) classify(res *Result, waitErr error, ctx context.Context,
 		// carries a fatal message in that case; a sandboxed program that simply
 		// exits 255 produces stdout/stderr but no nsjail fatal line.
 		if code == 255 && isLaunchFailure(diagnostic) {
+			// A cwd that does not exist (or is not a directory) makes nsjail's
+			// chdir fail *inside* the sandbox, which nsjail reports as a launch
+			// failure. That is a bad request path, not a broken isolation layer,
+			// so classify it as ErrInvalidCwd (422) rather than a sandbox
+			// failure (503). The distinction matters because cwd is
+			// caller-controlled: a typo must never read as "sandbox unavailable".
+			if isChdirFailure(diagnostic) {
+				res.ExitCode = 255
+				return ErrInvalidCwd
+			}
 			res.ExitCode = 255
 			return &SandboxError{Diagnostic: summarizeDiagnostic(diagnostic)}
 		}
@@ -369,6 +380,19 @@ func (r *NsjailRunner) classify(res *Result, waitErr error, ctx context.Context,
 	}
 	res.ExitCode = -1
 	return nil
+}
+
+// isChdirFailure reports whether nsjail's diagnostic indicates it failed to
+// change into the requested working directory (as opposed to a genuine sandbox
+// setup failure such as an unusable cgroup hierarchy). nsjail logs a line
+// containing "chdir" and the target path when the cwd is missing.
+func isChdirFailure(diagnostic string) bool {
+	for _, line := range strings.Split(diagnostic, "\n") {
+		if strings.Contains(line, "chdir") || strings.Contains(line, "chdir(") {
+			return true
+		}
+	}
+	return false
 }
 
 // isLaunchFailure reports whether nsjail's own log indicates it failed to set up
@@ -605,7 +629,12 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 
 	lim := req.Workspace.Limits
 	timeoutSec := int(req.Timeout.Seconds())
-	if timeoutSec <= 0 {
+	if req.NoTimeout {
+		// nsjail's `time_limit: 0` means "no limit" (verified against the
+		// installed build: a process ran past the 6 s command timeout when
+		// time_limit was 0, and was killed at 3 s when it was 3).
+		timeoutSec = 0
+	} else if timeoutSec <= 0 {
 		timeoutSec = lim.MaxWallTimeSec
 	}
 	cwd, err := sandboxCwd(req.Cwd)

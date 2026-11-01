@@ -386,6 +386,78 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     _Rationale_: "I forgot the field" and "I intend an empty file" are different requests and must
     not be indistinguishable.
 
+## v0.0.12 — native file execution, unbounded runs, workspace stop
+
+59. **A workspace `stop` stops runs *and* sessions; `suspend` stops both too.**
+    _Context_: `Service.StopWorkspace` called `StopAllRuns` only and left live
+    terminal sessions running, so "stop the workspace's operations" did not
+    actually stop the workspace. `SuspendWorkspace` already called
+    `StopWorkspaceSessions`.
+    _Decision_: `POST /workspaces/{id}/stop` stops every run **and** every live
+    session (reason `workspace_stopped`), returning `stopped_run_ids` /
+    `stopped_run_count` **and** `stopped_session_ids` / `stopped_session_count`.
+    `suspend` already stopped both (reason `workspace_suspended`). The existing
+    response fields keep working, so a client depending on them is unaffected.
+    _Rationale_: a single control that claims to stop a workspace's work must not
+    leave half of it running; surfacing both counts lets a client report exactly
+    what it stopped. Verified by the acceptance suite (`stop.*` checks) which
+    leaves zero processes of the workspace's tree.
+
+60. **Unbounded runs are opt-in twice, default deny, and recorded honestly.**
+    _Context_: the product owner wants a user's file to run until the user stops
+    it, not to a wall-clock limit; the engine capped everything at
+    `max_wall_time_sec` (default 300, hard max 3600).
+    _Decision_: a run may be requested with `no_timeout: true` — deliberately
+    **distinct** from `timeout_sec: 0` ("use the workspace default") so unlimited
+    cannot be asked for by omission. It is accepted only when **both**
+    `max_limits.allow_unlimited_runs` (server) and the workspace
+    `limits.allow_unlimited_runs` are true; otherwise `422`, with
+    `details.config` naming the refusing level. Default is **false** at both
+    levels. The run record reports `unlimited: true` and `timeout_sec: null`; it
+    is never stored with a fake finite number, so a reader can tell "no limit"
+    from "an hour". The executor renders nsjail `time_limit: 0` (verified to mean
+    "no limit") and layers no timeout context; only an explicit stop cancels it.
+    _Rationale_: an unbounded run is a real capacity risk, so it must be an
+    explicit, doubly-consented act, not a default. Two levels let an operator
+    forbid it globally while a workspace otherwise would opt in. Recording the
+    truth (null, not 3600) is what the owner asked for ("do not store a fake
+    number"). The honest risk — an unbounded run still holds a `max_runs` slot
+    and its cgroup share, so a runaway process can occupy the workspace's
+    capacity indefinitely until stopped — is stated in the docs. The kill path
+    is proven, not assumed: stopping an unbounded run leaves zero surviving
+    processes and status `killed`.
+
+61. **A named long-lived project/service is a documented non-goal for this
+    version.** _Context_: the engine has no supervisor, no restart-on-crash, no
+    autostart, and no lifecycle beyond a single run or a single session; a leaked
+    expectation of a "project that stays up" would be a gap discovered in
+    production. _Decision_: this is written down as **not implemented** in
+    [SPEC.md §2.9](SPEC.md), and this entry records where it would belong if
+    built. _Rationale_: the two candidate homes are (a) an **engine-level
+    supervisor** — a durable "service" record with a desired-state/reconcile
+    loop, restart policy and autostart-on-resume, which fits the engine because
+    only it can see process death and hold the cgroup/sandbox lease — versus (b)
+    the **frontend** restarting runs/sessions itself — which needs no engine
+    change but re-implements liveness, retry, and crash detection behind the
+    engine's back, and cannot observe a crash the engine does not report. The
+    engine-level supervisor is the more faithful place (the engine already owns
+    `RecoverRuns`/`RecoverSessions`), but it is a new subsystem with its own
+    decisions (restart backoff, crash-loop caps, desired-state storage), so it is
+    deliberately deferred. Stated honestly: **neither exists today.**
+
+62. **A run's `cwd` is validated at request time; a bad `cwd` is 422, not 503
+    (defect N-1).** _Context_: `cwd` was not carried on a bad path, so a missing
+    `cwd` reached nsjail and its `chdir` failure surfaced as `503 "sandbox
+    unavailable"`, falsely implying the isolation layer was broken.
+    _Decision_: `cwd` (both kinds) is resolved against the workspace root and
+    checked to exist and be a directory before the run is accepted; a bad `cwd`
+    is `422`. In the executor, an nsjail exit-255 diagnostic that indicates a
+    failed `chdir` is classified as `ErrInvalidCwd` (→ `422`) rather than
+    `ErrSandboxUnavailable` (→ `503`); a genuine setup failure stays `503`.
+    _Rationale_: `cwd` is caller-controlled, so a typo must read as a bad request
+    and never as a broken sandbox; the distinction is exactly the difference
+    between "fix your request" and "page an operator".
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.

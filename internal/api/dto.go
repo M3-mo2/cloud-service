@@ -24,12 +24,13 @@ type workspaceJSON struct {
 }
 
 type limitsJSON struct {
-	CPUCores       float64 `json:"cpu_cores"`
-	MemoryMB       int     `json:"memory_mb"`
-	DiskMB         int     `json:"disk_mb"`
-	MaxWallTimeSec int     `json:"max_wall_time_sec"`
-	MaxRuns        int     `json:"max_runs"`
-	AllowNet       bool    `json:"allow_net"`
+	CPUCores           float64 `json:"cpu_cores"`
+	MemoryMB           int     `json:"memory_mb"`
+	DiskMB             int     `json:"disk_mb"`
+	MaxWallTimeSec     int     `json:"max_wall_time_sec"`
+	MaxRuns            int     `json:"max_runs"`
+	AllowNet           bool    `json:"allow_net"`
+	AllowUnlimitedRuns bool    `json:"allow_unlimited_runs"`
 }
 
 func toWorkspaceJSON(w *model.Workspace) workspaceJSON {
@@ -49,12 +50,13 @@ func toWorkspaceJSON(w *model.Workspace) workspaceJSON {
 
 func toLimitsJSON(l model.Limits) limitsJSON {
 	return limitsJSON{
-		CPUCores:       l.CPUCores,
-		MemoryMB:       l.MemoryMB,
-		DiskMB:         l.DiskMB,
-		MaxWallTimeSec: l.MaxWallTimeSec,
-		MaxRuns:        l.MaxRuns,
-		AllowNet:       l.AllowNet,
+		CPUCores:           l.CPUCores,
+		MemoryMB:           l.MemoryMB,
+		DiskMB:             l.DiskMB,
+		MaxWallTimeSec:     l.MaxWallTimeSec,
+		MaxRuns:            l.MaxRuns,
+		AllowNet:           l.AllowNet,
+		AllowUnlimitedRuns: l.AllowUnlimitedRuns,
 	}
 }
 
@@ -77,12 +79,13 @@ func (r *createWorkspaceRequest) toLimits() *model.Limits {
 		return nil
 	}
 	return &model.Limits{
-		CPUCores:       r.Limits.CPUCores,
-		MemoryMB:       r.Limits.MemoryMB,
-		DiskMB:         r.Limits.DiskMB,
-		MaxWallTimeSec: r.Limits.MaxWallTimeSec,
-		MaxRuns:        r.Limits.MaxRuns,
-		AllowNet:       r.Limits.AllowNet,
+		CPUCores:           r.Limits.CPUCores,
+		MemoryMB:           r.Limits.MemoryMB,
+		DiskMB:             r.Limits.DiskMB,
+		MaxWallTimeSec:     r.Limits.MaxWallTimeSec,
+		MaxRuns:            r.Limits.MaxRuns,
+		AllowNet:           r.Limits.AllowNet,
+		AllowUnlimitedRuns: r.Limits.AllowUnlimitedRuns,
 	}
 }
 
@@ -90,12 +93,13 @@ func (r *createWorkspaceRequest) toLimits() *model.Limits {
 // pointer so an absent field and an explicit null both mean "keep the current
 // value"; only a present, non-null value is applied.
 type patchLimitsJSON struct {
-	CPUCores       *float64 `json:"cpu_cores"`
-	MemoryMB       *int     `json:"memory_mb"`
-	DiskMB         *int     `json:"disk_mb"`
-	MaxWallTimeSec *int     `json:"max_wall_time_sec"`
-	MaxRuns        *int     `json:"max_runs"`
-	AllowNet       *bool    `json:"allow_net"`
+	CPUCores           *float64 `json:"cpu_cores"`
+	MemoryMB           *int     `json:"memory_mb"`
+	DiskMB             *int     `json:"disk_mb"`
+	MaxWallTimeSec     *int     `json:"max_wall_time_sec"`
+	MaxRuns            *int     `json:"max_runs"`
+	AllowNet           *bool    `json:"allow_net"`
+	AllowUnlimitedRuns *bool    `json:"allow_unlimited_runs"`
 }
 
 // patchWorkspaceRequest is the PATCH /v1/workspaces/{id} body.
@@ -109,12 +113,13 @@ func (r *patchWorkspaceRequest) toUpdate() service.WorkspaceUpdate {
 	upd := service.WorkspaceUpdate{Name: r.Name}
 	if r.Limits != nil {
 		upd.Limits = &service.LimitUpdate{
-			CPUCores:       r.Limits.CPUCores,
-			MemoryMB:       r.Limits.MemoryMB,
-			DiskMB:         r.Limits.DiskMB,
-			MaxWallTimeSec: r.Limits.MaxWallTimeSec,
-			MaxRuns:        r.Limits.MaxRuns,
-			AllowNet:       r.Limits.AllowNet,
+			CPUCores:           r.Limits.CPUCores,
+			MemoryMB:           r.Limits.MemoryMB,
+			DiskMB:             r.Limits.DiskMB,
+			MaxWallTimeSec:     r.Limits.MaxWallTimeSec,
+			MaxRuns:            r.Limits.MaxRuns,
+			AllowNet:           r.Limits.AllowNet,
+			AllowUnlimitedRuns: r.Limits.AllowUnlimitedRuns,
 		}
 	}
 	return upd

@@ -31,6 +31,7 @@ acceptance:
 		"storage: { data_dir: \"/data\" }" \
 		"sandbox: { nsjail_path: \"/usr/local/bin/nsjail\", user: \"sandbox\", group: \"sandbox\", kill_grace_sec: 2 }" \
 		"limits: { cpu_cores: 1, memory_mb: 512, disk_mb: 1024, max_wall_time_sec: 60, max_runs: 3 }" \
+		"max_limits: { cpu_cores: 8, memory_mb: 8192, disk_mb: 51200, max_wall_time_sec: 3600, max_runs: 64, allow_net: true, allow_unlimited_runs: true }" \
 		"keys:" \
 		"  - { key: \"dev-key-please-rotate\", principal_id: \"user_dev\" }" \
 		"  - { key: \"other-key\", principal_id: \"user_other\" }" \
