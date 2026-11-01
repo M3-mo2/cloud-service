@@ -152,8 +152,9 @@ func (m *Manager) EnsureHub() error {
 		if _, err := m.createNetns(hubNetnsName); err != nil {
 			return fmt.Errorf("create hub namespace: %w", err)
 		}
-		hh := m.cfg.HubSubnet.Addr()
-		hIn := hh.Next() // .2
+		// .1 is the host end, .2 is the hub end.
+		hh := m.cfg.HubSubnet.Addr().Next() // .1
+		hIn := hh.Next()                    // .2
 		// Host end of the link.
 		if err := m.sys.run("ip", "link", "add", hubHostIface, "type", "veth", "peer", "name", hubIface); err != nil {
 			return fmt.Errorf("create hub link: %w", err)
@@ -244,7 +245,16 @@ func (m *Manager) buildWorkspaceLink(alloc *Allocation) error {
 		}
 	}
 	hubSide := ifaceNamePrefix + shortID(alloc.WorkspaceID)
-	if err := m.sys.run("ip", "link", "add", hubSide, "type", "veth", "peer", "name", guestIface); err != nil {
+	// Defensive cleanup of any stale link from a prior hard death (the hub
+	// namespace may still hold a half-built interface).
+	_ = m.inNetns(hubNetnsName, "ip", "link", "del", hubSide)
+	// The peer must not be created with the name "eth0" in the HOST namespace:
+	// that name is already taken by the host's own uplink, so `ip link add ...
+	// peer name eth0` fails with "File exists". Create the peer under a unique
+	// temporary name and rename it to eth0 *inside* the workspace namespace,
+	// where "eth0" is free.
+	peerSide := "sbxwp" + shortID(alloc.WorkspaceID)
+	if err := m.sys.run("ip", "link", "add", hubSide, "type", "veth", "peer", "name", peerSide); err != nil {
 		return fmt.Errorf("create workspace veth: %w", err)
 	}
 	// Hub end.
@@ -252,8 +262,14 @@ func (m *Manager) buildWorkspaceLink(alloc *Allocation) error {
 		return fmt.Errorf("move hub veth end: %w", err)
 	}
 	// Workspace end.
-	if err := m.sys.run("ip", "link", "set", guestIface, "netns", m.netnsPath(name)); err != nil {
+	if err := m.sys.run("ip", "link", "set", peerSide, "netns", m.netnsPath(name)); err != nil {
 		return fmt.Errorf("move workspace veth end: %w", err)
+	}
+	// A stale eth0 in the namespace (from a prior half-built link) would make
+	// the rename fail; remove it first, then rename the fresh peer to eth0.
+	_ = m.inNetns(name, "ip", "link", "del", guestIface)
+	if err := m.inNetns(name, "ip", "link", "set", peerSide, "name", guestIface); err != nil {
+		return fmt.Errorf("rename workspace interface: %w", err)
 	}
 	// Address and bring up the hub end.
 	if err := m.inNetns(hubNetnsName, "ip", "addr", "add", alloc.HubAddr.String()+"/30", "dev", hubSide); err != nil {

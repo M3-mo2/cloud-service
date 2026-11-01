@@ -26,7 +26,7 @@ func newAllocator(base netip.Addr, max uint32) *allocator {
 		byAddr: map[netip.Addr]*Allocation{},
 		base:   addrToUint32(base),
 		max:    max,
-		next:   1,
+		next:   0,
 	}
 }
 
@@ -41,10 +41,10 @@ func (a *allocator) reserve(wsID string) (*Allocation, error) {
 	for tries := uint32(0); tries < a.max; tries++ {
 		idx := a.next
 		a.next++
-		if a.next > a.max {
-			a.next = 1
+		if a.next >= a.max {
+			a.next = 0
 		}
-		if idx == 0 || idx > a.max {
+		if idx >= a.max {
 			continue
 		}
 		addr := a.addrFor(idx)
@@ -54,7 +54,7 @@ func (a *allocator) reserve(wsID string) (*Allocation, error) {
 		// The workspace address is the .2 of the /30.
 		alloc := &Allocation{
 			WorkspaceID: wsID,
-			Index:       idx,
+			Index:       idx + 1,
 			HubAddr:     addr,
 			GuestAddr:   addr.Next(),
 		}
@@ -66,9 +66,10 @@ func (a *allocator) reserve(wsID string) (*Allocation, error) {
 	return nil, fmt.Errorf("workspace network pool exhausted (%d subnets)", a.max)
 }
 
-// addrFor returns the .1 (hub) address of the idx-th /30 block.
+// addrFor returns the .1 (hub) address of the idx-th /30 block. The block's
+// network address is base + idx*4; the hub takes .1 and the workspace .2.
 func (a *allocator) addrFor(idx uint32) netip.Addr {
-	return uint32ToAddr(a.base + (idx << 2))
+	return uint32ToAddr(a.base + (idx << 2) + 1)
 }
 
 // release frees the subnet held by wsID, if any.
@@ -98,7 +99,7 @@ func (a *allocator) reset() {
 	defer a.mu.Unlock()
 	a.byWS = map[string]*Allocation{}
 	a.byAddr = map[netip.Addr]*Allocation{}
-	a.next = 1
+	a.next = 0
 }
 
 func addrToUint32(a netip.Addr) uint32 {
