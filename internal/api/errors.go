@@ -81,6 +81,15 @@ func mapError(err error) *model.Error {
 	if workspace.IsUnsafe(err) {
 		return model.New(422, model.CodeUnprocessable, "unsafe path: escapes workspace root")
 	}
+	if workspace.IsIsDirectory(err) {
+		return model.New(422, model.CodeNotDirectory, "path is a directory")
+	}
+	if workspace.IsNotDirectory(err) {
+		return model.New(422, model.CodeNotDirectory, "path is not a directory")
+	}
+	if workspace.IsRangeError(err) {
+		return model.New(422, model.CodeUnprocessable, "invalid line range")
+	}
 	if workspace.IsTooLarge(err) {
 		return model.New(413, model.CodePayloadTooLarge, "file exceeds maximum allowed size")
 	}

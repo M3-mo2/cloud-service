@@ -94,6 +94,88 @@ rm -f "$UP"
 echo "### 7. read /main.py (meta)"
 check "read.main.py" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/content?path=/main.py&meta=true" | jsonfield "['sha256']")" "$(printf 'print("hi")\n' | sha256sum | cut -d' ' -f1)"
 
+echo "### 7b. first-class file browsing and viewing"
+# A listing path that is a file must fail loudly, never silently empty.
+check "list.file_422" "$(httpcode -H "$K" "$B/v1/workspaces/$WS/files?path=/main.py")" "422"
+
+# A browse fixture: one dir and two files with a known sorted order.
+curl -s -o /dev/null -H "$K" -H "$JSON" -d '{"path":"/browse/zdir"}' "$B/v1/workspaces/$WS/files/mkdir"
+curl -s -o /dev/null -X PUT -H "$K" -H "$JSON" -d '{"content":"bbb"}' "$B/v1/workspaces/$WS/files/content?path=/browse/b.txt"
+curl -s -o /dev/null -X PUT -H "$K" -H "$JSON" -d '{"content":"a"}' "$B/v1/workspaces/$WS/files/content?path=/browse/a.txt"
+BLIST=$(curl -s -H "$K" "$B/v1/workspaces/$WS/files?path=/browse")
+# Directories first, then files, each byte-wise by name.
+check "list.order" "$(printf '%s' "$BLIST" | python3 -c 'import json,sys;print(",".join(x["name"] for x in json.load(sys.stdin)["entries"]))')" "zdir,a.txt,b.txt"
+check "list.first_type" "$(printf '%s' "$BLIST" | jsonfield "['entries'][0]['type']")" "dir"
+check "list.total" "$(printf '%s' "$BLIST" | jsonfield "['total']")" "3"
+check "list.count_eq_total" "$(printf '%s' "$BLIST" | jsonfield "['count']")" "3"
+check "list.not_truncated" "$(printf '%s' "$BLIST" | jsonfield "['truncated']")" "False"
+check "list.metadata" "$(printf '%s' "$BLIST" | python3 -c 'import json,sys;e=json.load(sys.stdin)["entries"];print(all(x["mode"] and x["mod_time"] and x["path"].startswith("/") for x in e))')" "True"
+# Bounded paging signals the truncation and the full total.
+check "list.page_count" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files?path=/browse&limit=1&offset=0" | jsonfield "['count']")" "1"
+check "list.page_truncated" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files?path=/browse&limit=1&offset=0" | jsonfield "['truncated']")" "True"
+
+# stat: metadata for one path, 404 when missing.
+check "stat.file_type" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/stat?path=/main.py" | jsonfield "['type']")" "file"
+check "stat.file_sha" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/stat?path=/main.py" | jsonfield "['sha256']")" "$(printf 'print("hi")\n' | sha256sum | cut -d' ' -f1)"
+check "stat.file_size" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/stat?path=/main.py" | jsonfield "['size']")" "12"
+check "stat.missing_404" "$(httpcode -H "$K" "$B/v1/workspaces/$WS/files/stat?path=/missing")" "404"
+
+# PUT over a directory is 422, not 500.
+check "put.over_dir_422" "$(httpcode -X PUT -H "$K" -H "$JSON" -d '{"content":"x"}' "$B/v1/workspaces/$WS/files/content?path=/browse/zdir")" "422"
+# A body without content is a 4xx and writes nothing.
+check "put.no_content_4xx" "$(httpcode -X PUT -H "$K" -H "$JSON" -d '{}' "$B/v1/workspaces/$WS/files/content?path=/nope.txt")" "400"
+check "put.no_content_no_file" "$(httpcode -H "$K" "$B/v1/workspaces/$WS/files/stat?path=/nope.txt")" "404"
+# Reading a directory as a file is 422, not 404/500.
+check "read.dir_422" "$(httpcode -H "$K" "$B/v1/workspaces/$WS/files/content?path=/browse/zdir")" "422"
+
+# Range read: exactly the requested slice with honest range/total_size.
+RANGE=$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/content?path=/main.py&offset=0&limit=5&meta=true")
+check "range.content" "$(printf '%s' "$RANGE" | jsonfield "['content']")" 'print'
+check "range.length" "$(printf '%s' "$RANGE" | jsonfield "['range']['length']")" "5"
+check "range.offset" "$(printf '%s' "$RANGE" | jsonfield "['range']['offset']")" "0"
+check "range.total_size" "$(printf '%s' "$RANGE" | jsonfield "['total_size']")" "12"
+check "range.whole_file" "$(printf '%s' "$RANGE" | jsonfield "['whole_file']")" "False"
+check "range.truncated" "$(printf '%s' "$RANGE" | jsonfield "['truncated']")" "True"
+# The partial hash is the hash of the returned slice, and differs from the full hash.
+FULLHASH=$(printf 'print("hi")\n' | sha256sum | cut -d' ' -f1)
+PARTIALHASH=$(printf '%s' "$RANGE" | jsonfield "['sha256']")
+check "range.partial_hash" "$PARTIALHASH" "$(printf 'print' | sha256sum | cut -d' ' -f1)"
+check "range.partial_ne_full" "$([ "$PARTIALHASH" = "$FULLHASH" ] && echo SAME || echo DIFF)" "DIFF"
+# The negative case above is the point: a full read still equals the file hash.
+check "range.full_eq_file" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/content?path=/main.py&meta=true" | jsonfield "['sha256']")" "$FULLHASH"
+check "range.full_whole_file" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/content?path=/main.py&meta=true" | jsonfield "['whole_file']")" "True"
+
+# Binary detection on a file with NUL bytes (base64 of 00 01 02).
+curl -s -o /dev/null -X PUT -H "$K" -H "$JSON" -d '{"content":"AAEC","encoding":"base64"}' "$B/v1/workspaces/$WS/files/content?path=/bin.dat"
+check "binary.flag" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/content?path=/bin.dat&meta=true" | jsonfield "['binary']")" "True"
+check "binary.encoding" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/content?path=/bin.dat&meta=true" | jsonfield "['encoding']")" "base64"
+
+# Line-range read on a multi-line file.
+curl -s -o /dev/null -X PUT -H "$K" -H "$JSON" \
+  -d '{"content":"one\ntwo\nthree\nfour\n"}' \
+  "$B/v1/workspaces/$WS/files/content?path=/lines.txt"
+LINES=$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/content?path=/lines.txt&start_line=2&end_line=3")
+check "lines.content" "$(printf '%s' "$LINES" | jsonfield "['content']" | tr -d '\n')" "twothree"
+check "lines.start_line" "$(printf '%s' "$LINES" | jsonfield "['start_line']")" "2"
+check "lines.end_line" "$(printf '%s' "$LINES" | jsonfield "['end_line']")" "3"
+check "lines.line_count" "$(printf '%s' "$LINES" | jsonfield "['line_count']")" "2"
+check "lines.total_lines" "$(printf '%s' "$LINES" | jsonfield "['total_lines']")" "4"
+
+# Download a file larger than caps.file_read_mb (default 5 MiB), complete.
+# Upload it (the multipart cap is larger) rather than writing it through exec,
+# which runs as the unprivileged sandbox user and may not own the workspace root.
+BIGUP=$(mktemp)
+python3 -c "open('$BIGUP','wb').write(b'X'*6291456)"
+check "download.big_upload" "$(httpcode -H "$K" -F path=/big.bin -F file=@"$BIGUP" "$B/v1/workspaces/$WS/files/upload")" "201"
+rm -f "$BIGUP"
+check "download.big_code" "$(httpcode -H "$K" "$B/v1/workspaces/$WS/files/download?path=/big.bin")" "200"
+check "download.big_len" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/download?path=/big.bin" | wc -c | tr -d ' ')" "6291456"
+check "download.content_length" "$(curl -s -D - -o /dev/null -H "$K" "$B/v1/workspaces/$WS/files/download?path=/big.bin" | tr -d '\r' | awk 'tolower($1)=="content-length:"{print $2}')" "6291456"
+check "download.dir_422" "$(httpcode -H "$K" "$B/v1/workspaces/$WS/files/download?path=/browse/zdir")" "422"
+
+# The stat path reports the same size as the download.
+check "download.stat_size" "$(curl -s -H "$K" "$B/v1/workspaces/$WS/files/stat?path=/big.bin" | jsonfield "['size']")" "6291456"
+
 echo "### 8. exec (sync) -- a successful execution"
 EXEC=$(curl -s -H "$K" -H "$JSON" -d '{"cmd":["python3","main.py"]}' "$B/v1/workspaces/$WS/exec")
 check "exec.exit_code" "$(printf '%s' "$EXEC" | jsonfield "['exit_code']")" "0"

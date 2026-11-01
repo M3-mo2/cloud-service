@@ -71,7 +71,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **225** (222 unit + 3 `integration`-tagged), including regression
+Test functions: **253** (250 unit + 3 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -81,17 +81,24 @@ tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestListRunsFilterAndPage`, `TestPurgeRun*`, `TestUsageReportsDiskAndCounters`,
 `TestNewEndpointsEnforceOwnership`), for the two-tier packages
 (`TestInstallPackages*`, `TestListPrivatePackages`, `TestRemovePackage*`,
-`TestPrivateTierIsolatedBetweenWorkspaces`, `TestPackagesCrossOwnerForbidden`)
-and for terminal sessions (`TestPTYHelper*`, `TestSession*`,
+`TestPrivateTierIsolatedBetweenWorkspaces`, `TestPackagesCrossOwnerForbidden`),
+for terminal sessions (`TestPTYHelper*`, `TestSession*`,
 `TestRenderSessionConfigMountsHostDevpts`, `TestRenderConfigOmitsDevptsForOneShotExec`,
-`TestPTYFailureDetectedFromHelperStderr`; see §9b).
+`TestPTYFailureDetectedFromHelperStderr`; see §9b) and for first-class file
+browsing/viewing (`TestListFileNotDirectory`, `TestPutOverDirectoryRejected`,
+`TestPutRequiresContent`, `TestReadDirectoryRejected`,
+`TestListSortedWithMetadataAndPaging`, `TestStatEndpoint`,
+`TestRangeReadHonestHash`, `TestRangeReadBadParams`,
+`TestRangeReadLimitAboveCapRejected`, `TestLineRangeRead`,
+`TestBinaryDetectionAndEncoding`, `TestDownloadFileExemptFromReadCap`,
+`TestStatSymlink`, `TestReadRangeHonestHash`, `TestReadLines`; see §9c).
 
 The count is the number of `^func Test` declarations across every `*_test.go`
 file (the same measure `scripts/docs-consistency.sh` asserts against):
 
 ```
 $ find . -name '*_test.go' -exec grep -hE '^func Test' {} + | wc -l
-219
+253
 ```
 
 ## 2. Probes
@@ -688,11 +695,55 @@ feature once shipped with every unit test passing while sessions returned
 nsjail can observe that the sandbox's `/dev` lacks a working devpts; the stub
 runner and the rendered-config assertions cannot.
 
+## 9c. First-class file browsing and viewing (acceptance)
+
+The file API was made complete and honest for a file browser/viewer client.
+The measured defects before the change (live server, real nsjail):
+
+- `GET /files?path=/f.py` (a **file**) returned `200 {"entries":[]}` — silently
+  empty, no error.
+- `GET /files/content?path=/f.py/x` (a directory as a file) returned
+  `404 file not found`.
+- `PUT /files/content?path=<dir>` (**writing over a directory**) returned
+  `500 internal` (the internal `errNotDirectory` was never translated).
+- `PUT /files/content` with body `{}` returned `204` and wrote a **0-byte** file.
+- A file larger than `caps.file_read_mb` returned a **silent truncated prefix**
+  with `truncated:true`; **413 was never returned** on the read path, and
+  **`sha256` was computed over the returned prefix**, not the file.
+- `Service.StatFile` existed but had **no HTTP route**.
+- No range/offset/limit support, no binary detection, and no way to obtain a
+  file larger than `file_read_mb` at all.
+
+The change resolves `docs/API.md` "Known discrepancies" items **6, 7, 8 and 9**:
+a request `limit` above `file_read_mb` is `413`; `sha256` is over exactly the
+returned bytes with `range`/`total_size`/`whole_file` exposing partial delivery;
+`PUT /files/content` requires `content`; and wrong-node-type operations return
+`422 not_directory` (a new code), never `500` and never `404` when the path
+exists. It also adds `GET .../files/stat`, byte and line range reads, bounded
+paged listings with metadata (`mode`, symlink `target`/`target_inside`,
+deterministic directories-first ordering, `count`/`total`/`truncated`), explicit
+binary detection (NUL / invalid UTF-8 in a bounded 8192-byte sample), and a
+streaming `GET .../files/download` that is exempt from `file_read_mb`.
+
+The asserting acceptance additions live in `scripts/acceptance.sh` §7b:
+`list.file_422`, the sorted `list.order`/`list.first_type`/`list.total` plus
+metadata presence, `list.page_count`/`list.page_truncated`,
+`stat.file_type`/`stat.file_sha`/`stat.file_size`/`stat.missing_404`,
+`put.over_dir_422`, `put.no_content_4xx`/`put.no_content_no_file`,
+`read.dir_422`, the range checks (`range.content`, `range.length`,
+`range.offset`, `range.total_size`, `range.whole_file`, `range.truncated`), the
+integrity pair `range.partial_hash` and **`range.partial_ne_full`** (a partial
+read's hash ≠ the full file's `sha256sum`) plus **`range.full_eq_file`** (a full
+read's hash = the file's `sha256sum`), `binary.flag`/`binary.encoding`,
+`lines.content`/`lines.start_line`/`lines.end_line`/`lines.line_count`/`lines.total_lines`,
+and `download.big_code`/`download.big_len`/`download.content_length`
+(6 MiB, larger than the 5 MiB read cap) plus `download.dir_422`.
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **54** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **58** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
-frontend product boundary).
+frontend product boundary, and #55–58, the file browsing/viewing contract).
 
 ## 11. OpenAPI
 

@@ -160,6 +160,10 @@ type CapsConfig struct {
 	UploadMB     int `koanf:"upload_mb"`
 	FileReadMB   int `koanf:"file_read_mb"`
 	FileWriteMB  int `koanf:"file_write_mb"`
+	// FileListMax bounds the number of entries a single directory listing
+	// returns. It is a browse-time page size, not a read cap: a directory with
+	// more children reports truncated=true and total so a client can page.
+	FileListMax int `koanf:"file_list_max"`
 }
 
 // KeyConfig maps a static bearer key to a principal.
@@ -190,6 +194,9 @@ func (c CapsConfig) FileReadBytes() int64 { return int64(c.FileReadMB) * 1024 * 
 
 // FileWriteBytes returns the file write cap in bytes.
 func (c CapsConfig) FileWriteBytes() int64 { return int64(c.FileWriteMB) * 1024 * 1024 }
+
+// FileListMaxEntries returns the directory-listing page size.
+func (c CapsConfig) FileListMaxEntries() int { return c.FileListMax }
 
 // KillGrace returns the SIGTERM->SIGKILL grace period.
 func (s SandboxConfig) KillGrace() time.Duration {
@@ -231,6 +238,7 @@ func Default() Config {
 			UploadMB:     50,
 			FileReadMB:   5,
 			FileWriteMB:  10,
+			FileListMax:  1000,
 		},
 		Packages: PackagesConfig{
 			SharedDir:         "",
@@ -349,6 +357,9 @@ func (c *Config) applyDefaults() {
 	if caps.FileWriteMB <= 0 {
 		caps.FileWriteMB = d.Caps.FileWriteMB
 	}
+	if caps.FileListMax <= 0 {
+		caps.FileListMax = d.Caps.FileListMax
+	}
 	pkgs := &c.Packages
 	if pkgs.InstallTimeoutSec <= 0 {
 		pkgs.InstallTimeoutSec = d.Packages.InstallTimeoutSec
@@ -416,6 +427,7 @@ caps:
   upload_mb: 50
   file_read_mb: 5
   file_write_mb: 10
+  file_list_max: 1000
 packages:
   shared_dir: ""
   shared_enabled: true

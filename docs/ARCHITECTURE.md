@@ -669,8 +669,12 @@ flowchart TD
     INROOT -->|no| ESC["errSymlinkEsc → 422"]
     INROOT -->|yes| OK["absolute path inside root"]
     SYM -->|no| OK
-    OK --> OP["fs.List / Read / Write / Mkdir / Rename / Remove"]
+    OK --> OP["fs.List / ListPage / Stat / ReadRange / ReadLines / Open / Write / Mkdir / Rename / Remove"]
 ```
+
+`Stat` uses `resolveFinal`, a variant that does not follow a symlink in the
+final component so the link itself (type, target) can be reported, while still
+rejecting a link whose target escapes the root.
 
 Disk quota: `Fs` tracks bytes and `reserve(delta)` rejects writes, uploads, and
 renames that would exceed `disk_mb` with `507 insufficient_storage`. On every
@@ -768,7 +772,7 @@ flowchart LR
         LIFECYCLE["POST .../{suspend,resume,stop}"]
         USAGE["GET /workspaces/{id}/usage"]
         PKG["GET/DELETE /workspaces/{id}/packages\nPOST .../packages/install"]
-        F["GET/DELETE /files · /files/content\nPOST /files/{mkdir,rename,upload}"]
+        F["GET/DELETE /files · /files/stat\nGET/PUT /files/content · /files/download\nPOST /files/{mkdir,rename,upload}"]
         EX["POST /exec (sync, ≤60s)"]
         RN["POST/GET/DELETE /runs · /runs/{id}\nPOST /runs/{id}/stop\nDELETE /runs/{id}\nGET /runs/{id}/logs"]
         SS["POST/GET /sessions · /sessions/{id}\nPOST .../input|signal|resize\nGET .../output\nDELETE /sessions/{id}"]
@@ -793,9 +797,11 @@ flowchart LR
 | `GET .../{id}/packages` | private-tier packages + shared status | 200 | 403, 404 |
 | `POST .../{id}/packages/install` | pip install into private tier | 200 | 422 bad req, 409 suspended, 503 |
 | `DELETE .../{id}/packages` | remove one (`?name=`) / all (`?all=true`) | 204 / 200 | 400, 404 |
-| `GET .../files?path=` | list dir | 200 | 422 unsafe |
-| `GET .../files/content?path=` | read (raw / `?meta=true`) | 200 | 404, 422, 413 |
-| `PUT .../files/content?path=` | write text/base64 | 204 | 507 quota |
+| `GET .../files?path=` | list dir (bounded page, metadata) | 200 | 422 unsafe, 422 `not_directory` (a file) |
+| `GET .../files/stat?path=` | metadata for one path | 200 | 404, 422 |
+| `GET .../files/content?path=` | read whole / byte range / line range (raw or `?meta=true`) | 200 | 404, 413, 422, 422 `not_directory` |
+| `GET .../files/download?path=` | stream the entire file (exempt from `file_read_mb`) | 200 | 404, 422, 422 `not_directory` |
+| `PUT .../files/content?path=` | write text/base64 (`content` required) | 204 | 400, 507 quota, 422 `not_directory` |
 | `DELETE .../files?path=` | delete | 204 | 404, 422 |
 | `POST .../files/mkdir` | mkdir -p | 201 | 400, 422 |
 | `POST .../files/rename` | rename | 204 | 404, 422 |
@@ -854,6 +860,7 @@ caps:                        # hard ceilings, never overridable per request
   upload_mb: 50
   file_read_mb: 5
   file_write_mb: 10
+  file_list_max: 1000
 packages:                    # two-tier Python packages
   shared_dir: "/opt/sandboxd/packages"       # RO bind; empty disables
   shared_enabled: true
@@ -981,7 +988,7 @@ Deferred to v0.1 (documented, not bugs):
 
 ## 13. Decision index
 
-The 54 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
+The 58 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
 including the isolation model, network default-off, retention (100 runs),
 exec-vs-runs split, disk-quota strategy, caps, path safety, process kill, error
 envelope, ULID IDs, health-probe semantics, the cgroup/rlimit/env/lifecycle
@@ -989,8 +996,8 @@ corrections, run recovery, the workspace control plane (runtime-mutable limits,
 suspend vs stop, run filter/purge, usage accounting), the two-tier package model,
 the conditional resolver mounts, terminal sessions (the PTY helper vs its
 alternatives, stdin-pipe vs `--pass_fd`, signal-vs-stop, idle/lifetime values,
-restart/cleanup, output reuse and injection-proofing), and the engine/frontend
-product boundary (#54).
+restart/cleanup, output reuse and injection-proofing), the engine/frontend
+product boundary (#54), and first-class file browsing/viewing (#55–58).
 
 ---
 

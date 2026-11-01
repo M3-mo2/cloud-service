@@ -107,17 +107,21 @@ recent run/mutation (run start/stop, purge, PATCH, suspend/resume/stop).
 ### 2.3 Files (per workspace)
 
 All paths relative to workspace root; leading `/` allowed and normalized. All
-endpoints enforce path safety.
+endpoints enforce path safety. Browsing and viewing are first-class:
 
-- `GET /v1/workspaces/{id}/files?path=/` → `{"entries":[{"name","path","type":"file|dir","size","mod_time"}]}`
-- `GET /v1/workspaces/{id}/files/content?path=/main.py[&encoding=base64]` → file bytes (`Content-Type` detected, `Content-Disposition: attachment; filename=...`); JSON wrapper if `?meta=true`
-- `PUT /v1/workspaces/{id}/files/content?path=/main.py` body `{"content":"...","encoding?":"text|base64"}` → 204
+- `GET /v1/workspaces/{id}/files?path=/?limit=&offset=` → `{"path","entries":[{"name","path","type":"file|dir|symlink","size","mode","mod_time","target?","target_inside?"}],"count","total","truncated"}`. Directories first, then files, each byte-wise by name; a bounded page (`caps.file_list_max`, default 1000) with `count`/`total`/`truncated`. Listing a file is `422 not_directory`, never an empty `200`.
+- `GET /v1/workspaces/{id}/files/stat?path=/main.py` → one entry's metadata (`type`, `size`, `mode`, `mod_time`, and for a file `content_type`/`sha256`/`binary`); `404` when missing.
+- `GET /v1/workspaces/{id}/files/content?path=/main.py[&encoding=base64][&meta=true][&offset=&limit=][&start_line=&end_line=]` → file bytes (`Content-Type` detected, `Content-Disposition: attachment; filename=...`); JSON wrapper if `?meta=true`. Byte range (`offset`/`limit`, `limit` ≤ `file_read_mb`) and line range (`start_line`/`end_line`, 1-based inclusive) are mutually exclusive. `sha256` hashes exactly the returned bytes; `range`/`total_size`/`whole_file` make partial delivery explicit; binary content is detected (NUL/invalid UTF-8 in a bounded sample) and reported.
+- `GET /v1/workspaces/{id}/files/download?path=/big.bin` → streams the entire file (constant memory), exempt from `file_read_mb`, with `Content-Type`/`Content-Length`/`Content-Disposition`; a directory is `422`.
+- `PUT /v1/workspaces/{id}/files/content?path=/main.py` body `{"content":"...","encoding?":"text|base64"}` → 204 (missing `content` → 400; writing over a directory → 422 `not_directory`)
 - `DELETE /v1/workspaces/{id}/files?path=/main.py` → 204
 - `POST /v1/workspaces/{id}/files/mkdir` body `{"path":"/src"}` → 201
 - `POST /v1/workspaces/{id}/files/rename` body `{"from":"/a","to":"/b"}` → 204
 - `POST /v1/workspaces/{id}/files/upload` multipart `file` + `path` → 201
 
-Enforce output/body caps (§1.8) and disk quota (§1.5).
+Enforce output/body caps (§1.8) and disk quota (§1.5). Operating on the wrong
+node type (a file where a directory is required, or vice versa) is a `422`
+`not_directory`; it is never `404` when the path exists and never `500`.
 
 ### 2.4 Exec (sync)
 
@@ -320,12 +324,13 @@ the table) is:
 | `too_many_sessions` | 409 | Concurrent terminal sessions exceed `sessions.max_per_workspace`. |
 | `session_ended` | 409 | Operation on a terminal session (input/signal/resize, or output after DELETE). |
 | `validation` | 400 | Bad JSON, unknown field, failed `validate` tag, bad filter/query. Also carries **405** for method-not-allowed. |
-| `unprocessable` | 422 | Unsafe path/symlink escape, `cwd` escape, command not found, a limit `<= 0` or above the server maximum, invalid package requirement. |
-| `payload_too_large` | 413 | Body/file over a hard cap. |
+| `unprocessable` | 422 | Unsafe path/symlink escape, `cwd` escape, command not found, a limit `<= 0` or above the server maximum, invalid package requirement, conflicting byte/line range params, a `limit` above `file_read_mb`. |
+| `not_directory` | 422 | Wrong node type: listing a file, reading/downloading a directory as a file, writing over a directory. The path exists, so never `404`. |
+| `payload_too_large` | 413 | Body/file over a hard cap (including a `GET .../files/content` `limit` above `file_read_mb`). |
 | `insufficient_storage` | 507 | Workspace disk quota exceeded. **Emitted as a string literal in `internal/api/errors.go`; not defined as a constant in `internal/model/errors.go`.** |
 | `timeout` | 504 | **Defined but never emitted** by any handler (retained in the vocabulary and the OpenAPI enum). |
 | `unavailable` | 503 | nsjail missing, or nsjail could not set up/launch the sandbox. |
-| `internal` | 500 | Unexpected server error; unmapped filesystem conditions (e.g. listing a path that is a file). |
+| `internal` | 500 | Unexpected server error. |
 
 The code is not always a 1:1 mirror of the status: a **405 method not allowed**
 carries `code:"validation"`.

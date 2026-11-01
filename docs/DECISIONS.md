@@ -336,12 +336,62 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     rather than a surprise. The alternative — implying each end user holds a key — would misstate
     the trust model and invite exposing the engine directly.
 
+## v0.0.11 — first-class file browsing and viewing
+
+55. **Wrong-node-type file operations are `422 not_directory`, never `404` or `500`.**
+    _Context_: listing a path that is a file returned `200 {"entries":[]}`; reading a directory
+    as a file returned `404`; writing over a directory returned `500`. The internal
+    `errNotDirectory` was never translated by `mapError`.
+    _Decision_: a new error code `not_directory` (HTTP 422) is emitted whenever the path exists
+    but is the wrong kind of node — listing a file, reading/downloading a directory as a file, or
+    writing over a directory. Sealed variants `errNotDirectory` / `errIsDirectory` are translated
+    in `internal/api/errors.go`. A missing path stays `404`.
+    _Rationale_: the path exists, so `404` ("not found") is a lie and `500` blames the server for
+    a client mistake; `422` names the real cause. A dedicated code lets a file-browser client
+    distinguish "no such path" from "you asked a file to behave like a directory".
+
+56. **A directory listing is a bounded, metadata-rich, deterministically ordered page.**
+    _Context_: a viewer needs name/type/size/mode/mtime per row without a second call, and a
+    directory can hold very many entries.
+    _Decision_: `GET /files` returns `{path, entries, count, total, truncated}` where each entry
+    carries `name`, `path`, `type` (`file`/`dir`/`symlink`), `size` (0 for a directory), `mode`
+    (octal), `mod_time` (RFC3339) and, for a symlink, `target` plus `target_inside`. Ordering is
+    directories first, then files, each byte-wise by name. The page is bounded by
+    `caps.file_list_max` (default 1000) with `count`/`total`/`truncated` and `limit`/`offset`
+    paging.
+    _Rationale_: one call renders a browser row set; a documented total and a stable order make
+    paging reliable; a bounded page keeps a pathological directory from forcing an unbounded
+    response.
+
+57. **`sha256` hashes exactly the returned bytes; partial delivery is explicit.**
+    _Context_: the read path hashed the truncated prefix, so the checksum verified a file the
+    client never received, and a client could not tell a whole-file hash from a partial one.
+    _Decision_: the read response reports `sha256` over exactly the bytes in the response, plus
+    `range {offset, length}`, `total_size`, and `whole_file` (true only when the response is the
+    entire file). `offset`/`limit` select a byte range; `start_line`/`end_line` select a line
+    range; the two are mutually exclusive (`422` otherwise); a `limit` above `file_read_mb` is
+    `413`. A separate `GET /files/download` streams the entire file (constant memory, exempt from
+    `file_read_mb`, still bounded by `disk_mb`). Binary content is detected from a bounded
+    8192-byte sample (NUL or invalid UTF-8) and reported as `binary`, forced to base64 so it is
+    never mangled into invalid JSON.
+    _Rationale_: an integrity field that cannot be trusted to describe the payload is worse than
+    none; making the range and the whole-file flag explicit lets a client verify what it got and
+    resume paging. The bounded sample keeps detection cheap, and its limit is documented.
+
+58. **`PUT /files/content` requires `content`; an explicit empty string writes a 0-byte file.**
+    _Context_: a body without `content` wrote a 0-byte file with `204`, so a client bug silently
+    destroyed a file.
+    _Decision_: `putFileRequest.Content` is a `*string`; absent → `400 validation`, explicit `""`
+    → a valid 0-byte write.
+    _Rationale_: "I forgot the field" and "I intend an empty file" are different requests and must
+    not be indistinguishable.
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.
 - **Error codes**: `unauthorized`, `forbidden`, `not_found`, `conflict`, `workspace_suspended`,
-  `validation`, `unprocessable`, `payload_too_large`, `timeout`, `unavailable`, `internal`.
-  _Rationale_: fixed vocabulary mapped 1:1 from HTTP status.
+  `validation`, `unprocessable`, `not_directory`, `payload_too_large`, `timeout`, `unavailable`,
+  `internal`. _Rationale_: fixed vocabulary mapped 1:1 from HTTP status.
 - **CWD default**: `/` normalizes to the workspace root `/workspace` inside the sandbox.
   _Rationale_: the workspace is the only mounted path users should see.
 - **Log offset semantics**: byte offsets into the log file; `next` is the offset to pass on the

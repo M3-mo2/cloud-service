@@ -20,7 +20,16 @@ var (
 	errTraversal    = &unsafeError{"path escapes workspace root"}
 	errSymlinkEsc   = &unsafeError{"symlink points outside workspace root"}
 	errNotDirectory = &plainError{"path is not a directory"}
+	errIsDirectory  = &plainError{"path is a directory"}
 )
+
+// IsNotDirectory reports whether err indicates that an operation requiring a
+// directory was given a non-directory path. The API maps it to 422.
+func IsNotDirectory(err error) bool { return err == errNotDirectory }
+
+// IsIsDirectory reports whether err indicates that a file write targeted an
+// existing directory. The API maps it to 422.
+func IsIsDirectory(err error) bool { return err == errIsDirectory }
 
 // IsUnsafe reports whether err indicates a path traversal / symlink escape.
 func IsUnsafe(err error) bool {
@@ -110,6 +119,64 @@ func secureJoin(root, cleanRel string) (string, error) {
 	}
 	if !within(root, cur) {
 		return "", errTraversal
+	}
+	return cur, nil
+}
+
+// resolveFinal is like secureJoin but does not follow a symlink in the final
+// component, so callers can report the link itself (type, target) while still
+// rejecting a link whose target escapes root. Parent symlinks are followed, as
+// in secureJoin.
+func resolveFinal(root, cleanRel string) (string, error) {
+	if cleanRel == "." {
+		return root, nil
+	}
+	parts := strings.Split(cleanRel, "/")
+	last := len(parts) - 1
+	cur := root
+	for i, part := range parts {
+		cur = filepath.Join(cur, part)
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return cur, nil
+			}
+			return "", err
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		if i == last {
+			// Validate the link's target stays inside the workspace, but keep
+			// the link path itself.
+			resolved, err := filepath.EvalSymlinks(cur)
+			if err != nil {
+				// Dangling link: a lexical check of the raw target.
+				target, rerr := os.Readlink(cur)
+				if rerr != nil {
+					return "", rerr
+				}
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(filepath.Dir(cur), target)
+				}
+				if !within(root, filepath.Clean(target)) {
+					return "", errSymlinkEsc
+				}
+				return cur, nil
+			}
+			if !within(root, resolved) {
+				return "", errSymlinkEsc
+			}
+			return cur, nil
+		}
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err != nil {
+			return "", err
+		}
+		if !within(root, resolved) {
+			return "", errSymlinkEsc
+		}
+		cur = resolved
 	}
 	return cur, nil
 }

@@ -85,12 +85,13 @@ additional code the router emits:
 | `too_many_sessions` | 409 | Per-workspace concurrent-session cap reached | `POST .../sessions` when `sessions.max_per_workspace` is already in use. |
 | `session_ended` | 409 | Operation on a terminal session | `input`/`signal`/`resize` (or `output` after `DELETE`) on a session that has ended; the workspace check wins while suspended. |
 | `validation` | 400 | Malformed or invalid request | Bad JSON, unknown JSON field, failing `validate` tag, missing query/body field, bad `stream`/`status`/`kind` filter, unknown route body. Also carries the **405** status for method-not-allowed. |
-| `unprocessable` | 422 | Unsafe path or invalid limit/target | Path traversal / symlink escape, `cwd` escape, command not found, deleting the workspace root, file-run target that is a directory, a limit `<= 0` or **above the server maximum**. |
-| `payload_too_large` | 413 | Body or file over a hard cap | JSON body > `json_body_mb`, upload > `upload_mb`, file write > `file_write_mb`. |
+| `unprocessable` | 422 | Unsafe path or invalid limit/target | Path traversal / symlink escape, `cwd` escape, command not found, deleting the workspace root, file-run target that is a directory, a limit `<= 0` or **above the server maximum**, conflicting byte/line range parameters, a request `limit` above `file_read_mb`. |
+| `not_directory` | 422 | Wrong node type for the operation | Listing a path that is a file, reading/writing/downloading a directory as a file, writing over a directory. The path exists, so this is never 404 (see discrepancies 9). |
+| `payload_too_large` | 413 | Body or file over a hard cap | JSON body > `json_body_mb`, upload > `upload_mb`, file write > `file_write_mb`, a `GET /files/content` `limit` above `file_read_mb`. |
 | `insufficient_storage` | 507 | Workspace disk quota exceeded | Write/upload/rename past `limits.disk_mb`. |
 | `timeout` | 504 | Timeout | **Defined but never emitted** (see discrepancies). |
 | `unavailable` | 503 | Sandbox backend unavailable | nsjail binary missing, or nsjail could not set up/launch the sandbox (`details.nsjail`). |
-| `internal` | 500 | Unexpected server error | Bugs and unmapped filesystem conditions (e.g. listing a path that is a file). |
+| `internal` | 500 | Unexpected server error | Bugs and genuinely unmapped conditions. |
 
 Note the code is not always a 1:1 mirror of the status: a **405 method not
 allowed** response carries `code:"validation"`.
@@ -108,7 +109,8 @@ Hard caps, all from `internal/config` (never raisable per request):
 | `caps.json_body_mb` | 1 | Every JSON request body | `413 payload_too_large` |
 | `caps.upload_mb` | 50 | `POST /files/upload` multipart body and file | `413 payload_too_large` |
 | `caps.file_write_mb` | 10 | `PUT /files/content` payload | `413 payload_too_large` |
-| `caps.file_read_mb` | 5 | `GET /files/content` | returns a **prefix** with `truncated:true` (not an error) |
+| `caps.file_read_mb` | 5 | `GET /files/content` inline reads | returns a **prefix** with `truncated:true` (not an error); a request `limit` above it is `413` |
+| `caps.file_list_max` | 1000 | `GET /files` page size | returns a bounded page with `truncated:true` and the full `total` |
 | `caps.exec_stdout_kb` | 256 | Sync exec stdout | `truncated:true` |
 | `caps.exec_stderr_kb` | 256 | Sync exec stderr | `truncated:true` |
 | `caps.run_log_mb` | 10 | Each async run log stream | `truncated:true` on the run |
@@ -661,31 +663,82 @@ curl -s -H "$AUTH" -H "$JSON" -d '{"cmd":["python3","-c","import requests; print
 
 ### GET /v1/workspaces/{workspaceID}/files
 
-List a directory.
+List a directory as a bounded page of entries.
 
 - **Path parameter:** `workspaceID`.
 - **Query parameters:**
   - `path` (string, default `/`) — directory path relative to the workspace
     root; a leading `/` is accepted and normalized.
+  - `limit` (integer, optional) — maximum entries to return; `<= 0` or absent
+    uses `caps.file_list_max` (default 1000). A value above the cap is clamped by
+    the cap.
+  - `offset` (integer, optional) — number of sorted entries to skip. Must be
+    `>= 0`.
 - **Response 200:**
 
   ```json
-  {"entries":[{"name":"main.py","path":"/main.py","type":"file",
-               "size":12,"mod_time":"2026-01-02T15:04:05Z"}]}
+  {"path":"/",
+   "entries":[{"name":"src","path":"/src","type":"dir","size":0,"mode":"0755",
+               "mod_time":"2026-01-02T15:04:05Z"},
+              {"name":"main.py","path":"/main.py","type":"file","size":12,
+               "mode":"0644","mod_time":"2026-01-02T15:04:05Z"}],
+   "count":2,"total":2,"truncated":false}
   ```
 
   `type` is `file`, `dir`, or `symlink`. `path` is the absolute
-  workspace-rooted path (always starts with `/`). `size` is the entry size in
-  bytes; `mod_time` is RFC3339 UTC.
+  workspace-rooted path (always starts with `/`). `mode` is the octal permission
+  string. `size` is the entry size in bytes; a directory reports `0`.
+  `mod_time` is RFC3339 UTC. For a symlink, `target` is the raw link target and
+  `target_inside` says whether it resolves inside the workspace.
+- **Ordering (stable, so a client can rely on it):** directories first, then
+  files (symlinks count as files), each group sorted by name byte-wise.
+- **Paging:** `count` is the number of entries in this page, `total` the full
+  child count, and `truncated` is true when entries were omitted. Page by
+  advancing `offset` by `count` until `truncated` is false.
 - **Errors:** 400 `validation` (n/a here), 401, 403, 404 `not_found` (directory
-  does not exist), 422 `unprocessable` (unsafe path).
+  does not exist), 422 `unprocessable` (unsafe path, bad `limit`/`offset`),
+  422 `not_directory` (the path is a **file**).
 - **Semantics:** the `path` is sanitized with `cleanRelative` then `secureJoin`:
   `..` above the root and symlinks resolving outside the root are rejected with
-  422. Listing a path that is a **file** returns **500** (see discrepancies).
+  422. Listing a path that is a **file** fails loudly with `422 not_directory` —
+  it is never a silently-empty `200`.
 
 ```sh
 curl -s -H "Authorization: Bearer $KEY" \
   "localhost:8080/v1/workspaces/$WS/files?path=/"
+
+# page two of 100-entry pages
+curl -s -H "Authorization: Bearer $KEY" \
+  "localhost:8080/v1/workspaces/$WS/files?path=/&limit=100&offset=100"
+```
+
+### GET /v1/workspaces/{workspaceID}/files/stat
+
+Return metadata for a single path without reading its contents.
+
+- **Path parameter:** `workspaceID`.
+- **Query parameters:** `path` (string, **required**).
+- **Response 200:**
+
+  ```json
+  {"name":"main.py","path":"/main.py","type":"file","size":12,"mode":"0644",
+   "mod_time":"2026-01-02T15:04:05Z","content_type":"text/x-python; charset=utf-8",
+   "sha256":"0ca9...","binary":false}
+  ```
+
+  For a regular file, `sha256` is the hash of the **whole** file,
+  `content_type` is detected from the extension/content, and `binary` uses the
+  bounded detection rule (below). For a directory, `size` is `0` and
+  `content_type`/`sha256` are omitted. For a symlink, `type` is `symlink`,
+  `target` is the raw link target and `target_inside` is present.
+- **Errors:** 400 `validation` (path missing), 401, 403, 404 `not_found`,
+  422 `unprocessable` (unsafe path).
+- **Semantics:** a missing path is `404`; an existing file, directory or
+  symlink is always `200`.
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" \
+  "localhost:8080/v1/workspaces/$WS/files/stat?path=/main.py"
 ```
 
 ### DELETE /v1/workspaces/{workspaceID}/files
@@ -708,34 +761,74 @@ curl -s -o /dev/null -w '%{http_code}\n' -X DELETE \
 
 ### GET /v1/workspaces/{workspaceID}/files/content
 
-Read a file.
+Read a file, in whole or in part.
 
 - **Path parameter:** `workspaceID`.
 - **Query parameters:**
   - `path` (string, **required**) — file path.
   - `encoding` (string, optional) — `text` (default) or `base64`; only the exact
-    value `base64` is special, anything else is treated as text.
+    value `base64` is special, anything else is treated as text. Binary content
+    is always returned base64-encoded, whatever `encoding` says.
   - `meta` (string, optional) — the exact value `true` selects the JSON wrapper.
+  - `offset` (integer, optional) — byte offset to start at (default 0). Must be
+    `>= 0`.
+  - `limit` (integer, optional) — maximum bytes to return. `<= 0` or absent
+    reads up to `caps.file_read_mb`; a value above `caps.file_read_mb` is
+    rejected with `413 payload_too_large`. This is the **maximum `limit`
+    accepted**.
+  - `start_line`, `end_line` (integers, optional) — 1-based inclusive line range.
+    `end_line` absent or `0` means "to the end of the file".
 - **Response 200 (raw, default):** the file bytes with the detected
   `Content-Type`, `Content-Disposition: attachment; filename=<base>`,
-  `Content-Length` and `X-Sandboxd-Truncated: true|false`.
-- **Response 200 (`meta=true`):**
+  `Content-Length` and the headers `X-Sandboxd-Truncated`,
+  `X-Sandboxd-Whole-File`, `X-Sandboxd-Binary`, `X-Sandboxd-Total-Size`,
+  `X-Sandboxd-Range-Offset`, `X-Sandboxd-Range-Length`. Use `meta=true` when a
+  `sha256` is wanted.
+- **Response 200 (`meta=true`, byte read):**
 
   ```json
   {"path":"/main.py","content":"print(\"hi\")\n","encoding":"text",
-   "size":12,"sha256":"0ca9...","content_type":"text/x-python; charset=utf-8",
-   "truncated":false}
+   "size":12,"total_size":12,"range":{"offset":0,"length":12},
+   "whole_file":true,"sha256":"0ca9...",
+   "content_type":"text/x-python; charset=utf-8",
+   "truncated":false,"binary":false}
   ```
 
-  `content` is base64 when `encoding=base64`. `path` echoes the query string
-  verbatim (not normalized). `size` is the real file size; `content` may be a
-  prefix of it when `truncated` is true.
+- **Response 200 (`meta=true`, line read):**
+
+  ```json
+  {"path":"/main.py","content":"print(\"hi\")\n","encoding":"text",
+   "start_line":1,"end_line":1,"line_count":1,"total_lines":1,
+   "sha256":"0ca9...","truncated":false,"binary":false}
+  ```
+
 - **Errors:** 400 `validation` (path missing), 401, 403, 404 `not_found`,
-  422 `unprocessable`.
-- **Semantics:** at most `caps.file_read_mb` bytes are returned; a larger file
-  yields a truncated prefix with `truncated:true` (no error). For a truncated
-  read the `sha256` is over the **returned prefix**, not the whole file (see
-  discrepancies). Reading a directory returns 500 (see discrepancies).
+  413 `payload_too_large` (`limit` above `file_read_mb`), 422 `unprocessable`
+  (unsafe path; bad `offset`/`limit`; both byte and line params; `end_line <
+  start_line`), 422 `not_directory` (the path is a directory).
+- **Precedence:** byte parameters (`offset`/`limit`) and line parameters
+  (`start_line`/`end_line`) are **mutually exclusive**; supplying both is a
+  `422`. With neither, the whole file is read up to `file_read_mb`.
+- **Semantics (integrity):** for a byte read, `sha256` is the hash of **exactly
+  the bytes returned in this response**, never of a larger slice. `range` reports
+  the `offset`/`length` actually returned, `total_size` is the real file size,
+  and `whole_file` is true only when the response contains the entire file. A
+  client can therefore tell a whole-file hash from a partial one from the
+  response alone: `whole_file:true` (or a `sha256` equal to the file's
+  `sha256sum`) means the hash covers the whole file.
+- **Semantics (truncation):** a file larger than `caps.file_read_mb` yields a
+  capped prefix with `truncated:true`, the `range` actually returned and
+  `total_size`; truncation is never silent. A request `limit` above the cap is a
+  `413`, not a silent clamp.
+- **Semantics (binary):** content is reported as `binary:true` (and forced to
+  base64) when a bounded leading sample — at most 8192 bytes — contains a NUL
+  byte or invalid UTF-8. Detection cannot inspect a file larger than the sample;
+  binary data appearing only past the sample is reported as text.
+- **Semantics (lines):** a line range returns the requested lines plus
+  `line_count`/`total_lines`. `end_line` past the end returns the remaining
+  lines. A final line without a trailing newline still counts. Reading is
+  bounded: accumulated line output is capped at `file_read_mb` (then
+  `truncated:true`) and a single line is capped at 1 MiB.
 
 ```sh
 curl -s -H "Authorization: Bearer $KEY" \
@@ -743,6 +836,40 @@ curl -s -H "Authorization: Bearer $KEY" \
 
 curl -s -H "Authorization: Bearer $KEY" \
   "localhost:8080/v1/workspaces/$WS/files/content?path=/main.py&meta=true"
+
+# the first 1 KiB
+curl -s -H "Authorization: Bearer $KEY" \
+  "localhost:8080/v1/workspaces/$WS/files/content?path=/big&offset=0&limit=1024&meta=true"
+
+# lines 10..20
+curl -s -H "Authorization: Bearer $KEY" \
+  "localhost:8080/v1/workspaces/$WS/files/content?path=/main.py&start_line=10&end_line=20"
+```
+
+### GET /v1/workspaces/{workspaceID}/files/download
+
+Stream the **entire** file for delivery to a user.
+
+- **Path parameter:** `workspaceID`.
+- **Query parameters:** `path` (string, **required**).
+- **Response 200:** the whole file, with the detected `Content-Type`,
+  `Content-Disposition: attachment; filename=<base>`, `Content-Length` when the
+  size is known, and `X-Sandboxd-Truncated: false` / `X-Sandboxd-Whole-File:
+  true`.
+- **Errors:** 400 `validation` (path missing), 401, 403, 404 `not_found`,
+  422 `unprocessable` (unsafe path), 422 `not_directory` (the path is a
+  directory).
+- **Semantics:** the response is streamed with constant memory (it is not
+  buffered), and it is **exempt from `caps.file_read_mb`** — that cap governs
+  inline viewing, so a file too large to read inline can still be downloaded.
+  The workspace disk quota still governs storage. The practical limit is the
+  workspace's `limits.disk_mb` (the largest file that can exist) and the
+  response is bounded by the client's read; there is no server-side download
+  size cap.
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" -OJ \
+  "localhost:8080/v1/workspaces/$WS/files/download?path=/big.bin"
 ```
 
 ### PUT /v1/workspaces/{workspaceID}/files/content
@@ -755,16 +882,17 @@ Write (create or overwrite) a file.
 
   | Field | Go type | JSON | Required | Validation | Default |
   |-------|---------|------|----------|------------|---------|
-  | `content` | `string` | `content` | no | none — an omitted field writes an **empty** file | `""` |
+  | `content` | `string` | `content` | **yes** | an omitted field is a `400 validation`; an explicit `""` writes a 0-byte file | — |
   | `encoding` | `string` | `encoding` | no | `base64` decodes the content; anything else is literal text | `text` |
 
 - **Response 204:** empty body.
-- **Errors:** 400 `validation` (path missing, invalid JSON, invalid base64),
-  401, 403, 413 `payload_too_large` (body > `json_body_mb`, or content >
-  `file_write_mb`), 422 `unprocessable`, 507 `insufficient_storage` (quota).
+- **Errors:** 400 `validation` (path missing, invalid JSON, missing `content`,
+  invalid base64), 401, 403, 413 `payload_too_large` (body > `json_body_mb`, or
+  content > `file_write_mb`), 422 `unprocessable`, 422 `not_directory` (the path
+  is an existing directory), 507 `insufficient_storage` (quota).
 - **Semantics:** missing parent directories are created. The write is accounted
-  against `limits.disk_mb`. Writing over a path that is a directory returns 500
-  (see discrepancies).
+  against `limits.disk_mb`. Writing over a path that is a **directory** is a
+  `422 not_directory`.
 
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' -X PUT \
@@ -1681,19 +1809,21 @@ should be updated.
 5. **Unknown routes return a documented-shaped 404.** The router's `NotFound`
    returns `404 not_found` "route not found"; `openapi.yaml` does not describe the
    catch-all.
-6. **Reading a file never returns 413.** `openapi.yaml` lists 413 for
-   `GET .../files/content`, but the read path returns a truncated prefix with
-   `truncated:true` instead of erroring at `file_read_mb`.
-7. **`sha256` is over the returned prefix for truncated reads.** For files larger
-   than `file_read_mb`, the `meta=true` wrapper hashes the truncated bytes, not
-   the whole file.
-8. **`PUT /files/content` does not require `content`.** `openapi.yaml` marks it
-   required; the implementation has no `validate` tag, so `{}` writes a 0-byte
-   file.
-9. **Operations on the wrong node type return 500, not 4xx.** Listing a path that
-   is a file, reading a directory, or writing over a directory map to
-   `500 internal` (the internal `errNotDirectory` is not translated). OpenAPI
-   implies 4xx.
+6. **Resolved — reading a file can now return 413.** `GET .../files/content`
+   still returns a capped prefix with `truncated:true` for the default read, but
+   a request `limit` above `caps.file_read_mb` is rejected with
+   `413 payload_too_large`, matching `openapi.yaml`.
+7. **Resolved — `sha256` is over exactly the returned bytes.** The `meta=true`
+   wrapper hashes the bytes in the response (never a larger slice), and reports
+   `range`/`total_size`/`whole_file` so a client can tell a whole-file hash from
+   a partial one from the response alone.
+8. **Resolved — `PUT /files/content` requires `content`.** `putFileRequest.Content`
+   is a pointer, so an omitted field is `400 validation`; an explicit `""` writes
+   a 0-byte file.
+9. **Resolved — wrong-node-type operations return 422, not 500/404.** Listing a
+   file, reading a directory as a file, and writing over a directory now return
+   `422 not_directory` (a new `not_directory` code). The path exists, so it is
+   never `404`, and it is never `500`.
 10. **Async `cwd` is rejected, not accepted.** Runs execute at the workspace
     root; a `cwd` field on `POST /runs` is an unknown field → 400. Only sync
     `exec` accepts `cwd`.

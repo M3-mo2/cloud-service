@@ -1,37 +1,97 @@
 package workspace
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // Entry describes a directory child.
+//
+// Mode is the octal permission string (e.g. "0644"). Target is set only for
+// symlinks and is the raw link target; TargetInside reports whether that target
+// resolves inside the workspace root (false when it escapes or is dangling and
+// lexically outside).
 type Entry struct {
-	Name    string    `json:"name"`
-	Path    string    `json:"path"`
-	Type    string    `json:"type"`
-	Size    int64     `json:"size"`
-	ModTime time.Time `json:"mod_time"`
+	Name         string    `json:"name"`
+	Path         string    `json:"path"`
+	Type         string    `json:"type"`
+	Size         int64     `json:"size"`
+	Mode         string    `json:"mode"`
+	ModTime      time.Time `json:"mod_time"`
+	Target       string    `json:"target,omitempty"`
+	TargetInside bool      `json:"target_inside,omitempty"`
 }
 
-// FileInfo describes a file for metadata reads.
+// Listing is one bounded page of a directory listing.
+type Listing struct {
+	Path      string  `json:"path"`
+	Entries   []Entry `json:"entries"`
+	Count     int     `json:"count"`
+	Total     int     `json:"total"`
+	Truncated bool    `json:"truncated"`
+}
+
+// FileInfo describes a file (or symlink/directory) for metadata reads.
 type FileInfo struct {
-	Path        string    `json:"path"`
-	Size        int64     `json:"size"`
-	ModTime     time.Time `json:"mod_time"`
-	ContentType string    `json:"content_type"`
-	SHA256      string    `json:"sha256"`
-	Binary      bool      `json:"binary"`
+	Path         string    `json:"path"`
+	Name         string    `json:"name"`
+	Type         string    `json:"type"`
+	Size         int64     `json:"size"`
+	Mode         string    `json:"mode"`
+	ModTime      time.Time `json:"mod_time"`
+	ContentType  string    `json:"content_type"`
+	SHA256       string    `json:"sha256"`
+	Binary       bool      `json:"binary"`
+	Target       string    `json:"target,omitempty"`
+	TargetInside bool      `json:"target_inside,omitempty"`
+}
+
+// binarySampleSize bounds how many leading bytes are inspected for binary
+// detection (invalid UTF-8 or a NUL byte). It keeps detection cheap and bounded
+// regardless of file size.
+const binarySampleSize = 8192
+
+// ReadResult is a bounded byte-range read of a file. SHA256 is the hash of
+// exactly Data (the bytes returned), never of a larger slice, so a client can
+// verify what it received. WholeFile is true only when Data is the entire file.
+type ReadResult struct {
+	Data        []byte
+	Total       int64
+	Offset      int64
+	Length      int64
+	SHA256      string
+	WholeFile   bool
+	Truncated   bool
+	ContentType string
+	Binary      bool
+
+	modTime time.Time
+}
+
+// LineResult is a bounded line-range read of a text file. Data holds the bytes
+// of lines StartLine..EndLine (1-based, inclusive). SHA256 is the hash of
+// exactly Data. TotalLines counts every line in the file.
+type LineResult struct {
+	Data       []byte
+	StartLine  int64
+	EndLine    int64
+	TotalLines int64
+	SHA256     string
+	Truncated  bool
 }
 
 // Fs provides safe filesystem operations rooted at a workspace directory.
@@ -114,6 +174,16 @@ func (f *Fs) Resolve(userPath string) (string, error) {
 	return secureJoin(f.root, clean)
 }
 
+// resolveNoFollowFinal resolves a user path without following a symlink in the
+// final component, so the link itself can be reported.
+func (f *Fs) resolveNoFollowFinal(userPath string) (string, error) {
+	clean, err := cleanRelative(userPath)
+	if err != nil {
+		return "", err
+	}
+	return resolveFinal(f.root, clean)
+}
+
 // relPath converts an absolute in-workspace path back to a slash-prefixed
 // path rooted at /.
 func (f *Fs) relPath(abs string) string {
@@ -124,7 +194,9 @@ func (f *Fs) relPath(abs string) string {
 	return "/" + filepath.ToSlash(rel)
 }
 
-// List returns the direct children of a directory.
+// List returns the direct children of a directory, sorted directories-first
+// then by name (byte-wise). It returns every child; use ListPage to bound the
+// result.
 func (f *Fs) List(userPath string) ([]Entry, error) {
 	abs, err := f.Resolve(userPath)
 	if err != nil {
@@ -146,25 +218,118 @@ func (f *Fs) List(userPath string) ([]Entry, error) {
 	}
 	out := make([]Entry, 0, len(children))
 	for _, c := range children {
-		info, err := c.Info()
+		e, err := f.entryFor(abs, c)
 		if err != nil {
 			continue
 		}
-		typ := "file"
-		if c.IsDir() {
-			typ = "dir"
-		} else if info.Mode()&os.ModeSymlink != 0 {
-			typ = "symlink"
-		}
-		out = append(out, Entry{
-			Name:    c.Name(),
-			Path:    f.relPath(filepath.Join(abs, c.Name())),
-			Type:    typ,
-			Size:    info.Size(),
-			ModTime: info.ModTime().UTC(),
-		})
+		out = append(out, e)
 	}
+	sortEntries(out)
 	return out, nil
+}
+
+// ListPage returns a bounded page of a directory listing. limit caps the number
+// of entries returned (<= 0 means no bound); offset skips that many sorted
+// entries. Total is the full child count, so a client can page even when the
+// page is truncated.
+func (f *Fs) ListPage(userPath string, limit, offset int) (Listing, error) {
+	entries, err := f.List(userPath)
+	if err != nil {
+		return Listing{}, err
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(entries) {
+		offset = len(entries)
+	}
+	window := entries[offset:]
+	truncated := false
+	if limit > 0 && len(window) > limit {
+		window = window[:limit]
+		truncated = true
+	}
+	return Listing{
+		Path:      f.relPath(mustResolve(f, userPath)),
+		Entries:   window,
+		Count:     len(window),
+		Total:     len(entries),
+		Truncated: truncated,
+	}, nil
+}
+
+// entryFor builds an Entry for one directory child.
+func (f *Fs) entryFor(dir string, c os.DirEntry) (Entry, error) {
+	abs := filepath.Join(dir, c.Name())
+	// Lstat (not the DirEntry's cached info) so the mode and size describe the
+	// link itself, never its target.
+	li, err := os.Lstat(abs)
+	if err != nil {
+		return Entry{}, err
+	}
+	e := Entry{
+		Name:    c.Name(),
+		Path:    f.relPath(abs),
+		Size:    li.Size(),
+		Mode:    fmt.Sprintf("%04o", li.Mode().Perm()),
+		ModTime: li.ModTime().UTC(),
+	}
+	switch {
+	case li.Mode()&os.ModeSymlink != 0:
+		e.Type = "symlink"
+		target, terr := os.Readlink(abs)
+		if terr == nil {
+			e.Target = target
+			e.TargetInside = f.targetInside(abs)
+		}
+	case li.IsDir():
+		e.Type = "dir"
+		e.Size = 0
+	default:
+		e.Type = "file"
+	}
+	return e, nil
+}
+
+// targetInside reports whether the symlink at abs resolves within the root. A
+// dangling link whose lexical target stays inside the root is reported inside;
+// an escaping or unresolvable link is not.
+func (f *Fs) targetInside(abs string) bool {
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		// Dangling: fall back to a lexical check of the link's target.
+		target, rerr := os.Readlink(abs)
+		if rerr != nil {
+			return false
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(abs), target)
+		}
+		return within(f.root, filepath.Clean(target))
+	}
+	return within(f.root, resolved)
+}
+
+// sortEntries orders directories before files (symlinks count as files), then
+// by name byte-wise.
+func sortEntries(entries []Entry) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		di, dj := entries[i].Type == "dir", entries[j].Type == "dir"
+		if di != dj {
+			return di
+		}
+		return entries[i].Name < entries[j].Name
+	})
+}
+
+// mustResolve resolves a path for reporting; on error it returns a best-effort
+// slash path.
+func mustResolve(f *Fs, userPath string) string {
+	abs, err := f.Resolve(userPath)
+	if err != nil {
+		return userPath
+	}
+	return abs
 }
 
 var errNotFound = &plainError{"file not found"}
@@ -174,77 +339,270 @@ var errNotFound = &plainError{"file not found"}
 // errors (e.g. a missing nsjail template) are intentionally not matched.
 func IsNotFound(err error) bool { return err == errNotFound }
 
-// Stat returns metadata for a file without reading its contents.
+// Stat returns metadata for a path (file, directory or symlink) without reading
+// its contents. For a regular file it includes the full-file sha256; for a
+// directory or symlink SHA256 is empty. errNotDirectory is no longer returned:
+// callers that require a file check Type themselves.
 func (f *Fs) Stat(userPath string) (FileInfo, error) {
-	abs, err := f.Resolve(userPath)
+	abs, err := f.resolveNoFollowFinal(userPath)
 	if err != nil {
 		return FileInfo{}, err
 	}
-	fi, err := os.Stat(abs)
+	li, err := os.Lstat(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return FileInfo{}, errNotFound
 		}
 		return FileInfo{}, err
 	}
-	if fi.IsDir() {
-		return FileInfo{}, errNotDirectory
+	info := FileInfo{
+		Path:    f.relPath(abs),
+		Name:    li.Name(),
+		Size:    li.Size(),
+		Mode:    fmt.Sprintf("%04o", li.Mode().Perm()),
+		ModTime: li.ModTime().UTC(),
 	}
+	switch {
+	case li.Mode()&os.ModeSymlink != 0:
+		info.Type = "symlink"
+		if target, terr := os.Readlink(abs); terr == nil {
+			info.Target = target
+			info.TargetInside = f.targetInside(abs)
+		}
+		return info, nil
+	case li.IsDir():
+		info.Type = "dir"
+		info.Size = 0
+		return info, nil
+	}
+	info.Type = "file"
 	sum, err := hashFile(abs)
 	if err != nil {
 		return FileInfo{}, err
 	}
 	ct := detectContentType(abs, nil)
-	return FileInfo{
-		Path:        f.relPath(abs),
-		Size:        fi.Size(),
-		ModTime:     fi.ModTime().UTC(),
-		ContentType: ct,
-		SHA256:      sum,
-		Binary:      !isTextContentType(ct),
-	}, nil
+	info.ContentType = ct
+	info.SHA256 = sum
+	info.Binary = isBinaryFile(abs)
+	return info, nil
 }
 
 // Read reads up to maxBytes from a file. If the file is larger than maxBytes
-// it returns the prefix and truncated=true.
+// it returns the prefix and truncated=true. The returned FileInfo.SHA256 is the
+// hash of exactly the returned bytes; FileInfo.Binary is detected from a
+// bounded sample of those bytes. WholeFile is true when the whole file was
+// returned.
 func (f *Fs) Read(userPath string, maxBytes int64) (data []byte, info FileInfo, truncated bool, err error) {
-	abs, err := f.Resolve(userPath)
+	res, err := f.ReadRange(userPath, 0, maxBytes)
 	if err != nil {
 		return nil, FileInfo{}, false, err
+	}
+	info = FileInfo{
+		Path:        f.relPath(mustResolve(f, userPath)),
+		Name:        filepath.Base(f.relPath(mustResolve(f, userPath))),
+		Type:        "file",
+		Size:        res.Total,
+		ModTime:     res.modTime,
+		ContentType: res.ContentType,
+		SHA256:      res.SHA256,
+		Binary:      res.Binary,
+	}
+	return res.Data, info, res.Truncated, nil
+}
+
+// ReadRange reads up to limit bytes starting at byte offset. It streams from
+// disk, so it does not load more than the requested slice. limit <= 0 means
+// "no explicit limit" and is treated as the whole remaining file, which the
+// service layer bounds with the read cap. The returned ReadResult.SHA256 is the
+// hash of exactly the returned bytes and WholeFile is true only when the slice
+// covers the entire file.
+func (f *Fs) ReadRange(userPath string, offset, limit int64) (ReadResult, error) {
+	abs, err := f.Resolve(userPath)
+	if err != nil {
+		return ReadResult{}, err
 	}
 	fh, err := os.Open(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, FileInfo{}, false, errNotFound
+			return ReadResult{}, errNotFound
 		}
-		return nil, FileInfo{}, false, err
+		return ReadResult{}, err
 	}
 	defer fh.Close()
 	fi, err := fh.Stat()
 	if err != nil {
-		return nil, FileInfo{}, false, err
+		return ReadResult{}, err
 	}
 	if fi.IsDir() {
-		return nil, FileInfo{}, false, errNotDirectory
+		return ReadResult{}, errNotDirectory
 	}
-	var buf bytes.Buffer
-	n, err := io.CopyN(&buf, fh, maxBytes)
-	if err != nil && err != io.EOF {
-		return nil, FileInfo{}, false, err
+	total := fi.Size()
+	if offset < 0 {
+		offset = 0
 	}
-	truncated = fi.Size() > maxBytes
-	sum := sha256.Sum256(buf.Bytes())
-	ct := detectContentType(abs, buf.Bytes())
-	info = FileInfo{
-		Path:        f.relPath(abs),
-		Size:        fi.Size(),
-		ModTime:     fi.ModTime().UTC(),
-		ContentType: ct,
+	if offset > total {
+		offset = total
+	}
+	toRead := total - offset
+	if limit > 0 && limit < toRead {
+		toRead = limit
+	}
+	buf := make([]byte, toRead)
+	if toRead > 0 {
+		if _, err := fh.ReadAt(buf, offset); err != nil && err != io.EOF {
+			return ReadResult{}, err
+		}
+	}
+	whole := offset == 0 && toRead == total
+	sum := sha256.Sum256(buf)
+	return ReadResult{
+		Data:        buf,
+		Total:       total,
+		Offset:      offset,
+		Length:      toRead,
 		SHA256:      hex.EncodeToString(sum[:]),
-		Binary:      !isTextContentType(ct),
+		WholeFile:   whole,
+		Truncated:   !whole,
+		ContentType: detectContentType(abs, buf),
+		Binary:      isBinary(buf),
+		modTime:     fi.ModTime().UTC(),
+	}, nil
+}
+
+// maxLineBytes bounds a single line so a file with no newline cannot force an
+// unbounded allocation while scanning.
+const maxLineBytes = 1 << 20
+
+// ReadLines returns lines [startLine, endLine] (1-based, inclusive) of a text
+// file. endLine <= 0 means "to the end of the file"; startLine <= 0 is treated
+// as 1. Lines longer than maxLineBytes are treated as a single line capped at
+// that size. TotalLines counts every line (a final line without a trailing
+// newline still counts). maxBytes bounds the accumulated output (<= 0 means no
+// bound); when the requested lines exceed it, Truncated is set. SHA256 is the
+// hash of exactly the returned bytes.
+func (f *Fs) ReadLines(userPath string, startLine, endLine, maxBytes int64) (LineResult, error) {
+	abs, err := f.Resolve(userPath)
+	if err != nil {
+		return LineResult{}, err
 	}
-	_ = n
-	return buf.Bytes(), info, truncated, nil
+	fh, err := os.Open(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return LineResult{}, errNotFound
+		}
+		return LineResult{}, err
+	}
+	defer fh.Close()
+	fi, err := fh.Stat()
+	if err != nil {
+		return LineResult{}, err
+	}
+	if fi.IsDir() {
+		return LineResult{}, errNotDirectory
+	}
+	if startLine <= 0 {
+		startLine = 1
+	}
+	if endLine > 0 && endLine < startLine {
+		return LineResult{}, errRange
+	}
+	br := bufio.NewReaderSize(fh, 64*1024)
+	var (
+		out        bytes.Buffer
+		line       int64
+		totalLines int64
+		overCap    bool
+	)
+	for {
+		chunk, err := readBoundedLine(br)
+		if len(chunk) > 0 || err == nil {
+			line++
+			totalLines = line
+			if line >= startLine && (endLine <= 0 || line <= endLine) {
+				if maxBytes > 0 && int64(out.Len()+len(chunk)) > maxBytes {
+					overCap = true
+				} else if !overCap {
+					out.Write(chunk)
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	returnedEnd := endLine
+	if returnedEnd <= 0 || returnedEnd > totalLines {
+		returnedEnd = totalLines
+	}
+	data := out.Bytes()
+	sum := sha256.Sum256(data)
+	return LineResult{
+		Data:       data,
+		StartLine:  startLine,
+		EndLine:    returnedEnd,
+		TotalLines: totalLines,
+		SHA256:     hex.EncodeToString(sum[:]),
+		Truncated:  overCap || (endLine > 0 && endLine < totalLines),
+	}, nil
+}
+
+// readBoundedLine reads one line (including its trailing newline) up to
+// maxLineBytes. It returns the bytes and io.EOF when the final line has no
+// trailing newline.
+func readBoundedLine(br *bufio.Reader) ([]byte, error) {
+	var buf []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		buf = append(buf, chunk...)
+		if len(buf) >= maxLineBytes {
+			// Discard the rest of an over-long line but keep a newline as a
+			// delimiter if one is reachable.
+			for err == bufio.ErrBufferFull {
+				_, err = br.ReadSlice('\n')
+			}
+			return buf[:maxLineBytes], err
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return buf, err
+	}
+}
+
+// Open returns an *os.File positioned at the start of a regular file for
+// streaming (used by download). The caller closes it. A directory is rejected
+// with errNotDirectory.
+func (f *Fs) Open(userPath string) (*os.File, FileInfo, error) {
+	abs, err := f.Resolve(userPath)
+	if err != nil {
+		return nil, FileInfo{}, err
+	}
+	fh, err := os.Open(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, FileInfo{}, errNotFound
+		}
+		return nil, FileInfo{}, err
+	}
+	fi, err := fh.Stat()
+	if err != nil {
+		fh.Close()
+		return nil, FileInfo{}, err
+	}
+	if fi.IsDir() {
+		fh.Close()
+		return nil, FileInfo{}, errNotDirectory
+	}
+	info := FileInfo{
+		Path:        f.relPath(abs),
+		Name:        fi.Name(),
+		Type:        "file",
+		Size:        fi.Size(),
+		Mode:        fmt.Sprintf("%04o", fi.Mode().Perm()),
+		ModTime:     fi.ModTime().UTC(),
+		ContentType: detectContentType(abs, nil),
+	}
+	return fh, info, nil
 }
 
 // WriteOptions controls a write.
@@ -263,7 +621,7 @@ func (f *Fs) Write(userPath string, data []byte, appendMode bool, opts WriteOpti
 		return err
 	}
 	if fi, err := os.Stat(abs); err == nil && fi.IsDir() {
-		return errNotDirectory
+		return errIsDirectory
 	}
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return err
@@ -464,29 +822,48 @@ func detectContentType(path string, sniff []byte) string {
 
 func detectBySniff(b []byte) string {
 	ct := "text/plain; charset=utf-8"
-	if !isText(b) {
+	if isBinary(b) {
 		return "application/octet-stream"
 	}
 	return ct
 }
 
-func isText(b []byte) bool {
-	for _, c := range b {
-		if c == 0 {
-			return false
-		}
+// isBinary reports whether a bounded sample looks binary: it contains a NUL
+// byte or invalid UTF-8. Only the first binarySampleSize bytes are inspected,
+// so a large file with binary data only past the sample is reported as text.
+// The rule cannot inspect the whole file and is documented as such.
+func isBinary(b []byte) bool {
+	sample := b
+	if len(sample) > binarySampleSize {
+		sample = sample[:binarySampleSize]
 	}
-	return true
+	if bytes.IndexByte(sample, 0) >= 0 {
+		return true
+	}
+	return !utf8.Valid(sample)
 }
 
-func isTextContentType(ct string) bool {
-	return strings.HasPrefix(ct, "text/") ||
-		strings.Contains(ct, "json") ||
-		strings.Contains(ct, "xml") ||
-		strings.Contains(ct, "yaml") ||
-		strings.Contains(ct, "javascript") ||
-		strings.Contains(ct, "python")
+// IsBinary reports whether a sample looks binary using the same bounded rule as
+// the read path. It is exported for callers that already hold bytes.
+func IsBinary(b []byte) bool { return isBinary(b) }
+
+// isBinaryFile reads a bounded leading sample of a file and applies isBinary.
+// An unreadable file is reported as non-binary.
+func isBinaryFile(path string) bool {
+	fh, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer fh.Close()
+	buf := make([]byte, binarySampleSize)
+	n, _ := io.ReadFull(fh, buf)
+	return isBinary(buf[:n])
 }
+
+var errRange = &plainError{"invalid line range"}
+
+// IsRangeError reports whether err indicates a nonsensical line range.
+func IsRangeError(err error) bool { return err == errRange }
 
 var errTooLarge = &plainError{"file exceeds maximum allowed size"}
 

@@ -1,6 +1,8 @@
 package workspace
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -270,4 +272,259 @@ func asQuota(err error, target **QuotaError) bool {
 		*target = qe
 	}
 	return ok
+}
+
+func TestListSortedDirsFirstWithMetadata(t *testing.T) {
+	fs := newFs(t)
+	fs.Write("/b.txt", []byte("bb"), false, WriteOptions{})
+	fs.Write("/a.txt", []byte("a"), false, WriteOptions{})
+	fs.Mkdir("/zeta")
+	fs.Mkdir("/alpha")
+	entries, err := fs.List("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, len(entries))
+	for i, e := range entries {
+		got[i] = e.Type + ":" + e.Name
+	}
+	want := []string{"dir:alpha", "dir:zeta", "file:a.txt", "file:b.txt"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("order = %v want %v", got, want)
+	}
+	for _, e := range entries {
+		if e.Mode == "" {
+			t.Fatalf("entry %q has no mode", e.Name)
+		}
+	}
+	// Directory size is reported as 0.
+	if entries[0].Size != 0 {
+		t.Fatalf("dir size = %d want 0", entries[0].Size)
+	}
+}
+
+func TestListPageTruncation(t *testing.T) {
+	fs := newFs(t)
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		fs.Write("/"+n, []byte("x"), false, WriteOptions{})
+	}
+	page, err := fs.ListPage("/", 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Entries) != 2 || page.Count != 2 || page.Total != 5 || !page.Truncated {
+		t.Fatalf("page = %+v", page)
+	}
+	if page.Entries[0].Name != "a" || page.Entries[1].Name != "b" {
+		t.Fatalf("entries = %+v", page.Entries)
+	}
+	page2, err := fs.ListPage("/", 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page2.Entries[0].Name != "c" || page2.Count != 2 {
+		t.Fatalf("page2 = %+v", page2.Entries)
+	}
+	last, err := fs.ListPage("/", 2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last.Count != 1 || last.Truncated {
+		t.Fatalf("last = %+v", last)
+	}
+}
+
+func TestListSymlinkTarget(t *testing.T) {
+	fs := newFs(t)
+	fs.Write("/real.txt", []byte("x"), false, WriteOptions{})
+	if err := os.Symlink("real.txt", filepath.Join(fs.Root(), "inside")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if err := os.Symlink("/etc/passwd", filepath.Join(fs.Root(), "outside")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	entries, err := fs.List("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]Entry{}
+	for _, e := range entries {
+		byName[e.Name] = e
+	}
+	if e := byName["inside"]; e.Type != "symlink" || e.Target != "real.txt" || !e.TargetInside {
+		t.Fatalf("inside entry = %+v", e)
+	}
+	if e := byName["outside"]; e.Type != "symlink" || e.TargetInside {
+		t.Fatalf("outside entry = %+v", e)
+	}
+}
+
+func TestReadRangeHonestHash(t *testing.T) {
+	fs := newFs(t)
+	content := []byte("0123456789abcdef")
+	fs.Write("/f", content, false, WriteOptions{})
+
+	full, err := fs.ReadRange("/f", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !full.WholeFile || full.Truncated {
+		t.Fatalf("full = %+v", full)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(content)); full.SHA256 != got {
+		t.Fatalf("full hash = %s want %s", full.SHA256, got)
+	}
+
+	part, err := fs.ReadRange("/f", 4, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(part.Data) != "456789" || part.Offset != 4 || part.Length != 6 {
+		t.Fatalf("part = %q off=%d len=%d", part.Data, part.Offset, part.Length)
+	}
+	if part.WholeFile {
+		t.Fatal("partial read must not be whole_file")
+	}
+	wantPart := fmt.Sprintf("%x", sha256.Sum256([]byte("456789")))
+	if part.SHA256 != wantPart {
+		t.Fatalf("partial hash = %s want %s", part.SHA256, wantPart)
+	}
+	if part.SHA256 == full.SHA256 {
+		t.Fatal("partial hash must differ from full hash")
+	}
+}
+
+func TestReadRangeBoundaries(t *testing.T) {
+	fs := newFs(t)
+	// Empty file.
+	fs.Write("/empty", []byte{}, false, WriteOptions{})
+	empty, err := fs.ReadRange("/empty", 0, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.Data) != 0 || !empty.WholeFile || empty.Truncated || empty.Total != 0 {
+		t.Fatalf("empty = %+v", empty)
+	}
+	// One byte over the cap.
+	fs.Write("/six", []byte("abcdef"), false, WriteOptions{})
+	over, err := fs.ReadRange("/six", 0, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(over.Data) != 5 || !over.Truncated || over.WholeFile {
+		t.Fatalf("over = %+v", over)
+	}
+	// Exactly at the cap.
+	exact, err := fs.ReadRange("/six", 1, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(exact.Data) != "bcdef" || !exact.Truncated || exact.WholeFile {
+		t.Fatalf("exact = %+v", exact)
+	}
+}
+
+func TestReadLines(t *testing.T) {
+	fs := newFs(t)
+	fs.Write("/f.txt", []byte("one\ntwo\nthree\nfour\n"), false, WriteOptions{})
+	res, err := fs.ReadLines("/f.txt", 2, 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(res.Data) != "two\nthree\n" || res.StartLine != 2 || res.EndLine != 3 || res.TotalLines != 4 {
+		t.Fatalf("res = %+v data=%q", res, res.Data)
+	}
+	// Open-ended range to end of file.
+	rest, err := fs.ReadLines("/f.txt", 3, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rest.Data) != "three\nfour\n" {
+		t.Fatalf("rest = %q", rest.Data)
+	}
+	// No trailing newline counts as a line.
+	fs.Write("/noeol", []byte("a\nb"), false, WriteOptions{})
+	n, err := fs.ReadLines("/noeol", 1, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(n.Data) != "a\nb" || n.TotalLines != 2 {
+		t.Fatalf("noeol = %+v data=%q", n, n.Data)
+	}
+	// Empty file has zero lines.
+	fs.Write("/e", []byte{}, false, WriteOptions{})
+	e, err := fs.ReadLines("/e", 1, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.TotalLines != 0 || len(e.Data) != 0 {
+		t.Fatalf("empty lines = %+v", e)
+	}
+	// Invalid range.
+	if _, err := fs.ReadLines("/f.txt", 3, 1, 0); !IsRangeError(err) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestListAndReadNotDirectory(t *testing.T) {
+	fs := newFs(t)
+	fs.Write("/f.txt", []byte("x"), false, WriteOptions{})
+	if _, err := fs.List("/f.txt"); !IsNotDirectory(err) {
+		t.Fatalf("list err = %v", err)
+	}
+	if _, err := fs.ReadRange("/missing", 0, 0); !IsNotFound(err) {
+		t.Fatalf("read missing err = %v", err)
+	}
+}
+
+func TestReadDirectoryNotDirectory(t *testing.T) {
+	fs := newFs(t)
+	fs.Mkdir("/d")
+	if _, err := fs.ReadRange("/d", 0, 10); !IsNotDirectory(err) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, _, err := fs.Open("/d"); !IsNotDirectory(err) {
+		t.Fatalf("open dir err = %v", err)
+	}
+}
+
+func TestWriteOverDirectoryIsDirectory(t *testing.T) {
+	fs := newFs(t)
+	fs.Mkdir("/d")
+	err := fs.Write("/d", []byte("x"), false, WriteOptions{})
+	if !IsIsDirectory(err) {
+		t.Fatalf("err = %v want is-directory", err)
+	}
+}
+
+func TestStatKindsAndBinary(t *testing.T) {
+	fs := newFs(t)
+	fs.Write("/f.txt", []byte("hello"), false, WriteOptions{})
+	fs.Write("/bin", []byte{0x00, 0x01, 0xff}, false, WriteOptions{})
+	fs.Mkdir("/d")
+
+	fi, err := fs.Stat("/f.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Type != "file" || fi.Size != 5 || fi.SHA256 == "" || fi.Binary || fi.Mode == "" {
+		t.Fatalf("stat file = %+v", fi)
+	}
+	bd, err := fs.Stat("/bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bd.Binary {
+		t.Fatalf("binary not detected: %+v", bd)
+	}
+	di, err := fs.Stat("/d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if di.Type != "dir" || di.SHA256 != "" {
+		t.Fatalf("stat dir = %+v", di)
+	}
+	if _, err := fs.Stat("/missing"); !IsNotFound(err) {
+		t.Fatalf("stat missing err = %v", err)
+	}
 }

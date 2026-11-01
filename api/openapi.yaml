@@ -318,23 +318,24 @@ paths:
     get:
       operationId: getv1_workspaces_workspaceId_files
       tags: [Files]
-      summary: List a directory
+      summary: List a directory as a bounded page
+      description: "Directories first, then files, each sorted by name byte-wise. A page is bounded by caps.file_list_max; count/total/truncated let a client page."
       parameters:
         - name: path
           in: query
           schema: { type: string, default: "/" }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
       responses:
         "200":
           description: Entries
           content:
             application/json:
-              schema:
-                type: object
-                required: [entries]
-                properties:
-                  entries:
-                    type: array
-                    items: { $ref: "#/components/schemas/Entry" }
+              schema: { $ref: "#/components/schemas/DirectoryListing" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -354,13 +355,37 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "422": { $ref: "#/components/responses/Unprocessable" }
+  /v1/workspaces/{workspaceId}/files/stat:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getv1_workspaces_workspaceId_files_stat
+      tags: [Files]
+      summary: Stat a single path
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Entry metadata
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatEntry" }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
   /v1/workspaces/{workspaceId}/files/content:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
     get:
       operationId: getv1_workspaces_workspaceId_files_content
       tags: [Files]
-      summary: Read a file
+      summary: Read a file (whole or a range)
+      description: "Byte params (offset/limit) and line params (start_line/end_line) are mutually exclusive. sha256 is the hash of exactly the returned bytes; whole_file is true only when the response contains the entire file."
       parameters:
         - name: path
           in: query
@@ -372,6 +397,19 @@ paths:
         - name: meta
           in: query
           schema: { type: boolean }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0 }
+        - name: limit
+          in: query
+          description: "Maximum bytes; must not exceed caps.file_read_mb."
+          schema: { type: integer, minimum: 0 }
+        - name: start_line
+          in: query
+          schema: { type: integer, minimum: 1 }
+        - name: end_line
+          in: query
+          schema: { type: integer, minimum: 1 }
       responses:
         "200":
           description: File bytes or JSON metadata wrapper
@@ -379,10 +417,14 @@ paths:
             application/octet-stream:
               schema: { type: string, format: binary }
             application/json:
-              schema: { $ref: "#/components/schemas/FileContentMeta" }
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/FileContentMeta"
+                  - $ref: "#/components/schemas/FileLinesMeta"
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "422": { $ref: "#/components/responses/Unprocessable" }
     put:
       operationId: putv1_workspaces_workspaceId_files_content
@@ -406,6 +448,30 @@ paths:
         "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "422": { $ref: "#/components/responses/Unprocessable" }
         "507": { $ref: "#/components/responses/InsufficientStorage" }
+  /v1/workspaces/{workspaceId}/files/download:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getv1_workspaces_workspaceId_files_download
+      tags: [Files]
+      summary: Download the entire file
+      description: "Streams the whole file with constant memory. Exempt from caps.file_read_mb (that cap governs inline viewing); still bounded by the workspace disk quota."
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: File bytes
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
   /v1/workspaces/{workspaceId}/files/mkdir:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -965,6 +1031,7 @@ components:
         - session_ended
         - validation
         - unprocessable
+        - not_directory
         - payload_too_large
         - insufficient_storage
         - timeout
@@ -1087,29 +1154,87 @@ components:
         limits: { $ref: "#/components/schemas/Limits" }
     Entry:
       type: object
-      required: [name, path, type, size, mod_time]
+      required: [name, path, type, size, mode, mod_time]
+      properties:
+        name: { type: string }
+        path: { type: string }
+        type: { type: string, enum: [file, dir, symlink] }
+        size: { type: integer, format: int64, description: "Entry size in bytes; 0 for a directory." }
+        mode: { type: string, description: "Octal permission string, e.g. 0644." }
+        mod_time: { type: string, format: date-time }
+        target: { type: string, description: "Raw link target; only for a symlink." }
+        target_inside: { type: boolean, description: "Whether a symlink resolves inside the workspace; only for a symlink." }
+    DirectoryListing:
+      type: object
+      required: [path, entries, count, total, truncated]
+      properties:
+        path: { type: string }
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/Entry" }
+        count: { type: integer, description: "Number of entries in this page." }
+        total: { type: integer, description: "Total number of children (for paging)." }
+        truncated: { type: boolean, description: "True when entries were omitted by the page size." }
+    StatEntry:
+      type: object
+      required: [name, path, type, size, mode, mod_time]
       properties:
         name: { type: string }
         path: { type: string }
         type: { type: string, enum: [file, dir, symlink] }
         size: { type: integer, format: int64 }
+        mode: { type: string }
         mod_time: { type: string, format: date-time }
+        target: { type: string, description: "Raw link target; only for a symlink." }
+        target_inside: { type: boolean, description: "Whether a symlink resolves inside the workspace." }
+        content_type: { type: string, description: "Detected content type; only for a regular file." }
+        sha256:
+          type: string
+          description: "Hex sha256 of the whole file; only for a regular file."
+        binary:
+          type: boolean
+          description: "Bounded binary detection (NUL or invalid UTF-8 in a leading sample); only for a regular file."
     FileContentMeta:
       type: object
-      required: [path, content, encoding, size]
+      required: [path, content, encoding, size, total_size, range, whole_file, sha256, truncated, binary]
+      description: "Byte-range read. sha256 is the hash of exactly the returned bytes; whole_file is true only when the response contains the entire file."
       properties:
         path: { type: string }
         content: { type: string }
         encoding: { type: string, enum: [text, base64] }
-        size: { type: integer, format: int64 }
+        size: { type: integer, format: int64, description: "Total file size in bytes." }
+        total_size: { type: integer, format: int64 }
+        range:
+          type: object
+          required: [offset, length]
+          properties:
+            offset: { type: integer, format: int64 }
+            length: { type: integer, format: int64 }
+        whole_file: { type: boolean }
         sha256: { type: string }
         content_type: { type: string }
         truncated: { type: boolean }
+        binary: { type: boolean }
+    FileLinesMeta:
+      type: object
+      required: [path, content, encoding, start_line, end_line, line_count, total_lines, sha256, truncated, binary]
+      description: "Line-range read (start_line/end_line, 1-based inclusive). sha256 is the hash of exactly the returned bytes."
+      properties:
+        path: { type: string }
+        content: { type: string }
+        encoding: { type: string, enum: [text, base64] }
+        start_line: { type: integer, format: int64 }
+        end_line: { type: integer, format: int64 }
+        line_count: { type: integer, format: int64 }
+        total_lines: { type: integer, format: int64 }
+        sha256: { type: string }
+        truncated: { type: boolean }
+        binary: { type: boolean }
     PutFileRequest:
       type: object
       required: [content]
       properties:
-        content: { type: string }
+        content: { type: string, description: "Required. An explicit empty string writes a 0-byte file." }
         encoding: { type: string, enum: [text, base64], default: text }
     ExecRequest:
       type: object

@@ -13,6 +13,7 @@ const (
 	CodeConflict        = "conflict"
 	CodeValidation      = "validation"
 	CodeUnprocessable   = "unprocessable"
+	CodeNotDirectory    = "not_directory"
 	CodePayloadTooLarge = "payload_too_large"
 	CodeTimeout         = "timeout"
 	CodeUnavailable     = "unavailable"
