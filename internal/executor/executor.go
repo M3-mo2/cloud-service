@@ -97,14 +97,10 @@ type Request struct {
 	// empty network namespace (never the host's).
 	NetnsPath string
 	// ResolverConf, when set, is a host path bind-mounted read-only at
-	// /etc/resolv.conf so an allow_net workspace can resolve names through the
-	// engine's userspace egress proxy. Empty renders no resolver mount.
+	// /etc/resolv.conf so an allow_net workspace can resolve names. It names
+	// public resolvers, never the host's: the workspace reaches them through
+	// the chained slirp4netns egress. Empty renders no resolver mount.
 	ResolverConf string
-	// EgressEnv carries fixed KEY=VALUE proxy variables (HTTP_PROXY, ...)
-	// injected into an allow_net workspace so its tools use the engine's
-	// userspace egress proxy. They are service-chosen addresses, never
-	// caller-supplied.
-	EgressEnv []string
 
 	// ProcessKind / ProcessSource tag the sandbox with the identity of the work
 	// it belongs to ("run"/"session"/"exec" and the run/session id). The tag is

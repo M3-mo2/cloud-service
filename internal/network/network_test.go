@@ -4,50 +4,72 @@ import (
 	"testing"
 )
 
-func TestParseHostRange(t *testing.T) {
-	lo, hi, err := parseHostRange("32000-32999")
-	if err != nil || lo != 32000 || hi != 32999 {
-		t.Fatalf("got %d-%d err=%v", lo, hi, err)
-	}
-	for _, bad := range []string{"", "32000", "abc-10", "10-abc", "0-10", "10-70000", "100-50"} {
-		if _, _, err := parseHostRange(bad); err == nil {
-			t.Errorf("parseHostRange(%q) should fail", bad)
-		}
-	}
-}
-
 func TestAllocatorReserveRelease(t *testing.T) {
-	a := newAllocator(mustPrefix("10.200.0.0/16").Addr(), 1<<14)
+	a := newAllocator(mustPrefix("10.201.0.0/16").Addr(), 1<<8)
 	one, err := a.reserve("ws_1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if one.HubAddr.String() != "10.200.0.1" || one.GuestAddr.String() != "10.200.0.2" {
-		t.Fatalf("first /30 wrong: hub=%s guest=%s", one.HubAddr, one.GuestAddr)
+	if one.CIDR.String() != "10.201.0.0/24" {
+		t.Fatalf("first /24 wrong: %s", one.CIDR)
+	}
+	if one.GuestAddr.String() != "10.201.0.100" || one.GatewayAddr.String() != "10.201.0.2" {
+		t.Fatalf("addresses wrong: guest=%s gw=%s", one.GuestAddr, one.GatewayAddr)
 	}
 	two, err := a.reserve("ws_2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if two.HubAddr.String() != "10.200.0.5" || two.GuestAddr.String() != "10.200.0.6" {
-		t.Fatalf("second /30 wrong: hub=%s guest=%s", two.HubAddr, two.GuestAddr)
+	if two.CIDR.String() != "10.201.1.0/24" {
+		t.Fatalf("second /24 wrong: %s", two.CIDR)
 	}
 	// Idempotent.
 	again, err := a.reserve("ws_1")
-	if err != nil || again.HubAddr != one.HubAddr {
+	if err != nil || again.CIDR != one.CIDR {
 		t.Fatalf("reserve must be idempotent: %v %v", again, err)
 	}
 	// Release and reuse.
 	a.release("ws_1")
-	if _, ok := a.byAddr[one.HubAddr]; ok {
-		t.Fatal("released address still indexed")
+	if _, ok := a.byWS["ws_1"]; ok {
+		t.Fatal("released workspace still indexed")
 	}
-	three, err := a.reserve("ws_3")
-	if err != nil {
-		t.Fatal(err)
+	if _, ok := a.byIndex[0]; ok {
+		t.Fatal("released index still indexed")
 	}
-	if three.HubAddr == two.HubAddr {
-		t.Fatal("collision after release")
+}
+
+func TestMatchTunnelURL(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"INF |  https://random-words-here.trycloudflare.com  |", "https://random-words-here.trycloudflare.com"},
+		{"https://api.trycloudflare.com", ""},
+		{"no url here", ""},
+		{"INF Requesting new quick Tunnel on trycloudflare.com...\nINF https://calm-piano-abc.trycloudflare.com", "https://calm-piano-abc.trycloudflare.com"},
+		// api.trycloudflare.com plus the real URL: only the real one matches.
+		{"api.trycloudflare.com https://real-one.trycloudflare.com", "https://real-one.trycloudflare.com"},
+	}
+	for _, c := range cases {
+		if got := matchTunnelURL(c.in); got != c.want {
+			t.Errorf("matchTunnelURL(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestIsQuickTunnelArgs(t *testing.T) {
+	if !isQuickTunnelArgs([]string{"cloudflared", "tunnel", "--no-autoupdate", "--url", "http://localhost:5000"}) {
+		t.Error("quick tunnel args must be recognised")
+	}
+	if !isQuickTunnelArgs([]string{"cloudflared", "tunnel", "--url=http://localhost:5000"}) {
+		t.Error("--url= form must be recognised")
+	}
+	// A named/token tunnel is not a quick tunnel and must not be reaped.
+	if isQuickTunnelArgs([]string{"cloudflared", "tunnel", "--token", "abc", "run", "my-tunnel"}) {
+		t.Error("a named tunnel must not be treated as a quick tunnel")
+	}
+	if isQuickTunnelArgs([]string{"cloudflared", "tunnel", "run", "my-tunnel"}) {
+		t.Error("a run tunnel must not be treated as a quick tunnel")
 	}
 }
 
@@ -64,27 +86,11 @@ func TestShortIDStable(t *testing.T) {
 	}
 }
 
-func TestWriteHTTPError(t *testing.T) {
-	var buf writer
-	writeHTTPError(&buf, 502, "port_unreachable", "not reachable")
-	got := buf.String()
-	for _, want := range []string{"HTTP/1.1 502 Bad Gateway", `"code":"port_unreachable"`, `"message":"not reachable"`} {
-		if !contains(got, want) {
-			t.Errorf("missing %q in %q", want, got)
-		}
+func TestShellQuote(t *testing.T) {
+	if got := shellQuote("/run/netns/sbxdrelay"); got != "'/run/netns/sbxdrelay'" {
+		t.Fatalf("shellQuote = %q", got)
 	}
-}
-
-type writer struct{ b []byte }
-
-func (w *writer) Write(p []byte) (int, error) { w.b = append(w.b, p...); return len(p), nil }
-func (w *writer) String() string              { return string(w.b) }
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
+	if got := shellQuote("a'b"); got != `'a'\''b'` {
+		t.Fatalf("shellQuote escaping = %q", got)
 	}
-	return false
 }

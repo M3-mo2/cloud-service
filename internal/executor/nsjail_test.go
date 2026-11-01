@@ -157,7 +157,6 @@ func TestRenderConfigJoinsWorkspaceNetns(t *testing.T) {
 		Argv:          []string{"/bin/true"},
 		NetnsPath:     "/run/netns/sbxdws-abc123",
 		ResolverConf:  "/data/tmp/egress-resolv-abc123.conf",
-		EgressEnv:     []string{"HTTP_PROXY=http://10.200.0.1:3128"},
 	}, "/tmp/rt")
 	if err != nil {
 		t.Fatal(err)
@@ -169,9 +168,6 @@ func TestRenderConfigJoinsWorkspaceNetns(t *testing.T) {
 	}
 	if !strings.Contains(out, "/data/tmp/egress-resolv-abc123.conf") {
 		t.Errorf("the generated egress resolver must be mounted:\n%s", out)
-	}
-	if !strings.Contains(out, "HTTP_PROXY=http://10.200.0.1:3128") {
-		t.Errorf("the egress proxy env must be injected:\n%s", out)
 	}
 }
 

@@ -205,8 +205,8 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 	// Prepare the workspace's isolated network before recording the run, so a
 	// networking failure refuses the request instead of leaving a queued run
 	// that can never get a sandbox.
-	if _, err := s.EnsureWorkspaceNetwork(w.ID); err != nil {
-		return nil, model.New(503, model.CodeUnavailable, "workspace network unavailable: "+err.Error())
+	if err := s.EnsureWorkspaceNetwork(w); err != nil {
+		return nil, err
 	}
 
 	// Resolve the two package tiers before the run starts. A failure to

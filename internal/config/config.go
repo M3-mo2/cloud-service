@@ -19,55 +19,82 @@ type Config struct {
 	Caps      CapsConfig     `koanf:"caps"`
 	Packages  PackagesConfig `koanf:"packages"`
 	Sessions  SessionsConfig `koanf:"sessions"`
-	Ports     PortsConfig    `koanf:"ports"`
+	Network   NetworkConfig  `koanf:"network"`
+	Tunnels   TunnelsConfig  `koanf:"tunnels"`
 	Keys      []KeyConfig    `koanf:"keys"`
 }
 
-// PortsConfig controls published ports: mapping a host port onto a workspace's
-// own private port through the engine's forwarder. It is default-deny, exactly
-// like max_limits.allow_unlimited_runs: both Enabled (server switch) and the
-// workspace's limits.allow_ports must be true to publish.
+// NetworkConfig controls the per-workspace egress fabric. Egress is delivered by
+// chained slirp4netns instances, never by host interface/route changes: an
+// engine-owned "relay" namespace is connected to the host through one
+// slirp4netns instance, and each workspace namespace is connected to the relay
+// through a second slirp4netns instance. The relay carries a blackhole route for
+// every private range, so a workspace can reach the public internet and DNS but
+// never the host LAN, the host's own services, or another workspace.
 //
-// The bind address exists so a future in-host Cloudflare tunnel (phase 2) can
-// point at the forwarder without a refactor; see docs/DECISIONS.md.
-type PortsConfig struct {
-	// Enabled is the server-level switch. False (the default) refuses every
-	// publish with 422 ports_disabled.
+// The whole layer is opt-in per workspace (limits.allow_net). When the required
+// tools are missing the layer reports unavailable and allow_net workspaces fall
+// back to an empty namespace (no egress), never to the host network.
+type NetworkConfig struct {
+	// Enabled is the server-level switch. When false, no relay or workspace
+	// namespace is created and allow_net workspaces get an empty namespace.
 	Enabled bool `koanf:"enabled"`
-	// HostRange is the inclusive host-port range the engine allocates from,
-	// "lo-hi" (default 32000-32999). A host port outside this range is never
-	// allocated, so the forwarder can never bind an operator port.
-	HostRange string `koanf:"host_range"`
-	// BindAddr is the address the forwarder listens on (default 127.0.0.1). A
-	// future local tunnel process binds nothing itself: it connects to this
-	// address.
-	BindAddr string `koanf:"bind_addr"`
-	// MaxPerWorkspace caps published ports per workspace (default 2).
+	// NetnsDir is where the engine's namespaces are bind-mounted (default
+	// /run/netns). The engine never uses `ip netns add`; it creates namespaces
+	// with unshare and bind-mounts them here (see internal/network).
+	NetnsDir string `koanf:"netns_dir"`
+	// RelayNetns is the name of the shared intermediate namespace under
+	// NetnsDir (default sbxdrelay).
+	RelayNetns string `koanf:"relay_netns"`
+	// SlirpPath is the slirp4netns binary (default slirp4netns). It is the only
+	// way a workspace is given outbound internet: it speaks to the host over a
+	// UNIX socket, so zero host interfaces or routes are created.
+	SlirpPath string `koanf:"slirp_path"`
+	// MTU is passed to each slirp instance (default 65520, the measured-working
+	// value on the target host).
+	MTU int `koanf:"mtu"`
+	// Resolver is the public DNS resolver list written into each allow_net
+	// workspace's /etc/resolv.conf (default 1.1.1.1 and 8.8.8.8). The host's
+	// own resolver is deliberately never published to a workspace.
+	Resolver []string `koanf:"resolver"`
+	// StartTimeoutMS bounds how long a slirp instance is given to configure its
+	// tap before the interface is treated as up (default 5000).
+	StartTimeoutMS int `koanf:"start_timeout_ms"`
+}
+
+// TunnelsConfig controls quick Cloudflare tunnels (cloudflared), exposing one
+// workspace port to the public internet. It is default-deny, exactly like
+// allow_unlimited_runs: both Enabled (server switch) and the workspace's
+// limits.allow_tunnels must be true to create a tunnel. A tunnel also requires
+// the workspace to have allow_net (cloudflared needs egress to Cloudflare).
+//
+// Quick tunnels need no Cloudflare account and no token: cloudflared prints a
+// random https://<name>.trycloudflare.com URL. The engine only ever returns a
+// URL it actually observed on cloudflared's own output.
+type TunnelsConfig struct {
+	// Enabled is the server-level switch. False (the default) refuses every
+	// create with 422 tunnels_disabled.
+	Enabled bool `koanf:"enabled"`
+	// MaxPerWorkspace caps concurrent tunnels per workspace (default 2).
 	MaxPerWorkspace int `koanf:"max_per_workspace"`
-	// MaxPerPrincipal caps published ports across all of a principal's
-	// workspaces (default 5).
-	MaxPerPrincipal int `koanf:"max_per_principal"`
-	// MaxConns caps concurrent connections a single published port accepts
-	// (default 64). A slow client cannot pin a slot forever because of the
-	// idle timeout below.
-	MaxConns int `koanf:"max_conns"`
-	// ConnectTimeoutMS bounds the forwarder's dial into the workspace (default
-	// 1000). An unreachable app therefore fails fast with 502.
-	ConnectTimeoutMS int `koanf:"connect_timeout_ms"`
-	// IdleTimeoutMS bounds how long a connection may sit idle (no bytes in
-	// either direction) before it is closed (default 60000). This is the
-	// half-open/slow-client guard.
-	IdleTimeoutMS int `koanf:"idle_timeout_ms"`
+	// URLTimeoutSec bounds how long the engine waits for cloudflared to print
+	// its public URL before failing with 504 tunnel_url_not_observed (default
+	// 45). It bounds the wait; it never fabricates a URL.
+	URLTimeoutSec int `koanf:"url_timeout_sec"`
+	// CloudflaredPath is the cloudflared binary (default cloudflared). It is
+	// also visible inside a workspace on PATH (the sandbox mounts /usr), so the
+	// user's own `cloudflared tunnel --url http://localhost:PORT` works too.
+	CloudflaredPath string `koanf:"cloudflared_path"`
 }
 
-// ConnectTimeout returns the forward-dial timeout.
-func (p PortsConfig) ConnectTimeout() time.Duration {
-	return time.Duration(p.ConnectTimeoutMS) * time.Millisecond
+// URLTimeout returns the bounded wait for a tunnel URL.
+func (t TunnelsConfig) URLTimeout() time.Duration {
+	return time.Duration(t.URLTimeoutSec) * time.Second
 }
 
-// IdleTimeout returns the per-connection idle timeout.
-func (p PortsConfig) IdleTimeout() time.Duration {
-	return time.Duration(p.IdleTimeoutMS) * time.Millisecond
+// StartTimeout returns the slirp tap-configuration bound.
+func (n NetworkConfig) StartTimeout() time.Duration {
+	return time.Duration(n.StartTimeoutMS) * time.Millisecond
 }
 
 // SessionsConfig controls first-class server-side terminal sessions.
@@ -202,11 +229,12 @@ type LimitsConfig struct {
 	// an unlimited run is accepted only when both are true; otherwise 422.
 	// Default is false (deny).
 	AllowUnlimitedRuns bool `koanf:"allow_unlimited_runs"`
-	// AllowPorts opts a workspace in to published ports (the per-workspace half
-	// of the two-key switch). It is meaningful only in `limits:`; in
-	// `max_limits:` the server-level switch is ports.enabled. Both must be true
-	// to publish; otherwise 422 ports_disabled. Default false (deny).
-	AllowPorts bool `koanf:"allow_ports"`
+	// AllowTunnels opts a workspace in to quick Cloudflare tunnels (the
+	// per-workspace half of the two-key switch). It is meaningful only in
+	// `limits:`; in `max_limits:` the server-level switch is tunnels.enabled.
+	// Both must be true to create a tunnel; otherwise 422 tunnels_disabled.
+	// Default false (deny).
+	AllowTunnels bool `koanf:"allow_tunnels"`
 }
 
 // CapsConfig holds hard output/body caps. Sizes are expressed in the unit named
@@ -317,15 +345,20 @@ func Default() Config {
 			KillGraceSec:    3,
 			StartProbeMS:    250,
 		},
-		Ports: PortsConfig{
-			Enabled:          false,
-			HostRange:        "32000-32999",
-			BindAddr:         "127.0.0.1",
-			MaxPerWorkspace:  2,
-			MaxPerPrincipal:  5,
-			MaxConns:         64,
-			ConnectTimeoutMS: 1000,
-			IdleTimeoutMS:    60000,
+		Network: NetworkConfig{
+			Enabled:        false,
+			NetnsDir:       "/run/netns",
+			RelayNetns:     "sbxdrelay",
+			SlirpPath:      "slirp4netns",
+			MTU:            65520,
+			Resolver:       []string{"1.1.1.1", "8.8.8.8"},
+			StartTimeoutMS: 5000,
+		},
+		Tunnels: TunnelsConfig{
+			Enabled:         false,
+			MaxPerWorkspace: 2,
+			URLTimeoutSec:   45,
+			CloudflaredPath: "cloudflared",
 		},
 		Keys: []KeyConfig{},
 	}
@@ -463,27 +496,34 @@ func (c *Config) applyDefaults() {
 	if sess.StartProbeMS < 0 {
 		sess.StartProbeMS = d.Sessions.StartProbeMS
 	}
-	ports := &c.Ports
-	if ports.HostRange == "" {
-		ports.HostRange = d.Ports.HostRange
+	net := &c.Network
+	if net.NetnsDir == "" {
+		net.NetnsDir = d.Network.NetnsDir
 	}
-	if ports.BindAddr == "" {
-		ports.BindAddr = d.Ports.BindAddr
+	if net.RelayNetns == "" {
+		net.RelayNetns = d.Network.RelayNetns
 	}
-	if ports.MaxPerWorkspace <= 0 {
-		ports.MaxPerWorkspace = d.Ports.MaxPerWorkspace
+	if net.SlirpPath == "" {
+		net.SlirpPath = d.Network.SlirpPath
 	}
-	if ports.MaxPerPrincipal <= 0 {
-		ports.MaxPerPrincipal = d.Ports.MaxPerPrincipal
+	if net.MTU <= 0 {
+		net.MTU = d.Network.MTU
 	}
-	if ports.MaxConns <= 0 {
-		ports.MaxConns = d.Ports.MaxConns
+	if len(net.Resolver) == 0 {
+		net.Resolver = d.Network.Resolver
 	}
-	if ports.ConnectTimeoutMS <= 0 {
-		ports.ConnectTimeoutMS = d.Ports.ConnectTimeoutMS
+	if net.StartTimeoutMS <= 0 {
+		net.StartTimeoutMS = d.Network.StartTimeoutMS
 	}
-	if ports.IdleTimeoutMS <= 0 {
-		ports.IdleTimeoutMS = d.Ports.IdleTimeoutMS
+	tun := &c.Tunnels
+	if tun.MaxPerWorkspace <= 0 {
+		tun.MaxPerWorkspace = d.Tunnels.MaxPerWorkspace
+	}
+	if tun.URLTimeoutSec <= 0 {
+		tun.URLTimeoutSec = d.Tunnels.URLTimeoutSec
+	}
+	if tun.CloudflaredPath == "" {
+		tun.CloudflaredPath = d.Tunnels.CloudflaredPath
 	}
 }
 
@@ -506,7 +546,7 @@ limits:
   max_runs: 3
   allow_net: false
   allow_unlimited_runs: false
-  allow_ports: false
+  allow_tunnels: false
 max_limits:
   cpu_cores: 8
   memory_mb: 8192
@@ -539,14 +579,18 @@ sessions:
   shell: "/bin/sh"
   kill_grace_sec: 3
   start_probe_ms: 250
-ports:
+network:
   enabled: false
-  host_range: "32000-32999"
-  bind_addr: "127.0.0.1"
+  netns_dir: "/run/netns"
+  relay_netns: "sbxdrelay"
+  slirp_path: "slirp4netns"
+  mtu: 65520
+  resolver: ["1.1.1.1", "8.8.8.8"]
+  start_timeout_ms: 5000
+tunnels:
+  enabled: false
   max_per_workspace: 2
-  max_per_principal: 5
-  max_conns: 64
-  connect_timeout_ms: 1000
-  idle_timeout_ms: 60000
+  url_timeout_sec: 45
+  cloudflared_path: "cloudflared"
 `)
 }

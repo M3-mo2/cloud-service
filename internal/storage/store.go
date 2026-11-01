@@ -326,95 +326,95 @@ func (s *Store) DeleteSession(wsID, sessionID string) error {
 
 // portsDir returns the ports directory for a workspace.
 //
-// Ports are persisted as one JSON file per port under a per-workspace
-// directory, so a restart can enumerate every record and reap orphan listeners
-// that belong to no live workspace.
-func (s *Store) portsDir(wsID string) string {
-	return filepath.Join(s.WorkspaceDir(wsID), "ports")
+// Tunnels are persisted as one JSON file per tunnel under a per-workspace
+// directory, so a restart can enumerate every record and reap orphan cloudflared
+// processes that belong to no live workspace.
+func (s *Store) tunnelsDir(wsID string) string {
+	return filepath.Join(s.WorkspaceDir(wsID), "tunnels")
 }
 
-// PortPath returns the JSON path of a published port.
-func (s *Store) PortPath(wsID, portID string) string {
-	return filepath.Join(s.portsDir(wsID), portID+".json")
+// TunnelPath returns the JSON path of a tunnel.
+func (s *Store) TunnelPath(wsID, tunnelID string) string {
+	return filepath.Join(s.tunnelsDir(wsID), tunnelID+".json")
 }
 
-// CreatePort persists a new published-port record.
-func (s *Store) CreatePort(p *model.PublishedPort) error {
-	return writeJSONAtomic(s.PortPath(p.WorkspaceID, p.ID), p)
+// CreateTunnel persists a new tunnel record.
+func (s *Store) CreateTunnel(t *model.Tunnel) error {
+	return writeJSONAtomic(s.TunnelPath(t.WorkspaceID, t.ID), t)
 }
 
-// SavePort atomically rewrites a published-port record.
-func (s *Store) SavePort(p *model.PublishedPort) error {
-	return writeJSONAtomic(s.PortPath(p.WorkspaceID, p.ID), p)
+// SaveTunnel atomically rewrites a tunnel record.
+func (s *Store) SaveTunnel(t *model.Tunnel) error {
+	return writeJSONAtomic(s.TunnelPath(t.WorkspaceID, t.ID), t)
 }
 
-// GetPort loads a published port by ID.
-func (s *Store) GetPort(wsID, portID string) (*model.PublishedPort, error) {
-	var p model.PublishedPort
-	if err := readJSON(s.PortPath(wsID, portID), &p); err != nil {
+// GetTunnel loads a tunnel by ID.
+func (s *Store) GetTunnel(wsID, tunnelID string) (*model.Tunnel, error) {
+	var t model.Tunnel
+	if err := readJSON(s.TunnelPath(wsID, tunnelID), &t); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, model.ErrNotFound
 		}
 		return nil, err
 	}
-	return &p, nil
+	return &t, nil
 }
 
-// ListPorts returns all published ports for a workspace, newest first.
-func (s *Store) ListPorts(wsID string) ([]*model.PublishedPort, error) {
-	entries, err := os.ReadDir(s.portsDir(wsID))
+// ListTunnels returns all tunnels for a workspace, newest first.
+func (s *Store) ListTunnels(wsID string) ([]*model.Tunnel, error) {
+	entries, err := os.ReadDir(s.tunnelsDir(wsID))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return []*model.PublishedPort{}, nil
+			return []*model.Tunnel{}, nil
 		}
 		return nil, err
 	}
-	out := make([]*model.PublishedPort, 0, len(entries))
+	out := make([]*model.Tunnel, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
 		id := strings.TrimSuffix(e.Name(), ".json")
-		p, err := s.GetPort(wsID, id)
+		t, err := s.GetTunnel(wsID, id)
 		if err != nil {
 			continue
 		}
-		out = append(out, p)
+		out = append(out, t)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out, nil
 }
 
-// ListAllPorts returns every published port across every workspace, for
-// startup reaping.
-func (s *Store) ListAllPorts() ([]*model.PublishedPort, error) {
+// ListAllTunnels returns every tunnel across every workspace, for startup
+// reaping.
+func (s *Store) ListAllTunnels() ([]*model.Tunnel, error) {
 	entries, err := os.ReadDir(s.WorkspacesDir())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return []*model.PublishedPort{}, nil
+			return []*model.Tunnel{}, nil
 		}
 		return nil, err
 	}
-	var out []*model.PublishedPort
+	var out []*model.Tunnel
 	for _, e := range entries {
 		if !e.IsDir() || !strings.HasPrefix(e.Name(), model.WorkspaceIDPrefix) {
 			continue
 		}
-		ports, err := s.ListPorts(e.Name())
+		tunnels, err := s.ListTunnels(e.Name())
 		if err != nil {
 			continue
 		}
-		out = append(out, ports...)
+		out = append(out, tunnels...)
 	}
 	return out, nil
 }
 
-// DeletePort removes a published-port record.
-func (s *Store) DeletePort(wsID, portID string) error {
-	if !strings.HasPrefix(portID, model.PortIDPrefix) {
-		return fmt.Errorf("invalid port id %q", portID)
+// DeleteTunnel removes a tunnel record.
+func (s *Store) DeleteTunnel(wsID, tunnelID string) error {
+	if !strings.HasPrefix(tunnelID, model.TunnelIDPrefix) {
+		return fmt.Errorf("invalid tunnel id %q", tunnelID)
 	}
-	if err := os.Remove(s.PortPath(wsID, portID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(s.TunnelPath(wsID, tunnelID)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil

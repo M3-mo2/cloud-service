@@ -56,21 +56,23 @@ func main() {
 	runner := executor.NewNsjailRunner(cfg, tmplPath, store.TmpDir())
 
 	svc := service.New(cfg, store, runner, logger)
-	// Attach the isolated-network + published-port layer. When the host lacks
-	// the tools, the service still starts (runs get a fresh empty network
-	// namespace) but /readyz reports the network unavailable and ports stay
-	// unusable.
+	// Attach the isolated-network + tunnel layer. Egress is delivered by
+	// chained slirp4netns (never host interface/route changes); quick tunnels
+	// expose a workspace port with cloudflared inside the workspace namespace.
+	// When the host lacks the tools the service still starts (runs get a fresh
+	// empty network namespace) but /readyz reports the network unavailable and
+	// egress/tunnels stay unusable.
 	netMgr := network.NewManager(network.ManagerConfig{
-		WorkspaceSubnet: mustPrefix("10.200.0.0/16"),
-		HubSubnet:       mustPrefix("10.199.0.0/30"),
-		NetnsDir:        "/run/netns",
+		WorkspaceSubnet: mustPrefix("10.201.0.0/16"),
+		NetnsDir:        cfg.Network.NetnsDir,
+		RelayNetns:      cfg.Network.RelayNetns,
 		ResolverDir:     store.TmpDir(),
-		Ports:           cfg.Ports,
-		Egress:          &network.EgressConfig{ProxyPort: 3128, DNSPort: 53},
+		Network:         cfg.Network,
+		Tunnels:         cfg.Tunnels,
 	})
-	if cfg.Ports.Enabled {
-		if err := netMgr.EnsureHub(); err != nil {
-			logger.Error("network hub setup failed", "error", err)
+	if cfg.Network.Enabled {
+		if err := netMgr.EnsureRelay(); err != nil {
+			logger.Error("network relay setup failed; allow_net workspaces will have no egress", "error", err)
 		}
 	}
 	svc.SetNetwork(netMgr)
@@ -92,14 +94,14 @@ func main() {
 	if n := svc.ReapOrphans(); n > 0 {
 		logger.Info("reaped orphaned sandbox cgroups", "count", n)
 	}
-	// The same discipline for the network: no workspace namespace, veth or
-	// published-port listener survives a restart, so anything present on the way
-	// in is reaped.
+	// The same discipline for the network: no workspace namespace, relay or
+	// slirp process survives a restart, so anything present on the way in is
+	// reaped.
 	if n := netMgr.ReapOrphans(nil); n > 0 {
 		logger.Info("reaped orphaned workspace networks", "count", n)
 	}
-	if n := svc.ReapWorkspacePorts(); n > 0 {
-		logger.Info("reaped orphaned published ports", "count", n)
+	if n := svc.ReapWorkspaceTunnels(); n > 0 {
+		logger.Info("reaped orphaned tunnels", "count", n)
 	}
 	authn := auth.New(cfg.Keys)
 	server := api.NewServer(svc, authn, logger)

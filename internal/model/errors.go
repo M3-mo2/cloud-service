@@ -38,25 +38,24 @@ const (
 	// return not_found instead.
 	CodeSessionEnded = "session_ended"
 
-	// CodePortUnreachable is returned (HTTP 502) when a request reaches a
-	// published port's forwarder but nothing answers inside the workspace
-	// (the app never bound, bound only to 127.0.0.1, or has exited). It is a
-	// distinct machine-readable code so a client can tell a live mapping whose
-	// app is down from a mapping that does not exist (not_found) or a broken
-	// engine (a bare 500). The port record is honest: its status is
-	// `unreachable`.
-	CodePortUnreachable = "port_unreachable"
+	// CodeTunnelsDisabled is returned (HTTP 422) when a tunnel is created for a
+	// workspace that has not opted in (limits.allow_tunnels=false) or when the
+	// server-level tunnels.enabled switch is false. Creating a tunnel therefore
+	// requires both keys, exactly like allow_unlimited_runs. It is also returned
+	// when a workspace has not opted in to egress (limits.allow_net), which
+	// cloudflared needs.
+	CodeTunnelsDisabled = "tunnels_disabled"
 
-	// CodePortsDisabled is returned (HTTP 422) when a port is published for a
-	// workspace that has not opted in (limits.allow_ports=false) or when the
-	// server-level ports.enabled switch is false. Publishing therefore requires
-	// both keys, exactly like allow_unlimited_runs.
-	CodePortsDisabled = "ports_disabled"
+	// CodeTooManyTunnels is returned (HTTP 422) when creating a tunnel would
+	// exceed tunnels.max_per_workspace. The message names the limit; nothing
+	// extra is created.
+	CodeTooManyTunnels = "too_many_tunnels"
 
-	// CodeTooManyPorts is returned (HTTP 422) when publishing would exceed the
-	// configured per-workspace or per-principal cap. The message names the
-	// limit; nothing extra is published.
-	CodeTooManyPorts = "too_many_ports"
+	// CodeTunnelURLUnavailable is returned (HTTP 504) when cloudflared was
+	// started but did not print a public URL within tunnels.url_timeout_sec.
+	// The engine never fabricates a URL, so the create fails with this
+	// machine-readable reason instead of returning a URL it did not observe.
+	CodeTunnelURLUnavailable = "tunnel_url_unavailable"
 )
 
 // Error is the canonical API error, carrying an HTTP mapping and a code.

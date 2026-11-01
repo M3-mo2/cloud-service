@@ -4,14 +4,16 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
+	"time"
 
+	"sandboxd/internal/config"
 	"sandboxd/internal/network"
 )
 
 // fakeNetwork is an in-memory service.Network for API/service tests. It models
-// the isolated-network bookkeeping and the published-port forwarder without
+// the isolated-egress bookkeeping and the quick-tunnel lifecycle without
 // touching the host, so the HTTP contract (status codes, ownership, caps,
-// honest status) can be asserted deterministically.
+// honest URL/status) can be asserted deterministically.
 type fakeNetwork struct {
 	mu sync.Mutex
 
@@ -19,51 +21,56 @@ type fakeNetwork struct {
 	ready     bool
 	reason    string
 
-	// enabled controls PortsReady (ports.enabled).
-	enabled bool
+	// egress controls EgressEnabled (network.enabled).
+	egress bool
+	// tunnelsEnabled / tunnelsReady control the tunnel capability.
+	tunnelsEnabled bool
+	tunnelsReady   bool
+	tunnelsReason  string
 
-	// reachable maps "wsID:port" -> true when the workspace "is listening".
-	reachable map[string]bool
+	// url, when non-empty, is the URL StartTunnel returns; tunnelErr forces a
+	// failure instead.
+	url       string
+	tunnelErr error
 
 	// allocs maps wsID -> guest address.
 	allocs map[string]string
 	// nextIdx increments per workspace.
 	nextIdx int
 
-	// listeners maps portID -> bound host port.
-	listeners map[string]int
-	// usedHostPorts tracks every handed-out host port.
-	usedHostPorts map[int]bool
-	// hostRange is the allocation range.
-	hostLo, hostHi int
-	// startReachabilityError, when set, is used by EnsureWorkspace? (unused)
+	// running holds the live tunnels keyed by tunnel id -> workspace id.
+	running map[string]string
 }
 
 func newFakeNetwork() *fakeNetwork {
 	return &fakeNetwork{
-		available:     true,
-		ready:         true,
-		reachable:     map[string]bool{},
-		allocs:        map[string]string{},
-		listeners:     map[string]int{},
-		usedHostPorts: map[int]bool{},
-		hostLo:        32000,
-		hostHi:        32999,
+		available:      true,
+		ready:          true,
+		egress:         true,
+		tunnelsEnabled: true,
+		tunnelsReady:   true,
+		url:            "https://fake-tunnel.trycloudflare.com",
+		allocs:         map[string]string{},
+		running:        map[string]string{},
 	}
 }
 
-func (f *fakeNetwork) Available() bool { return f.available }
-
-func (f *fakeNetwork) EnsureHub() error { return nil }
+func (f *fakeNetwork) Available() bool       { return f.available }
+func (f *fakeNetwork) Ready() (bool, string) { return f.ready, f.reason }
+func (f *fakeNetwork) EgressEnabled() bool   { return f.egress }
 
 func (f *fakeNetwork) EnsureWorkspace(wsID string) (*network.Allocation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.allocs[wsID]; !ok {
 		f.nextIdx++
-		f.allocs[wsID] = fmt.Sprintf("10.200.%d.2", f.nextIdx)
+		f.allocs[wsID] = fmt.Sprintf("10.201.%d.100", f.nextIdx)
 	}
 	return &network.Allocation{WorkspaceID: wsID, GuestAddr: fakeAddr(f.allocs[wsID])}, nil
+}
+
+func (f *fakeNetwork) EnsureEmptyWorkspace(wsID string) (string, error) {
+	return "/run/netns/sbxdws-" + wsID, nil
 }
 
 func (f *fakeNetwork) ReleaseWorkspace(wsID string) {
@@ -79,84 +86,73 @@ func (f *fakeNetwork) HasWorkspace(wsID string) bool {
 	return ok
 }
 
-func (f *fakeNetwork) AllocationAddr(wsID string) (string, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	a, ok := f.allocs[wsID]
-	return a, ok
-}
-
-func (f *fakeNetwork) ProbePort(wsID string, port int) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.reachable[fmt.Sprintf("%s:%d", wsID, port)]
-}
-
-func (f *fakeNetwork) PickHostPort(used map[int]bool) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for p := f.hostLo; p <= f.hostHi; p++ {
-		if used[p] || f.usedHostPorts[p] {
-			continue
-		}
-		f.usedHostPorts[p] = true
-		return p, nil
-	}
-	return 0, fmt.Errorf("no free host port")
-}
-
-func (f *fakeNetwork) StartForwarder(portID string, hostPort int, targetAddr string, targetPort int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.listeners[portID] = hostPort
-	return nil
-}
-
-func (f *fakeNetwork) StopForwarder(portID string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.listeners, portID)
-}
-
-func (f *fakeNetwork) PortsReady() (bool, string) {
-	if !f.enabled {
-		return false, "ports.enabled is false"
-	}
-	return f.ready, f.reason
-}
-
-func (f *fakeNetwork) Ready() (bool, string) { return f.ready, f.reason }
-
-func (f *fakeNetwork) EgressEnabled() bool { return false }
-
 func (f *fakeNetwork) NetnsPathFor(wsID string) string {
-	return "/run/netns/sbxdws-fake"
+	return "/run/netns/sbxdws-" + wsID
 }
-
-func (f *fakeNetwork) ResolverConfPath() string { return "" }
 
 func (f *fakeNetwork) WriteResolverConf(alloc *network.Allocation) (string, error) {
-	return "", fmt.Errorf("no egress in fake")
+	return "/data/tmp/egress-resolv-" + alloc.WorkspaceID + ".conf", nil
 }
-
-func (f *fakeNetwork) EgressEnv(alloc *network.Allocation) map[string]string { return nil }
 
 func (f *fakeNetwork) ReapOrphans(live map[string]bool) int { return 0 }
 
 func (f *fakeNetwork) Stop() {}
 
-// listenerCount returns how many forwarders are live.
-func (f *fakeNetwork) listenerCount() int {
+func (f *fakeNetwork) StartTunnel(wsID, tunnelID string, port int, resolvConf string, timeout time.Duration) (*network.TunnelStart, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.listeners)
+	if f.tunnelErr != nil {
+		return nil, f.tunnelErr
+	}
+	f.running[tunnelID] = wsID
+	return &network.TunnelStart{URL: f.url, PID: 4242}, nil
 }
 
-// setReachable marks a workspace port as listening.
-func (f *fakeNetwork) setReachable(wsID string, port int, up bool) {
+func (f *fakeNetwork) StopTunnel(tunnelID string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.reachable[fmt.Sprintf("%s:%d", wsID, port)] = up
+	_, ok := f.running[tunnelID]
+	delete(f.running, tunnelID)
+	return ok
+}
+
+func (f *fakeNetwork) StopWorkspaceTunnels(wsID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, owner := range f.running {
+		if owner == wsID {
+			delete(f.running, id)
+		}
+	}
+}
+
+func (f *fakeNetwork) TunnelRunning(tunnelID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.running[tunnelID]
+	return ok
+}
+
+func (f *fakeNetwork) ReapTunnels(live map[string]bool) int { return 0 }
+
+func (f *fakeNetwork) TunnelsEnabled() bool { return f.tunnelsEnabled }
+
+func (f *fakeNetwork) TunnelsReady() (bool, string) {
+	if !f.tunnelsEnabled {
+		return false, "tunnels.enabled is false"
+	}
+	return f.tunnelsReady, f.tunnelsReason
+}
+
+func (f *fakeNetwork) TunnelsConfig() config.TunnelsConfig {
+	return config.TunnelsConfig{Enabled: f.tunnelsEnabled, MaxPerWorkspace: 2, URLTimeoutSec: 1}
+}
+
+// tunnelCount returns how many tunnels are live.
+func (f *fakeNetwork) tunnelCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.running)
 }
 
 func fakeAddr(s string) netip.Addr {

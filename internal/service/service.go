@@ -79,7 +79,7 @@ func (s *Service) CreateWorkspace(principalID, name string, limits *model.Limits
 	lim := s.defaultLimits()
 	if limits != nil {
 		lim = applyLimits(lim, *limits)
-		if err := checkMaxima(lim, s.maxLimits(), s.cfg.Ports.Enabled); err != nil {
+		if err := checkMaxima(lim, s.maxLimits(), s.cfg.Tunnels.Enabled); err != nil {
 			return nil, err
 		}
 	}
@@ -100,7 +100,7 @@ func (s *Service) CreateWorkspace(principalID, name string, limits *model.Limits
 }
 
 // checkMaxima rejects a limits value that exceeds any server-level maximum.
-func checkMaxima(l, max model.Limits, portsEnabled bool) error {
+func checkMaxima(l, max model.Limits, tunnelsEnabled bool) error {
 	switch {
 	case l.CPUCores > max.CPUCores:
 		return maxExceeded("cpu_cores", l.CPUCores, max.CPUCores)
@@ -114,8 +114,8 @@ func checkMaxima(l, max model.Limits, portsEnabled bool) error {
 		return maxExceeded("max_runs", l.MaxRuns, max.MaxRuns)
 	case l.AllowUnlimitedRuns && !max.AllowUnlimitedRuns:
 		return UnlimitedForbiddenByServer()
-	case l.AllowPorts && !portsEnabled:
-		return PortsForbiddenByServer()
+	case l.AllowTunnels && !tunnelsEnabled:
+		return TunnelsForbiddenByServer()
 	}
 	return nil
 }
@@ -159,7 +159,7 @@ func (s *Service) defaultLimits() model.Limits {
 		MaxRuns:            l.MaxRuns,
 		AllowNet:           l.AllowNet,
 		AllowUnlimitedRuns: l.AllowUnlimitedRuns,
-		AllowPorts:         l.AllowPorts,
+		AllowTunnels:       l.AllowTunnels,
 	}
 }
 
@@ -182,7 +182,7 @@ func applyLimits(base, over model.Limits) model.Limits {
 	}
 	base.AllowNet = over.AllowNet
 	base.AllowUnlimitedRuns = over.AllowUnlimitedRuns
-	base.AllowPorts = over.AllowPorts
+	base.AllowTunnels = over.AllowTunnels
 	return base
 }
 
@@ -216,9 +216,9 @@ func (s *Service) DeleteWorkspace(id, principalID string) error {
 	s.StopWorkspaceSessions(w.ID, model.SessionReasonWorkspaceDeleted)
 	// A detached process started from a session must not outlive the workspace.
 	s.StopDetachedProcesses(w)
-	// Ports die with the workspace: stop every forwarder and drop the records
-	// before the tree is removed.
-	s.ReleaseWorkspacePorts(w)
+	// Tunnels die with the workspace: stop every cloudflared process and drop
+	// the records before the tree is removed.
+	s.ReleaseWorkspaceTunnels(w)
 	if err := s.store.DeleteWorkspace(w.ID); err != nil {
 		return err
 	}

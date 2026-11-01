@@ -6,71 +6,58 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"sandboxd/internal/config"
 )
 
-// Fixed names for the engine-owned hub namespace and the host<->hub link. The
-// hub is a peer namespace, not the host namespace: the host sees only the
-// host-side veth of this one link, and the workspace subnet is never present in
-// the host routing table.
+// Fixed names/values for the engine-owned relay namespace. The relay is a peer
+// namespace, not the host namespace: slirp4netns connects it to the host, and
+// each workspace connects to it through a second slirp4netns. Nothing here
+// touches the host's interfaces or routing table.
 const (
-	hubNetnsName = "sbxdhub"
-	hubHostIface = "sbxdh0"
-	hubIface     = "sbxdh1"
-	// netnsNamePrefix marks the namespaces this package owns, so reaping can
-	// identify leftovers without touching anything else under NetnsDir.
+	// netnsNamePrefix marks the workspace namespaces this package owns, so
+	// reaping can identify leftovers without touching anything else under
+	// NetnsDir.
 	netnsNamePrefix = "sbxdws-"
-	// ifaceNamePrefix marks the per-workspace hub-side veths.
-	ifaceNamePrefix = "sbxw"
-	// guestIface is the interface name inside a workspace's own namespace. The
-	// name is local to each namespace, so every workspace can use "eth0".
-	guestIface = "eth0"
+	// privateBlackholes are the operator's private ranges. The relay installs a
+	// blackhole route for each, so a workspace that resolves a private address
+	// (or a malicious peer returns one) cannot reach the host LAN, the host's
+	// own services, or another workspace.
+	privateBlackholes = "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10"
 )
-
-// Allocation is the private network assigned to one workspace.
-type Allocation struct {
-	WorkspaceID string
-	// Index is the 1-based /30 block index inside the workspace subnet.
-	Index uint32
-	// HubAddr is the .1 address (the hub end of the workspace link).
-	HubAddr netip.Addr
-	// GuestAddr is the .2 address (the workspace's own address).
-	GuestAddr netip.Addr
-}
 
 // ManagerConfig configures the network manager.
 type ManagerConfig struct {
-	// WorkspaceSubnet is the pool of per-workspace /30 blocks (10.200.0.0/16).
+	// WorkspaceSubnet is the pool of per-workspace /24 blocks (10.201.0.0/16).
 	WorkspaceSubnet netip.Prefix
-	// HubSubnet is the /30 used for the host<->hub link; its .1 and .2 are the
-	// host and hub addresses respectively.
-	HubSubnet netip.Prefix
 	// NetnsDir is where named namespaces live (default /run/netns).
 	NetnsDir string
-	// ResolverDir is where the generated egress resolv.conf is written. It must
-	// be a stable, traversable path (e.g. the service tmp dir). Empty disables
-	// writing it.
+	// RelayNetns is the engine relay namespace name (default sbxdrelay).
+	RelayNetns string
+	// ResolverDir is where the generated per-workspace egress resolv.conf is
+	// written. It must be a stable, traversable path (e.g. the service tmp dir).
+	// Empty disables writing it.
 	ResolverDir string
-	// Ports is the published-port configuration.
-	Ports config.PortsConfig
-	// Egress, when non-nil, enables the userspace egress proxy for workspaces
-	// that opt in (allow_net). When nil, allow_net workspaces still get their
-	// own isolated namespace but have no path to the outside: egress is simply
-	// impossible, never a host-namespace share.
-	Egress *EgressConfig
+	// Network is the network configuration (tools, MTU, resolver list).
+	Network config.NetworkConfig
+	// Tunnels is the tunnel configuration (cloudflared path, url timeout).
+	Tunnels config.TunnelsConfig
 }
 
 // DefaultManagerConfig returns the measured-safe defaults for this host.
-func DefaultManagerConfig(ports config.PortsConfig) ManagerConfig {
+func DefaultManagerConfig(net config.NetworkConfig, tunnels config.TunnelsConfig) ManagerConfig {
 	return ManagerConfig{
-		WorkspaceSubnet: mustPrefix("10.200.0.0/16"),
-		HubSubnet:       mustPrefix("10.199.0.0/30"),
+		WorkspaceSubnet: mustPrefix("10.201.0.0/16"),
 		NetnsDir:        "/run/netns",
-		Ports:           ports,
+		RelayNetns:      "sbxdrelay",
+		Network:         net,
+		Tunnels:         tunnels,
 	}
 }
 
@@ -82,8 +69,9 @@ func mustPrefix(s string) netip.Prefix {
 	return p
 }
 
-// Manager owns the workspace netns/veth lifecycle, the egress proxy and the
-// published-port forwarder. It is safe for concurrent use.
+// Manager owns the relay namespace and the per-workspace egress namespaces. It
+// never touches the host's interface or route topology. It is safe for
+// concurrent use.
 type Manager struct {
 	sys system
 	cfg ManagerConfig
@@ -91,13 +79,18 @@ type Manager struct {
 	alloc *allocator
 
 	mu sync.Mutex
-	// applied tracks which workspaces currently have a live namespace/route.
+	// relayApplied tracks whether the relay is currently up.
+	relayApplied bool
+	// relayCmd is the outer slirp4netns process (host -> relay).
+	relayCmd *os.Process
+	// applied tracks which workspaces currently have a live namespace.
 	applied map[string]bool
+	// slirpCmds holds the inner slirp4netns process (relay -> workspace) per
+	// workspace, so a release can stop the exact process it started.
+	slirpCmds map[string]*os.Process
 
-	// egress is the userspace egress proxy (nil when disabled).
-	egress *egressProxy
-	// forwarders holds the live published-port listeners, keyed by port ID.
-	forwarders map[string]*forwarder
+	// tunnels holds the live tunnel processes keyed by tunnel id.
+	tunnels map[string]*tunnelProc
 }
 
 // NewManager constructs a manager over the real host.
@@ -105,25 +98,26 @@ func NewManager(cfg ManagerConfig) *Manager {
 	if cfg.NetnsDir == "" {
 		cfg.NetnsDir = "/run/netns"
 	}
+	if cfg.RelayNetns == "" {
+		cfg.RelayNetns = "sbxdrelay"
+	}
 	return newManagerWithSystem(cfg, osSystem{})
 }
 
 func newManagerWithSystem(cfg ManagerConfig, sys system) *Manager {
 	return &Manager{
-		sys:        sys,
-		cfg:        cfg,
-		alloc:      newAllocator(cfg.WorkspaceSubnet.Addr(), 1<<14),
-		applied:    map[string]bool{},
-		forwarders: map[string]*forwarder{},
+		sys:       sys,
+		cfg:       cfg,
+		alloc:     newAllocator(cfg.WorkspaceSubnet.Addr(), 1<<8),
+		applied:   map[string]bool{},
+		slirpCmds: map[string]*os.Process{},
+		tunnels:   map[string]*tunnelProc{},
 	}
 }
 
-// PortsConfig returns the manager's published-port configuration.
-func (m *Manager) PortsConfig() config.PortsConfig { return m.cfg.Ports }
-
 // Available reports whether the host has the tools this layer needs.
 func (m *Manager) Available() bool {
-	for _, t := range []string{"ip", "nsenter", "unshare", "mount"} {
+	for _, t := range []string{"nsenter", "unshare", "mount", m.cfg.Network.SlirpPath} {
 		if !toolAvailable(t) {
 			return false
 		}
@@ -133,7 +127,7 @@ func (m *Manager) Available() bool {
 
 // toolHint names the first missing tool, for a truthful /readyz.
 func (m *Manager) toolHint() string {
-	for _, t := range []string{"ip", "nsenter", "unshare", "mount"} {
+	for _, t := range []string{"nsenter", "unshare", "mount", m.cfg.Network.SlirpPath} {
 		if !toolAvailable(t) {
 			return t
 		}
@@ -141,70 +135,137 @@ func (m *Manager) toolHint() string {
 	return ""
 }
 
-// EnsureHub creates the hub namespace and the host<->hub link if absent, and
-// installs the host route to the workspace subnet via the hub. It also starts
-// the egress proxy when configured. It is idempotent.
-func (m *Manager) EnsureHub() error {
+// EgressEnabled reports whether the egress layer is configured on.
+func (m *Manager) EgressEnabled() bool { return m.cfg.Network.Enabled }
+
+// EnsureRelay creates the relay namespace and connects it to the host with one
+// slirp4netns instance, then installs the private-range blackholes. It is
+// idempotent. It returns an error when the host lacks the tools, so the caller
+// can fall back to an empty namespace rather than the host network.
+func (m *Manager) EnsureRelay() error {
+	if !m.cfg.Network.Enabled {
+		return fmt.Errorf("network layer disabled by configuration")
+	}
 	if !m.Available() {
 		return fmt.Errorf("network layer unavailable: missing tool %q", m.toolHint())
 	}
-	if _, err := os.Stat(m.netnsPath(hubNetnsName)); err != nil {
-		if _, err := m.createNetns(hubNetnsName); err != nil {
-			return fmt.Errorf("create hub namespace: %w", err)
-		}
-		// .1 is the host end, .2 is the hub end.
-		hh := m.cfg.HubSubnet.Addr().Next() // .1
-		hIn := hh.Next()                    // .2
-		// Host end of the link.
-		if err := m.sys.run("ip", "link", "add", hubHostIface, "type", "veth", "peer", "name", hubIface); err != nil {
-			return fmt.Errorf("create hub link: %w", err)
-		}
-		if err := m.sys.run("ip", "addr", "add", hh.String()+"/30", "dev", hubHostIface); err != nil {
-			return fmt.Errorf("address host hub end: %w", err)
-		}
-		if err := m.sys.run("ip", "link", "set", hubHostIface, "up"); err != nil {
-			return err
-		}
-		if err := m.sys.run("ip", "link", "set", hubIface, "netns", m.netnsPath(hubNetnsName)); err != nil {
-			return fmt.Errorf("move hub end into namespace: %w", err)
-		}
-		if err := m.inNetns(hubNetnsName, "ip", "link", "set", "lo", "up"); err != nil {
-			return err
-		}
-		if err := m.inNetns(hubNetnsName, "ip", "addr", "add", hIn.String()+"/30", "dev", hubIface); err != nil {
-			return err
-		}
-		if err := m.inNetns(hubNetnsName, "ip", "link", "set", hubIface, "up"); err != nil {
-			return err
-		}
-		// The host reaches every workspace address through the hub. The hub
-		// forwards between the host link and each workspace link (the hub has
-		// ip_forward enabled).
-		if err := m.sys.run("ip", "route", "add", m.cfg.WorkspaceSubnet.String(), "via", hIn.String(), "dev", hubHostIface); err != nil {
-			return fmt.Errorf("route workspace subnet via hub: %w", err)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.relayApplied {
+		return nil
+	}
+
+	if _, err := os.Stat(m.netnsPath(m.cfg.RelayNetns)); err != nil {
+		if _, err := m.createNetns(m.cfg.RelayNetns); err != nil {
+			return fmt.Errorf("create relay namespace: %w", err)
 		}
 	}
-	if err := m.inNetns(hubNetnsName, "sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
-		// Enabling forwarding in the hub makes the hub route between its own
-		// interfaces. It is best-effort: a host without sysctl in the sandbox
-		// still serves direct on-link traffic.
-		_ = m.inNetns(hubNetnsName, "sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward")
-	}
-	if m.cfg.Egress != nil && m.egress == nil {
-		eg := newEgressProxy(m)
-		if err := eg.start(); err != nil {
-			return fmt.Errorf("start egress proxy: %w", err)
+	// Loopback up so an inner tool can bind 127.0.0.1 in the relay.
+	_ = m.inNetns(m.cfg.RelayNetns, "ip", "link", "set", "lo", "up")
+
+	// Outer slirp: host -> relay. It creates the relay's tap interface and its
+	// default route, over a UNIX socket. No host interface appears: the socket
+	// is the whole transport.
+	cmd := m.startSlirp(m.cfg.RelayNetns, "", true)
+	if err := m.waitInterface(m.cfg.RelayNetns, m.cfg.Network.StartTimeout()); err != nil {
+		if cmd != nil {
+			_ = cmd.Kill()
 		}
-		m.egress = eg
+		return fmt.Errorf("connect relay to host: %w", err)
 	}
+	if cmd == nil {
+		return fmt.Errorf("start relay slirp: could not launch %s", m.cfg.Network.SlirpPath)
+	}
+	m.relayCmd = cmd
+
+	// Blackhole every private range in the relay, so neither the workspace nor
+	// a nested slirp can route to the operator's infrastructure even if a name
+	// resolves to a private address.
+	for _, net := range strings.Fields(privateBlackholes) {
+		if err := m.inNetns(m.cfg.RelayNetns, "ip", "route", "add", "blackhole", net); err != nil {
+			// A duplicate blackhole (a prior half-started relay) is harmless.
+			if !strings.Contains(err.Error(), "File exists") {
+				return fmt.Errorf("blackhole %s in relay: %w", net, err)
+			}
+		}
+	}
+	m.relayApplied = true
 	return nil
 }
 
-// EnsureWorkspace creates the workspace's private namespace and veth link if
-// absent, returning its allocation. It is idempotent and safe for concurrent
-// callers.
+// startSlirp launches a slirp4netns instance connecting a target namespace.
+//
+//   - outer (fromHost=true): run in the host namespace, targeting the relay.
+//   - inner (fromHost=false): run INSIDE the relay namespace, targeting a
+//     workspace, with a per-workspace --cidr so two workspaces never share an
+//     address.
+//
+// DNS is disabled on both: the workspace is given a public resolver in its own
+// /etc/resolv.conf instead, so DNS is ordinary NATed traffic and the host
+// resolver is never published.
+func (m *Manager) startSlirp(targetNetns, cidr string, fromHost bool) *os.Process {
+	args := []string{
+		"--configure",
+		"--mtu=" + fmt.Sprintf("%d", m.cfg.Network.MTU),
+		"--disable-host-loopback",
+		"--disable-dns",
+	}
+	if cidr != "" {
+		args = append(args, "--cidr="+cidr)
+	}
+	args = append(args, "--netns-type=path", m.netnsPath(targetNetns), "tap0")
+
+	if fromHost {
+		return m.spawn(m.cfg.Network.SlirpPath, args)
+	}
+	// Run inside the relay namespace. --no-fork makes nsenter exec slirp4netns
+	// directly, so the tracked pid IS the slirp process and killing it frees the
+	// relay-side socket.
+	nsArgs := append([]string{"--net=" + m.netnsPath(m.cfg.RelayNetns), "--no-fork", m.cfg.Network.SlirpPath}, args...)
+	return m.spawn("nsenter", nsArgs)
+}
+
+// spawn starts a long-lived process and returns its *os.Process. The child is
+// reaped in a goroutine; the manager tracks the pid and kills it by pid only.
+func (m *Manager) spawn(bin string, args []string) *os.Process {
+	cmd := exec.Command(bin, args...)
+	if err := cmd.Start(); err != nil {
+		return nil
+	}
+	proc := cmd.Process
+	go func() { _ = cmd.Wait() }()
+	return proc
+}
+
+// waitInterface waits until a tap interface is configured in a namespace
+// (slirp has set the address and route), bounded by timeout.
+func (m *Manager) waitInterface(netns string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		out, err := m.inNetnsOutput(netns, "ip", "-o", "link", "show", "tap0")
+		if err == nil && len(out) > 0 {
+			// Ensure the address is set too.
+			aout, aerr := m.inNetnsOutput(netns, "ip", "-o", "-4", "addr", "show", "tap0")
+			if aerr == nil && strings.Contains(string(aout), "inet ") {
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("interface did not come up in %s", filepath.Base(netns))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// EnsureWorkspace creates the workspace's private egress namespace if absent,
+// and returns its allocation. It is idempotent and safe for concurrent callers.
+// A workspace that is not opted in to egress still gets a private empty
+// namespace (callers use EnsureEmptyWorkspace) so isolation is never weakened.
 func (m *Manager) EnsureWorkspace(wsID string) (*Allocation, error) {
-	if err := m.EnsureHub(); err != nil {
+	if err := m.EnsureRelay(); err != nil {
 		return nil, err
 	}
 	m.mu.Lock()
@@ -217,8 +278,7 @@ func (m *Manager) ensureWorkspaceLocked(wsID string) (*Allocation, error) {
 		if m.applied[wsID] {
 			return alloc, nil
 		}
-		// Reserved but not applied: rebuild the link (e.g. after a reap).
-		if err := m.buildWorkspaceLink(alloc); err != nil {
+		if err := m.buildWorkspaceEgress(alloc); err != nil {
 			return nil, err
 		}
 		m.applied[wsID] = true
@@ -228,7 +288,7 @@ func (m *Manager) ensureWorkspaceLocked(wsID string) (*Allocation, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := m.buildWorkspaceLink(alloc); err != nil {
+	if err := m.buildWorkspaceEgress(alloc); err != nil {
 		m.alloc.release(wsID)
 		return nil, err
 	}
@@ -236,82 +296,64 @@ func (m *Manager) ensureWorkspaceLocked(wsID string) (*Allocation, error) {
 	return alloc, nil
 }
 
-// buildWorkspaceLink creates the netns, the veth pair and the addresses.
-func (m *Manager) buildWorkspaceLink(alloc *Allocation) error {
+// buildWorkspaceEgress creates the workspace namespace and connects it to the
+// relay with an inner slirp4netns. It creates no host interface or route.
+func (m *Manager) buildWorkspaceEgress(alloc *Allocation) error {
 	name := m.wsNetnsName(alloc.WorkspaceID)
 	if _, err := os.Stat(m.netnsPath(name)); err != nil {
 		if _, err := m.createNetns(name); err != nil {
 			return fmt.Errorf("create workspace namespace: %w", err)
 		}
 	}
-	hubSide := ifaceNamePrefix + shortID(alloc.WorkspaceID)
-	// Defensive cleanup of any stale link from a prior hard death (the hub
-	// namespace may still hold a half-built interface).
-	_ = m.inNetns(hubNetnsName, "ip", "link", "del", hubSide)
-	// The peer must not be created with the name "eth0" in the HOST namespace:
-	// that name is already taken by the host's own uplink, so `ip link add ...
-	// peer name eth0` fails with "File exists". Create the peer under a unique
-	// temporary name and rename it to eth0 *inside* the workspace namespace,
-	// where "eth0" is free.
-	peerSide := "sbxwp" + shortID(alloc.WorkspaceID)
-	if err := m.sys.run("ip", "link", "add", hubSide, "type", "veth", "peer", "name", peerSide); err != nil {
-		return fmt.Errorf("create workspace veth: %w", err)
+	_ = m.inNetns(name, "ip", "link", "set", "lo", "up")
+
+	// A stale inner slirp from a prior hard death would hold tap0 busy; stop
+	// the one this manager started for this workspace, if any.
+	if p := m.slirpCmds[alloc.WorkspaceID]; p != nil {
+		_ = p.Kill()
+		delete(m.slirpCmds, alloc.WorkspaceID)
 	}
-	// Hub end.
-	if err := m.sys.run("ip", "link", "set", hubSide, "netns", m.netnsPath(hubNetnsName)); err != nil {
-		return fmt.Errorf("move hub veth end: %w", err)
+
+	proc := m.startSlirp(name, alloc.CIDR.String(), false)
+	if proc == nil {
+		return fmt.Errorf("start workspace slirp: could not launch %s", m.cfg.Network.SlirpPath)
 	}
-	// Workspace end.
-	if err := m.sys.run("ip", "link", "set", peerSide, "netns", m.netnsPath(name)); err != nil {
-		return fmt.Errorf("move workspace veth end: %w", err)
+	if err := m.waitInterface(name, m.cfg.Network.StartTimeout()); err != nil {
+		_ = proc.Kill()
+		return fmt.Errorf("connect workspace to relay: %w", err)
 	}
-	// A stale eth0 in the namespace (from a prior half-built link) would make
-	// the rename fail; remove it first, then rename the fresh peer to eth0.
-	_ = m.inNetns(name, "ip", "link", "del", guestIface)
-	if err := m.inNetns(name, "ip", "link", "set", peerSide, "name", guestIface); err != nil {
-		return fmt.Errorf("rename workspace interface: %w", err)
-	}
-	// Address and bring up the hub end.
-	if err := m.inNetns(hubNetnsName, "ip", "addr", "add", alloc.HubAddr.String()+"/30", "dev", hubSide); err != nil {
-		return err
-	}
-	if err := m.inNetns(hubNetnsName, "ip", "link", "set", hubSide, "up"); err != nil {
-		return err
-	}
-	// Workspace end: loopback up (so 127.0.0.1 works) and its own address.
-	if err := m.inNetns(name, "ip", "link", "set", "lo", "up"); err != nil {
-		return err
-	}
-	if err := m.inNetns(name, "ip", "addr", "add", alloc.GuestAddr.String()+"/30", "dev", guestIface); err != nil {
-		return err
-	}
-	if err := m.inNetns(name, "ip", "link", "set", guestIface, "up"); err != nil {
-		return err
-	}
-	// The workspace reaches the hub only. There is deliberately NO default
-	// route, so the host LAN and every host port are unreachable. When egress
-	// is enabled the only addition is a route to the hub peer for the proxy,
-	// which is already on-link; the proxy is reached by address.
+	m.slirpCmds[alloc.WorkspaceID] = proc
 	return nil
 }
 
-// ReleaseWorkspace tears the workspace's link and namespace down and frees its
-// allocation. It is idempotent.
+// EnsureEmptyWorkspace creates a private, empty workspace namespace with no
+// egress (an allow_net:false workspace, or an allow_net workspace on a host
+// where the egress layer is unavailable). The workload is in its own namespace
+// with loopback only, never the host's. It returns the namespace path.
+func (m *Manager) EnsureEmptyWorkspace(wsID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	name := m.wsNetnsName(wsID)
+	if _, err := os.Stat(m.netnsPath(name)); err != nil {
+		if _, err := m.createNetns(name); err != nil {
+			return "", fmt.Errorf("create workspace namespace: %w", err)
+		}
+	}
+	_ = m.inNetns(name, "ip", "link", "set", "lo", "up")
+	return m.netnsPath(name), nil
+}
+
+// ReleaseWorkspace tears the workspace's namespace and its inner slirp down and
+// frees its allocation. It is idempotent and stops only the process this
+// manager started.
 func (m *Manager) ReleaseWorkspace(wsID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.releaseWorkspaceLocked(wsID)
-}
-
-func (m *Manager) releaseWorkspaceLocked(wsID string) {
-	name := m.wsNetnsName(wsID)
-	hubSide := ifaceNamePrefix + shortID(wsID)
-	// Deleting the hub-side veth deletes its peer (the workspace end) too.
-	if err := m.sys.run("ip", "link", "del", hubSide); err != nil {
-		// The peer may already be gone; try deleting inside the namespace.
-		_ = m.inNetns(name, "ip", "link", "del", guestIface)
+	if p := m.slirpCmds[wsID]; p != nil {
+		_ = p.Kill()
+		delete(m.slirpCmds, wsID)
 	}
-	m.destroyNetns(name)
+	m.destroyNetns(m.wsNetnsName(wsID))
 	delete(m.applied, wsID)
 	m.alloc.release(wsID)
 }
@@ -328,55 +370,52 @@ func (m *Manager) AllocationOf(wsID string) (*Allocation, bool) {
 	return m.alloc.get(wsID)
 }
 
-// ReapOrphans tears down every leftover workspace namespace and veth that is
-// not in live. It mirrors the cgroup ReapOrphans discipline: no workspace
-// network survives a restart, so anything present at startup is an orphan from
-// a hard death. It returns the number of namespaces reaped.
+// NetnsPathFor returns the namespace path a workspace would use. It does not
+// create anything.
+func (m *Manager) NetnsPathFor(wsID string) string {
+	return m.netnsPath(m.wsNetnsName(wsID))
+}
+
+// RelayNetnsPath returns the relay namespace path.
+func (m *Manager) RelayNetnsPath() string { return m.netnsPath(m.cfg.RelayNetns) }
+
+// ReapOrphans tears down every leftover workspace namespace and the relay, and
+// stops any slirp process this package started. It mirrors the cgroup
+// ReapOrphans discipline: no workspace network survives a restart, so anything
+// present at startup is an orphan from a hard death. It returns the number of
+// workspace namespaces reaped.
+//
+// It stops only slirp processes whose target namespace is one of ours, matched
+// by the namespace path in the process's own argv, so a foreign process is
+// never signalled.
 func (m *Manager) ReapOrphans(live map[string]bool) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Drop every in-memory reservation: the durable state is the host.
 	m.alloc.reset()
 	m.applied = map[string]bool{}
-
-	// Remove workspace-side veths by walking the hub namespace's links.
-	out, err := m.sys.output("nsenter", "--net="+m.netnsPath(hubNetnsName), "ip", "-o", "link", "show")
-	var orphans []string
-	if err == nil {
-		for _, line := range strings.Split(string(out), "\n") {
-			// "N: <name>: <flags>" -- the name is the second colon field.
-			fields := strings.Split(line, ":")
-			if len(fields) < 2 {
-				continue
-			}
-			name := strings.TrimSpace(fields[1])
-			if strings.HasPrefix(name, "@") {
-				name = strings.TrimPrefix(name, "@")
-			}
-			if strings.HasPrefix(name, ifaceNamePrefix) {
-				orphans = append(orphans, name)
-			}
-		}
+	for wsID, p := range m.slirpCmds {
+		_ = p.Kill()
+		delete(m.slirpCmds, wsID)
 	}
-	for _, iface := range orphans {
-		_ = m.sys.run("ip", "link", "del", iface)
+	if m.relayCmd != nil {
+		_ = m.relayCmd.Kill()
+		m.relayCmd = nil
 	}
+	m.relayApplied = false
 
-	// Remove namespaces we own.
+	// Stop any slirp4netns whose target is under our NetnsDir (an orphan from a
+	// prior hard death). The match is on the exact namespace path, so nothing
+	// else is ever signalled.
+	m.killOurSlirps()
+
+	reaped := 0
 	entries, err := os.ReadDir(m.cfg.NetnsDir)
 	if err != nil {
-		return len(orphans)
+		return 0
 	}
-	reaped := len(orphans)
 	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), netnsNamePrefix) {
+		if !strings.HasPrefix(e.Name(), netnsNamePrefix) && e.Name() != m.cfg.RelayNetns {
 			continue
-		}
-		wsID := m.wsIDFromNetns(e.Name())
-		if live != nil && live[wsID] {
-			// A workspace that should be live is rebuilt by EnsureWorkspace;
-			// its stale namespace is still removed here so the rebuild starts
-			// clean.
 		}
 		m.destroyNetns(e.Name())
 		reaped++
@@ -384,18 +423,58 @@ func (m *Manager) ReapOrphans(live map[string]bool) int {
 	return reaped
 }
 
-// Stop closes the egress proxy and every forwarder (graceful shutdown).
+// killOurSlirps terminates only slirp4netns processes whose argv names a
+// namespace under our NetnsDir. It walks /proc itself and signals the exact
+// pid; it never uses pkill/killall, so a foreign slirp is untouched.
+func (m *Manager) killOurSlirps() {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	dir := filepath.Clean(m.cfg.NetnsDir)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid := 0
+		if _, err := fmt.Sscanf(e.Name(), "%d", &pid); err != nil || pid <= 0 {
+			continue
+		}
+		comm, err := os.ReadFile(filepath.Join("/proc", e.Name(), "comm"))
+		if err != nil || strings.TrimSpace(string(comm)) != "slirp4netns" {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		args := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+		for _, a := range args {
+			if strings.HasPrefix(a, dir+"/") {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+				break
+			}
+		}
+	}
+}
+
+// Stop closes every inner slirp and the relay (graceful shutdown).
 func (m *Manager) Stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.egress != nil {
-		m.egress.stop()
-		m.egress = nil
+	for wsID, p := range m.slirpCmds {
+		_ = p.Kill()
+		delete(m.slirpCmds, wsID)
 	}
-	for id, f := range m.forwarders {
-		f.stop()
-		delete(m.forwarders, id)
+	for id, t := range m.tunnels {
+		t.stop()
+		delete(m.tunnels, id)
 	}
+	if m.relayCmd != nil {
+		_ = m.relayCmd.Kill()
+		m.relayCmd = nil
+	}
+	m.relayApplied = false
 }
 
 // wsNetnsName returns the namespace name for a workspace.
@@ -403,55 +482,14 @@ func (m *Manager) wsNetnsName(wsID string) string {
 	return netnsNamePrefix + shortID(wsID)
 }
 
-// NetnsPathFor returns the namespace path a workspace would use. It does not
-// create anything.
-func (m *Manager) NetnsPathFor(wsID string) string {
-	return m.netnsPath(m.wsNetnsName(wsID))
-}
-
-// HubNetnsPath returns the hub namespace path.
-func (m *Manager) HubNetnsPath() string { return m.netnsPath(hubNetnsName) }
-
-// EgressEnabled reports whether the userspace egress proxy is running.
-func (m *Manager) EgressEnabled() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.egress != nil
-}
-
-// wsIDFromNetns reverses wsNetnsName as far as possible (the hash is one-way,
-// so the manager keeps a lookup for live IDs and rebuilds it on demand).
-func (m *Manager) wsIDFromNetns(netnsName string) string {
-	return "" // namespace names are hashes; reaping is by prefix, not by name
-}
-
 // shortID returns a stable 8-hex-character digest of an identifier, used in
-// interface and namespace names (Linux interface names are capped at 15 chars).
+// namespace names.
 func shortID(id string) string {
 	h := sha256.Sum256([]byte(id))
 	return hex.EncodeToString(h[:])[:8]
 }
 
-// hostPortRange parses "lo-hi" into inclusive bounds.
-func parseHostRange(s string) (int, int, error) {
-	parts := strings.SplitN(s, "-", 2)
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("host_range %q must be \"lo-hi\"", s)
-	}
-	var lo, hi int
-	if _, err := fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &lo); err != nil {
-		return 0, 0, fmt.Errorf("host_range low: %w", err)
-	}
-	if _, err := fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &hi); err != nil {
-		return 0, 0, fmt.Errorf("host_range high: %w", err)
-	}
-	if lo < 1 || hi > 65535 || lo > hi {
-		return 0, 0, fmt.Errorf("host_range %q out of bounds", s)
-	}
-	return lo, hi, nil
-}
-
-// netnsDirExists reports whether the namespace directory is present and
+// netnsDirWritable reports whether the namespace directory is present and
 // writable, for a truthful readiness report.
 func (m *Manager) netnsDirWritable() bool {
 	if err := os.MkdirAll(m.cfg.NetnsDir, 0o755); err != nil {
@@ -469,14 +507,48 @@ func (m *Manager) netnsDirWritable() bool {
 
 // Ready reports whether the network layer can be used, plus a reason.
 func (m *Manager) Ready() (bool, string) {
+	if !m.cfg.Network.Enabled {
+		return false, "network.enabled is false"
+	}
 	if !m.Available() {
 		return false, "missing tool " + m.toolHint()
 	}
 	if !m.netnsDirWritable() {
 		return false, filepath.Clean(m.cfg.NetnsDir) + " not writable"
 	}
-	if _, _, err := parseHostRange(m.cfg.Ports.HostRange); err != nil {
-		return false, err.Error()
-	}
 	return true, ""
+}
+
+// ResolverConfPath returns the generated per-workspace resolv.conf path for a
+// workspace, or "" when egress is disabled or no resolver directory is
+// configured.
+func (m *Manager) ResolverConfPath() string {
+	if !m.cfg.Network.Enabled || m.cfg.ResolverDir == "" {
+		return ""
+	}
+	return filepath.Join(m.cfg.ResolverDir, "egress-resolv")
+}
+
+// WriteResolverConf writes a per-workspace /etc/resolv.conf naming the
+// configured PUBLIC resolvers, and returns its path. The host's own resolver is
+// deliberately never published to a workspace: the relay blackholes the
+// operator's private ranges, so a host resolver address would be unreachable
+// anyway, and publishing it would leak the host's search domain.
+func (m *Manager) WriteResolverConf(alloc *Allocation) (string, error) {
+	if m.ResolverConfPath() == "" {
+		return "", fmt.Errorf("egress resolver not configured")
+	}
+	if err := os.MkdirAll(m.cfg.ResolverDir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(m.cfg.ResolverDir, "egress-resolv-"+shortID(alloc.WorkspaceID)+".conf")
+	var b strings.Builder
+	for _, ns := range m.cfg.Network.Resolver {
+		b.WriteString("nameserver " + ns + "\n")
+	}
+	b.WriteString("options timeout:2 attempts:2\n")
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }

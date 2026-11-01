@@ -625,32 +625,6 @@ func nsjailCommand(ctx context.Context, bin, cfgPath, netns string) *exec.Cmd {
 	return exec.CommandContext(ctx, "nsenter", args...)
 }
 
-// withEgressEnv appends fixed service-chosen proxy variables to the sandbox
-// environment. A caller-supplied value of the same key is dropped so the
-// engine's proxy address always wins (the variables point at the workspace's
-// own hub peer, which is service-owned, not caller-owned).
-func withEgressEnv(env, egress []string) []string {
-	if len(egress) == 0 {
-		return env
-	}
-	managed := map[string]bool{}
-	for _, kv := range egress {
-		if k, _, ok := strings.Cut(kv, "="); ok {
-			managed[k] = true
-		}
-	}
-	out := env[:0]
-	for _, kv := range env {
-		if k, _, ok := strings.Cut(kv, "="); ok && managed[k] {
-			continue
-		}
-		out = append(out, kv)
-	}
-	out = append(out, egress...)
-	sortStrings(out)
-	return out
-}
-
 // tmplData is the data passed to the nsjail config template.
 type tmplData struct {
 	Argv         []string
@@ -798,7 +772,7 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 
 	data := tmplData{
 		Argv:          req.Argv,
-		Env:           withPackagePath(withEgressEnv(formatEnv(req.Env), req.EgressEnv), pkgPath),
+		Env:           withPackagePath(formatEnv(req.Env), pkgPath),
 		Cwd:           cwd,
 		TimeLimitSec:  timeoutSec,
 		CPUCores:      lim.CPUCores,

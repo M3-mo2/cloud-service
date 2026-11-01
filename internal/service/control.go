@@ -31,7 +31,7 @@ type LimitUpdate struct {
 	MaxRuns            *int
 	AllowNet           *bool
 	AllowUnlimitedRuns *bool
-	AllowPorts         *bool
+	AllowTunnels       *bool
 }
 
 // WorkspaceUpdate is a partial update of a workspace.
@@ -76,7 +76,7 @@ func (s *Service) UpdateWorkspace(id string, upd WorkspaceUpdate) (*model.Worksp
 			w.Name = name
 		}
 		if upd.Limits != nil {
-			if err := applyLimitUpdate(&w.Limits, *upd.Limits, max, s.cfg.Ports.Enabled); err != nil {
+			if err := applyLimitUpdate(&w.Limits, *upd.Limits, max, s.cfg.Tunnels.Enabled); err != nil {
 				apiErr = err
 				return err
 			}
@@ -94,10 +94,10 @@ func (s *Service) UpdateWorkspace(id string, upd WorkspaceUpdate) (*model.Worksp
 }
 
 // applyLimitUpdate overlays a partial limit update, enforcing the maxima.
-// portsEnabled is the server-level ports.enabled switch: opting a workspace in
-// to published ports while the server switch is off is refused with 422, the
-// same discipline as allow_unlimited_runs.
-func applyLimitUpdate(cur *model.Limits, upd LimitUpdate, max model.Limits, portsEnabled bool) error {
+// tunnelsEnabled is the server-level tunnels.enabled switch: opting a workspace
+// in to tunnels while the server switch is off is refused with 422, the same
+// discipline as allow_unlimited_runs.
+func applyLimitUpdate(cur *model.Limits, upd LimitUpdate, max model.Limits, tunnelsEnabled bool) error {
 	if upd.CPUCores != nil {
 		v := *upd.CPUCores
 		if v <= 0 {
@@ -154,11 +154,11 @@ func applyLimitUpdate(cur *model.Limits, upd LimitUpdate, max model.Limits, port
 	if upd.AllowUnlimitedRuns != nil {
 		cur.AllowUnlimitedRuns = *upd.AllowUnlimitedRuns
 	}
-	if upd.AllowPorts != nil {
-		if *upd.AllowPorts && !portsEnabled {
-			return PortsForbiddenByServer()
+	if upd.AllowTunnels != nil {
+		if *upd.AllowTunnels && !tunnelsEnabled {
+			return TunnelsForbiddenByServer()
 		}
-		cur.AllowPorts = *upd.AllowPorts
+		cur.AllowTunnels = *upd.AllowTunnels
 	}
 	return nil
 }
@@ -210,9 +210,9 @@ func (s *Service) SuspendWorkspace(id string) (*model.Workspace, []string, bool,
 	}
 	s.StopAllRuns(id)
 	s.StopWorkspaceSessions(id, model.SessionReasonWorkspaceSuspended)
-	// A suspended workspace keeps no host listeners: ports die with the suspend
-	// and the host ports are freed.
-	s.ReleaseWorkspacePorts(w)
+	// A suspended workspace keeps no public tunnels: cloudflared processes die
+	// with the suspend and the URLs stop working.
+	s.ReleaseWorkspaceTunnels(w)
 	// A detached process started from a session is part of the workspace's work
 	// too; suspending must not leave it running. Its ids are not part of the
 	// suspend response (whose shape is fixed), but the processes are stopped.
@@ -250,9 +250,10 @@ func (s *Service) StopWorkspace(id string) (StopSummary, error) {
 	s.StopAllRuns(id)
 	stoppedSessions := s.StopWorkspaceSessions(id, model.SessionReasonWorkspaceStopped)
 	stoppedProcs := s.stopAllProcesses(id)
-	// A stop releases the workspace's published ports and the host listeners.
+	// A stop releases the workspace's public tunnels (their cloudflared
+	// processes die and the URLs stop working).
 	if w, err := s.store.GetWorkspace(id); err == nil {
-		s.ReleaseWorkspacePorts(w)
+		s.ReleaseWorkspaceTunnels(w)
 	}
 	return StopSummary{RunIDs: stoppedRuns, SessionIDs: stoppedSessions, ProcessIDs: stoppedProcs}, nil
 }

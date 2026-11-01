@@ -69,10 +69,10 @@ func (s *Server) Router() http.Handler {
 				r.Get("/processes", s.handleListProcesses)
 				r.Post("/processes/{processID}/stop", s.handleStopProcess)
 
-				r.Post("/ports", s.handlePublishPort)
-				r.Get("/ports", s.handleListPorts)
-				r.Get("/ports/{portID}", s.handleGetPort)
-				r.Delete("/ports/{portID}", s.handleUnpublishPort)
+				r.Post("/tunnels", s.handleCreateTunnel)
+				r.Get("/tunnels", s.handleListTunnels)
+				r.Get("/tunnels/{tunnelID}", s.handleGetTunnel)
+				r.Delete("/tunnels/{tunnelID}", s.handleDeleteTunnel)
 
 				r.Get("/packages", s.handleListPackages)
 				r.Post("/packages/install", s.handleInstallPackages)
@@ -132,18 +132,18 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	dataOK := s.dataDirWritable()
 	nsjailOK := s.svc.Runner().Available()
 	cgroupsOK := s.svc.Runner().CgroupsUsable()
-	// The isolated network layer is reported truthfully: when ports are enabled
-	// but the layer cannot serve, readiness is not claimed.
+	// The isolated network layer is reported truthfully: when the egress layer
+	// is enabled but cannot serve, readiness is not claimed.
 	netAvail, netReady, netReason := s.svc.NetworkStatus()
-	portsEnabled, portsReady, portsReason := s.svc.PortsStatus()
+	tunEnabled, tunReady, tunReason := s.svc.TunnelsStatus()
 	status := http.StatusOK
 	if !dataOK || !nsjailOK || !cgroupsOK {
 		status = http.StatusServiceUnavailable
 	}
-	if portsEnabled && !portsReady {
+	if s.cfg.Network.Enabled && (!netAvail || !netReady) {
 		status = http.StatusServiceUnavailable
 	}
-	if netAvail && !netReady && s.cfg.Ports.Enabled {
+	if tunEnabled && !tunReady {
 		status = http.StatusServiceUnavailable
 	}
 	body := map[string]any{
@@ -152,19 +152,20 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		"cgroups":  cgroupsOK,
 		"data_dir": dataOK,
 		"network": map[string]any{
+			"enabled":   s.cfg.Network.Enabled,
 			"available": netAvail,
 			"ready":     netReady,
 		},
-		"ports": map[string]any{
-			"enabled": portsEnabled,
-			"ready":   portsReady,
+		"tunnels": map[string]any{
+			"enabled": tunEnabled,
+			"ready":   tunReady,
 		},
 	}
 	if netReason != "" {
 		body["network"].(map[string]any)["reason"] = netReason
 	}
-	if portsReason != "" {
-		body["ports"].(map[string]any)["reason"] = portsReason
+	if tunReason != "" {
+		body["tunnels"].(map[string]any)["reason"] = tunReason
 	}
 	writeJSON(w, status, body)
 }
@@ -172,24 +173,22 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	l := s.cfg.Limits
 	m := s.cfg.MaxLimits
-	portsEnabled, portsReady, portsReason := s.svc.PortsStatus()
-	portsCap := map[string]any{
-		"enabled":           portsEnabled,
-		"ready":             portsReady,
-		"host_range":        s.cfg.Ports.HostRange,
-		"bind_addr":         s.cfg.Ports.BindAddr,
-		"max_per_workspace": s.cfg.Ports.MaxPerWorkspace,
-		"max_per_principal": s.cfg.Ports.MaxPerPrincipal,
+	tunEnabled, tunReady, tunReason := s.svc.TunnelsStatus()
+	tunCap := map[string]any{
+		"enabled":           tunEnabled,
+		"ready":             tunReady,
+		"max_per_workspace": s.cfg.Tunnels.MaxPerWorkspace,
+		"url_timeout_sec":   s.cfg.Tunnels.URLTimeoutSec,
 	}
-	if portsReason != "" {
-		portsCap["reason"] = portsReason
+	if tunReason != "" {
+		tunCap["reason"] = tunReason
 	}
 	netAvail, netReady, netReason := s.svc.NetworkStatus()
 	netCap := map[string]any{
-		"available":      netAvail,
-		"ready":          netReady,
-		"egress":         s.svc.EgressEnabled(),
-		"workspace_cidr": "10.200.0.0/16",
+		"enabled":   s.cfg.Network.Enabled,
+		"available": netAvail,
+		"ready":     netReady,
+		"egress":    s.svc.EgressEnabled(),
 	}
 	if netReason != "" {
 		netCap["reason"] = netReason
@@ -206,7 +205,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 			"max_runs":             l.MaxRuns,
 			"allow_net":            l.AllowNet,
 			"allow_unlimited_runs": l.AllowUnlimitedRuns,
-			"allow_ports":          l.AllowPorts,
+			"allow_tunnels":        l.AllowTunnels,
 		},
 		"limits_maxima": map[string]any{
 			"cpu_cores":            m.CPUCores,
@@ -217,7 +216,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 			"allow_net":            m.AllowNet,
 			"allow_unlimited_runs": m.AllowUnlimitedRuns,
 		},
-		"ports":               portsCap,
+		"tunnels":             tunCap,
 		"network":             netCap,
 		"interpreters":        model.SupportedInterpreters(),
 		"runnable_extensions": model.SupportedExtensions(),

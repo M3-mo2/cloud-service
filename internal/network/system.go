@@ -1,23 +1,35 @@
-// Package network implements per-workspace isolated networking and published
-// ports for sandboxd.
+// Package network implements per-workspace isolated networking (egress) and
+// quick public tunnels for sandboxd.
 //
-// Every workspace gets its own private network namespace with a point-to-point
-// veth link to an engine-owned "hub" namespace. The workspace sees exactly one
-// peer (the host end of its own link) and has no default route, so it can
-// reach neither the host LAN, nor another workspace, nor any host service that
-// binds 0.0.0.0: the forwarder and the optional egress proxy originate inside
-// the hub namespace, so the host needs no route to the workspace subnet at all.
+// Egress model. Every allow_net workspace gets its own network namespace that
+// is connected to the public internet ONLY through chained slirp4netns
+// instances:
 //
-// The hub itself is reachable from the host over a dedicated host<->hub veth
-// link, so the engine can install listeners and dial into a workspace without
-// ever exposing the workspace subnet to the host network.
+//	workspace ns --slirp(UNIX socket)--> relay ns --slirp(UNIX socket)--> host
 //
-// This is a measured design (see docs/DECISIONS.md and docs/VERIFICATION.md):
-// `ip netns add` is broken on the target host (it mounts /sys and fails with
+// An engine-owned "relay" namespace is created once and connected to the host
+// by a single slirp4netns instance. Each workspace namespace is then connected
+// to the relay by a second slirp4netns instance run INSIDE the relay namespace.
+// Because slirp4netns speaks to its parent over a UNIX socket and only wires up
+// a tap interface inside the child namespace, this creates ZERO host
+// interfaces, ZERO host routes and ZERO veth pairs. The relay carries a
+// blackhole route for every private range, so the workspace can reach the
+// public internet (and a public resolver) but never the host LAN, the host's
+// own services, or another workspace.
+//
+// This is the measured-safe design (see docs/DECISIONS.md and
+// docs/VERIFICATION.md): the host's own interfaces and routes are byte-identical
+// before and after, and no veth/tap interface exists on the host. The
+// abandoned alternative — host veth pairs, addresses and routes (or `ip netns
+// add`) — took the target host off the network three times and is deleted from
+// this tree.
+//
+// `ip netns add` is unusable on the target host (it mounts /sys and fails with
 // "Operation not permitted"), so namespaces are created by holding a private
 // namespace with `unshare -n` and bind-mounting its /proc/<pid>/ns/net into
 // /run/netns; the holder then exits and the bind mount keeps the namespace
-// alive. iptables and nft are not installed, so no NAT is used anywhere.
+// alive. iptables and nft are not installed, so no NAT is used anywhere: the
+// controlled egress path IS slirp4netns.
 package network
 
 import (
@@ -34,9 +46,7 @@ import (
 // bookkeeping can be tested without root while the real implementation shells
 // out to `ip`, `nsenter`, `unshare` and `mount`.
 type system interface {
-	// run executes a command and returns an error if it fails.
 	run(name string, args ...string) error
-	// output executes a command and returns its stdout.
 	output(name string, args ...string) ([]byte, error)
 }
 
@@ -82,19 +92,23 @@ func toolAvailable(name string) bool {
 // holding a private namespace with `unshare -n` and bind-mounting that
 // process's /proc/<pid>/ns/net into /run/netns works, and the namespace then
 // outlives the holder because the bind mount holds a reference.
+//
+// The child writes nothing; the pid used is the direct child of `unshare -n`,
+// which exec's the sleep in the freshly unshared namespace. (Callers must NOT
+// wrap this in sudo: sudo would return sudo's own pid, capturing the host
+// namespace — a trap this package's tests guard against.)
 func (m *Manager) createNetns(name string) (string, error) {
 	if err := os.MkdirAll(m.cfg.NetnsDir, 0o755); err != nil {
 		return "", err
 	}
 	path := filepath.Join(m.cfg.NetnsDir, name)
-	// Remove a stale mount/file first (best effort; a live namespace with the
-	// same name would otherwise collide).
+	// Remove a stale mount/file first (best effort).
+	_ = m.sys.run("umount", path)
 	_ = os.Remove(path)
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		return "", err
 	}
 
-	// Hold a private netns in a short-lived child.
 	holder := exec.Command("unshare", "-n", "sleep", "100000")
 	if err := holder.Start(); err != nil {
 		return "", fmt.Errorf("unshare -n: %w", err)
@@ -106,7 +120,6 @@ func (m *Manager) createNetns(name string) (string, error) {
 	}()
 
 	nsFile := fmt.Sprintf("/proc/%d/ns/net", pid)
-	// Wait for the namespace to appear, then bind-mount it.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, err := os.Stat(nsFile); err == nil {
@@ -138,8 +151,46 @@ func (m *Manager) netnsPath(name string) string {
 
 // inNetns runs a command inside a named namespace via nsenter. Using
 // `nsenter --net=<path>` (not `ip netns exec`) avoids the broken /sys mount
-// path entirely.
+// path entirely. It is used for read-only inspection (addr/route probes).
 func (m *Manager) inNetns(name string, command string, args ...string) error {
 	full := append([]string{"--net=" + m.netnsPath(name), command}, args...)
 	return m.sys.run("nsenter", full...)
+}
+
+// inNetnsOutput runs a command inside a named namespace and returns stdout.
+func (m *Manager) inNetnsOutput(name string, command string, args ...string) ([]byte, error) {
+	full := append([]string{"--net=" + m.netnsPath(name), command}, args...)
+	return m.sys.output("nsenter", full...)
+}
+
+// runInNetnsMount runs a command inside a named namespace AND a private mount
+// namespace. The private mount namespace is what lets the engine bind a public
+// resolver over /etc/resolv.conf for slirp and cloudflared WITHOUT touching the
+// host's /etc/resolv.conf: `unshare -m` isolates the mount, then `nsenter
+// --net` enters the target network namespace. This is the measured-safe
+// replacement for the earlier approach, which leaked a resolver bind onto the
+// host because `nsenter --net` alone shares the host mount namespace.
+func (m *Manager) runInNetnsMount(netns, resolvConf string, command string, args ...string) *exec.Cmd {
+	// The inner shell binds the resolver (when set), then execs nsenter so no
+	// wrapper process survives; nsenter in turn execs the target command.
+	script := ""
+	if resolvConf != "" {
+		script = "mount --bind " + shellQuote(resolvConf) + " /etc/resolv.conf && "
+	}
+	script += "exec nsenter --net=" + shellQuote(netns) + " " + shellJoin(append([]string{command}, args...))
+	return exec.Command("unshare", "-m", "sh", "-c", script)
+}
+
+// shellQuote single-quotes a string for /bin/sh.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// shellJoin quotes each argument for /bin/sh.
+func shellJoin(args []string) string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = shellQuote(a)
+	}
+	return strings.Join(out, " ")
 }

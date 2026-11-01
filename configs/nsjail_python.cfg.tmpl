@@ -103,12 +103,14 @@ mount {
 
 {{- if .AllowNet }}
 
-# Egress configuration. The workspace is in its OWN network namespace with no
-# default route, so the host's /etc/resolv.conf is useless and deliberately NOT
-# mounted (ADR 42/: leaking the host search domain and nameservers into an
-# isolated workload is exactly what isolation avoids). When the engine's
-# userspace egress proxy is running, a per-run resolv.conf naming the hub's DNS
-# forwarder is mounted instead. /etc/hosts still carries the localhost mapping.
+# Egress configuration. The workspace is in its OWN network namespace, connected
+# to the public internet ONLY through chained slirp4netns instances (a UNIX
+# socket, never a host interface or route). The host's /etc/resolv.conf is
+# useless there and deliberately NOT mounted (ADR 42/: leaking the host search
+# domain and nameservers into an isolated workload is exactly what isolation
+# avoids). Instead a per-run resolv.conf naming PUBLIC resolvers is mounted; the
+# workspace reaches them through the chained egress, and the relay blackholes
+# every operator-private range so the host LAN stays unreachable.
 {{- if .ResolverConf }}
 mount {
   src: "{{ .ResolverConf }}"

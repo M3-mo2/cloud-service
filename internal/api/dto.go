@@ -31,7 +31,7 @@ type limitsJSON struct {
 	MaxRuns            int     `json:"max_runs"`
 	AllowNet           bool    `json:"allow_net"`
 	AllowUnlimitedRuns bool    `json:"allow_unlimited_runs"`
-	AllowPorts         bool    `json:"allow_ports"`
+	AllowTunnels       bool    `json:"allow_tunnels"`
 }
 
 func toWorkspaceJSON(w *model.Workspace) workspaceJSON {
@@ -58,7 +58,7 @@ func toLimitsJSON(l model.Limits) limitsJSON {
 		MaxRuns:            l.MaxRuns,
 		AllowNet:           l.AllowNet,
 		AllowUnlimitedRuns: l.AllowUnlimitedRuns,
-		AllowPorts:         l.AllowPorts,
+		AllowTunnels:       l.AllowTunnels,
 	}
 }
 
@@ -88,7 +88,7 @@ func (r *createWorkspaceRequest) toLimits() *model.Limits {
 		MaxRuns:            r.Limits.MaxRuns,
 		AllowNet:           r.Limits.AllowNet,
 		AllowUnlimitedRuns: r.Limits.AllowUnlimitedRuns,
-		AllowPorts:         r.Limits.AllowPorts,
+		AllowTunnels:       r.Limits.AllowTunnels,
 	}
 }
 
@@ -103,7 +103,7 @@ type patchLimitsJSON struct {
 	MaxRuns            *int     `json:"max_runs"`
 	AllowNet           *bool    `json:"allow_net"`
 	AllowUnlimitedRuns *bool    `json:"allow_unlimited_runs"`
-	AllowPorts         *bool    `json:"allow_ports"`
+	AllowTunnels       *bool    `json:"allow_tunnels"`
 }
 
 // patchWorkspaceRequest is the PATCH /v1/workspaces/{id} body.
@@ -124,7 +124,7 @@ func (r *patchWorkspaceRequest) toUpdate() service.WorkspaceUpdate {
 			MaxRuns:            r.Limits.MaxRuns,
 			AllowNet:           r.Limits.AllowNet,
 			AllowUnlimitedRuns: r.Limits.AllowUnlimitedRuns,
-			AllowPorts:         r.Limits.AllowPorts,
+			AllowTunnels:       r.Limits.AllowTunnels,
 		}
 	}
 	return upd

@@ -18,11 +18,11 @@ const (
 	WorkspaceIDPrefix = "ws_"
 	RunIDPrefix       = "run_"
 	SessionIDPrefix   = "ses_"
-	PortIDPrefix      = "prt_"
+	TunnelIDPrefix    = "tun_"
 )
 
-// NewPortID returns a new published-port identifier.
-func NewPortID() string { return NewID(PortIDPrefix) }
+// NewTunnelID returns a new tunnel identifier.
+func NewTunnelID() string { return NewID(TunnelIDPrefix) }
 
 // NewID returns a ULID string with the given prefix.
 func NewID(prefix string) string {
@@ -51,11 +51,13 @@ type Limits struct {
 	// the server-level max_limits.allow_unlimited_runs must be true for an
 	// unlimited run to be accepted; otherwise the request is refused with 422.
 	AllowUnlimitedRuns bool `json:"allow_unlimited_runs"`
-	// AllowPorts opts a workspace in to published ports. It is false by default.
-	// Both this workspace flag and the server-level ports.enabled must be true
-	// for POST /v1/workspaces/{id}/ports to publish; otherwise the request is
-	// refused with 422. It mirrors the AllowUnlimitedRuns two-key pattern.
-	AllowPorts bool `json:"allow_ports"`
+	// AllowTunnels opts a workspace in to quick Cloudflare tunnels. It is false
+	// by default. Both this workspace flag and the server-level tunnels.enabled
+	// must be true for POST /v1/workspaces/{id}/tunnels to create a tunnel;
+	// otherwise the request is refused with 422. A tunnel additionally requires
+	// allow_net, because cloudflared needs egress to reach Cloudflare. It
+	// mirrors the AllowUnlimitedRuns two-key pattern.
+	AllowTunnels bool `json:"allow_tunnels"`
 }
 
 // Workspace statuses.
@@ -226,42 +228,38 @@ const (
 // SetExitCode records a session exit code.
 func (s *Session) SetExitCode(code int) { s.ExitCode = &code }
 
-// Published port statuses. A port is `published` when the workspace is
-// currently listening on it (the engine probed the working end) and
-// `unreachable` when the record exists but nothing answers inside the
-// workspace. The status is honest: it reflects a live observation, never an
-// assumption that publishing succeeded.
+// Tunnel statuses. A tunnel is `active` while its cloudflared process is
+// running and a public URL was observed; `stopped` once it has been deleted.
+// The URL is only ever recorded from cloudflared's own output, never
+// fabricated.
 const (
-	PortPublished   = "published"
-	PortUnreachable = "unreachable"
+	TunnelActive  = "active"
+	TunnelStopped = "stopped"
 )
 
-// PublishedPort is an engine-managed host-port mapping onto a workspace's own
-// private port. The forward target is always derived from the workspace's own
-// network allocation (AllocationAddr), never from request data, so the mapping
-// can never be turned into an open relay.
-type PublishedPort struct {
+// Tunnel is an engine-managed quick Cloudflare tunnel exposing one port inside
+// a workspace's own network namespace to the public internet. The cloudflared
+// process runs INSIDE the workspace's namespace and reaches Cloudflare over the
+// chained slirp4netns egress, so no host interface, route or listener is used.
+//
+// URL is captured from cloudflared's own output (a random
+// https://<name>.trycloudflare.com address) after a bounded wait; a tunnel is
+// never recorded with a URL the engine did not observe.
+type Tunnel struct {
 	ID          string `json:"id"`
 	WorkspaceID string `json:"workspace_id"`
 	OwnerID     string `json:"owner_id"`
 	// Port is the port the workspace listens on inside its own network
-	// namespace.
+	// namespace, which cloudflared connects to at localhost:Port.
 	Port int `json:"port"`
-	// Protocol is the transport; only "tcp" is supported.
-	Protocol string `json:"protocol"`
-	// Name is an optional human label.
-	Name string `json:"name,omitempty"`
-	// HostPort is the engine-allocated host port, always inside the configured
-	// host_range and unique across the whole host.
-	HostPort int `json:"host_port"`
-	// Host is the bind address the forwarder listens on.
-	Host string `json:"host"`
-	// Status is PortPublished or PortUnreachable, from the last observation.
+	// URL is the public https://<name>.trycloudflare.com address cloudflared
+	// printed. It is empty until observed.
+	URL string `json:"url"`
+	// Status is TunnelActive or TunnelStopped.
 	Status string `json:"status"`
-	// AllocationAddr is the workspace's private address the forwarder dials
-	// (from the workspace network allocation). It is engine-owned, not
-	// request-supplied.
-	AllocationAddr string    `json:"-"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	// PID is the host pid of the cloudflared process (engine-owned). It is not
+	// part of the API response and is used to stop the exact process.
+	PID       int       `json:"-"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
