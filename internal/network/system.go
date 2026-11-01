@@ -93,10 +93,14 @@ func toolAvailable(name string) bool {
 // process's /proc/<pid>/ns/net into /run/netns works, and the namespace then
 // outlives the holder because the bind mount holds a reference.
 //
-// The child writes nothing; the pid used is the direct child of `unshare -n`,
-// which exec's the sleep in the freshly unshared namespace. (Callers must NOT
-// wrap this in sudo: sudo would return sudo's own pid, capturing the host
-// namespace — a trap this package's tests guard against.)
+// SAFETY: after Start() the direct child has been forked but may not yet have
+// exec'd `unshare`; in that window /proc/<pid>/ns/net is still the HOST
+// namespace, and binding it would put the host network namespace at <path> —
+// exactly the failure that once took the host down. createNetns therefore waits
+// until the child's namespace DIFFERS from the caller's, then binds, and finally
+// verifies the bound namespace is not the host's, removing it and failing
+// loudly otherwise. A namespace that is not distinct from the host is never
+// returned.
 func (m *Manager) createNetns(name string) (string, error) {
 	if err := os.MkdirAll(m.cfg.NetnsDir, 0o755); err != nil {
 		return "", err
@@ -119,20 +123,93 @@ func (m *Manager) createNetns(name string) (string, error) {
 		_, _ = holder.Process.Wait()
 	}()
 
+	self, err := nsIdentity("/proc/self/ns/net")
+	if err != nil {
+		return "", fmt.Errorf("read host namespace: %w", err)
+	}
 	nsFile := fmt.Sprintf("/proc/%d/ns/net", pid)
+
+	// Wait for the child to enter its own namespace (its identity differs from
+	// ours), then bind-mount it. Binding before the child has exec'd `unshare`
+	// would capture the host namespace.
 	deadline := time.Now().Add(2 * time.Second)
+	bound := false
 	for {
-		if _, err := os.Stat(nsFile); err == nil {
+		if id, ierr := nsIdentity(nsFile); ierr == nil && id != self {
 			if err := m.sys.run("mount", "--bind", nsFile, path); err == nil {
+				bound = true
 				break
 			}
 		}
 		if time.Now().After(deadline) {
-			return "", fmt.Errorf("bind-mount namespace %s: timed out", path)
+			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	if !bound {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("bind-mount namespace %s: child did not enter a private namespace", path)
+	}
+
+	// Verify the bound namespace is not the host's (compare namespace identity,
+	// not a readlink: a bind-mounted nsfs file is not a symlink). If it is the
+	// host's, remove it and fail rather than hand back a host namespace that
+	// would let a workspace share the host network.
+	if id, ierr := nsIdentity(path); ierr != nil || id == self {
+		_ = m.sys.run("umount", path)
+		_ = os.Remove(path)
+		return "", fmt.Errorf("namespace %s resolved to the host network namespace; refusing to use it", path)
+	}
 	return path, nil
+}
+
+// nsIdentity returns a comparable identity for the network namespace at a path.
+// It uses the namespace inode (via stat) rather than readlink, because a
+// bind-mounted nsfs file at /run/netns/<name> is not a symlink and readlink on
+// it fails; the inode is the namespace's identity either way.
+func nsIdentity(path string) (uint64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("cannot stat %s", path)
+	}
+	// (dev, ino) together identify the namespace; on Linux nsfs the inode alone
+	// is the namespace id, but mixing in dev is free and safe.
+	return st.Dev<<32 ^ st.Ino, nil
+}
+
+// namespacePathIsHost reports whether a bound namespace path is the caller's
+// own (the host) namespace. It is a last-line guard used by callers that reuse
+// a pre-existing path.
+func (m *Manager) namespacePathIsHost(path string) bool {
+	self, err := nsIdentity("/proc/self/ns/net")
+	if err != nil {
+		return true
+	}
+	id, err := nsIdentity(path)
+	if err != nil {
+		return true
+	}
+	return id == self
+}
+
+// ensurePrivateNetns returns a namespace path at <netnsDir>/<name> that is
+// guaranteed to be a private namespace distinct from the host's. It creates the
+// namespace when absent, and replaces a stale path that resolves to the host
+// namespace (the one dangerous leftover a hard death can leave).
+func (m *Manager) ensurePrivateNetns(name string) (string, error) {
+	path := m.netnsPath(name)
+	if _, err := os.Stat(path); err == nil {
+		if !m.namespacePathIsHost(path) {
+			return path, nil
+		}
+		// Stale path pointing at the host namespace: never reuse it.
+		m.destroyNetns(name)
+	}
+	return m.createNetns(name)
 }
 
 // destroyNetns unmounts and removes a named namespace. The namespace itself

@@ -23,17 +23,26 @@ RUN git clone --depth 1 --branch "${NSJAIL_VERSION}" \
         https://github.com/google/nsjail.git /nsjail \
     && make -C /nsjail
 
-# Runtime stage: nsjail + python3, no toolchain.
+# Runtime stage: nsjail + python3 + cloudflared + slirp4netns, no toolchain.
 FROM ubuntu:24.04 AS runtime
 
+# cloudflared is fetched from its own release (it is not packaged). It lives in
+# /usr/local/bin, which the sandbox bind-mounts read-only at the same path, so it
+# is on PATH inside a workspace too. Pin a known-good version.
+ARG CLOUDFLARED_VERSION=2026.10.7
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         python3 \
+        slirp4netns \
         libprotobuf32t64 \
         libnl-3-200 \
         libnl-route-3-200 \
         libstdc++6 \
         zlib1g \
+    && curl -fsSL -o /usr/local/bin/cloudflared \
+        "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
+    && chmod +x /usr/local/bin/cloudflared \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system sandbox \
     && useradd --system --gid sandbox --no-create-home --shell /usr/sbin/nologin sandbox
@@ -48,7 +57,8 @@ COPY api/ /app/api/
 RUN mkdir -p /app/data && chown -R sandbox:sandbox /app/data
 
 # nsjail needs privileges to create namespaces and write the cgroup v2 subtree.
-# Run the container with:
+# Egress uses slirp4netns over UNIX sockets and needs the host netns to create
+# the relay; it changes no host interface or route. Run the container with:
 #   --privileged                 (or --cap-add=SYS_ADMIN --cap-add=NET_ADMIN)
 #   --cgroupns=host              (required for cgroup v2 ceilings)
 # Without --cgroupns=host, nsjail cannot apply memory/pids/cpu limits and every

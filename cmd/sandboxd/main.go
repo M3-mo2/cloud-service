@@ -153,6 +153,9 @@ func main() {
 	if !svc.ShutdownSessions(5 * time.Second) {
 		logger.Warn("session drain deadline exceeded; some sessions may not have terminated")
 	}
+	// Stop every slirp instance, tunnel and the relay. On the way out, no
+	// engine-owned network process is left running.
+	netMgr.Stop()
 	logger.Info("stopped")
 }
 

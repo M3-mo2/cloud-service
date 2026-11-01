@@ -155,10 +155,8 @@ func (m *Manager) EnsureRelay() error {
 		return nil
 	}
 
-	if _, err := os.Stat(m.netnsPath(m.cfg.RelayNetns)); err != nil {
-		if _, err := m.createNetns(m.cfg.RelayNetns); err != nil {
-			return fmt.Errorf("create relay namespace: %w", err)
-		}
+	if _, err := m.ensurePrivateNetns(m.cfg.RelayNetns); err != nil {
+		return fmt.Errorf("create relay namespace: %w", err)
 	}
 	// Loopback up so an inner tool can bind 127.0.0.1 in the relay.
 	_ = m.inNetns(m.cfg.RelayNetns, "ip", "link", "set", "lo", "up")
@@ -297,22 +295,22 @@ func (m *Manager) ensureWorkspaceLocked(wsID string) (*Allocation, error) {
 }
 
 // buildWorkspaceEgress creates the workspace namespace and connects it to the
-// relay with an inner slirp4netns. It creates no host interface or route.
+// relay with an inner slirp4netns. It creates no host interface or route. The
+// namespace is created fresh (createNetns removes any stale path and refuses a
+// namespace that resolves to the host), so a rebuild always starts with a clean
+// tap0.
 func (m *Manager) buildWorkspaceEgress(alloc *Allocation) error {
 	name := m.wsNetnsName(alloc.WorkspaceID)
-	if _, err := os.Stat(m.netnsPath(name)); err != nil {
-		if _, err := m.createNetns(name); err != nil {
-			return fmt.Errorf("create workspace namespace: %w", err)
-		}
-	}
-	_ = m.inNetns(name, "ip", "link", "set", "lo", "up")
-
-	// A stale inner slirp from a prior hard death would hold tap0 busy; stop
-	// the one this manager started for this workspace, if any.
+	// A stale inner slirp from a prior hard death would hold tap0 busy; stop the
+	// one this manager started for this workspace, if any.
 	if p := m.slirpCmds[alloc.WorkspaceID]; p != nil {
 		_ = p.Kill()
 		delete(m.slirpCmds, alloc.WorkspaceID)
 	}
+	if _, err := m.createNetns(name); err != nil {
+		return fmt.Errorf("create workspace namespace: %w", err)
+	}
+	_ = m.inNetns(name, "ip", "link", "set", "lo", "up")
 
 	proc := m.startSlirp(name, alloc.CIDR.String(), false)
 	if proc == nil {
@@ -320,6 +318,7 @@ func (m *Manager) buildWorkspaceEgress(alloc *Allocation) error {
 	}
 	if err := m.waitInterface(name, m.cfg.Network.StartTimeout()); err != nil {
 		_ = proc.Kill()
+		m.destroyNetns(name)
 		return fmt.Errorf("connect workspace to relay: %w", err)
 	}
 	m.slirpCmds[alloc.WorkspaceID] = proc
@@ -334,10 +333,8 @@ func (m *Manager) EnsureEmptyWorkspace(wsID string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	name := m.wsNetnsName(wsID)
-	if _, err := os.Stat(m.netnsPath(name)); err != nil {
-		if _, err := m.createNetns(name); err != nil {
-			return "", fmt.Errorf("create workspace namespace: %w", err)
-		}
+	if _, err := m.ensurePrivateNetns(name); err != nil {
+		return "", fmt.Errorf("create workspace namespace: %w", err)
 	}
 	_ = m.inNetns(name, "ip", "link", "set", "lo", "up")
 	return m.netnsPath(name), nil
