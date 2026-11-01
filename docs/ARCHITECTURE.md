@@ -464,7 +464,7 @@ fly (`configs/nsjail_python.cfg.tmpl`). The rendered sandbox has:
 
 | Layer | Setting | Effect | Applied when |
 |-------|---------|--------|--------------|
-| Namespaces | `clone_newpid/ns/ipc/uts/user` always; `newnet` unless `allow_net` | Isolated PID, mount, IPC, UTS, user; no network | always |
+| Namespaces | `clone_newpid/ns/ipc/uts/user` always; network is always private (own ns) | Isolated PID, mount, IPC, UTS, user, network | always |
 | mount ns | host `/usr`,`/lib`,`/lib64`,`/bin`,`/sbin` RO; workspace RW at `/workspace`; private `/tmp` | Child sees only the runtime + its own files | always |
 | `/proc` | `mount_proc: false` | Host process table not visible | always |
 | cgroup v2 | `cgroup_mem_max` (bytes), `cgroup_pids_max`, `cgroup_cpu_ms_per_sec` | Memory, process-count, CPU throttling | **only with `--cgroupns=host`** |
@@ -569,14 +569,17 @@ second**:
 
 **Conditional DNS mounts.** `/etc/resolv.conf` and `/etc/hosts` are bind-mounted
 read-only **only when `allow_net` is true**. Without `allow_net`, the network
-namespace is cloned and there is nothing to resolve, so the host resolver is not
-exposed; with `allow_net`, the mounts are required or `getaddrinfo` fails with
-`Temporary failure in name resolution` even though raw-IP TCP works (see §5.6).
+namespace is empty and there is nothing to resolve, so no resolver is exposed;
+with `allow_net`, the mounted resolver names **public** resolvers reached
+through the workspace's chained-slirp4netns egress (see §5.6). The host's own
+resolver is never published to a workspace.
 
 Consequences proven by the acceptance transcript: a jailed process cannot read
-`/etc/shadow` (`FileNotFoundError` — it simply isn't mounted), cannot open a
-network socket (`OSError`), and dies with `SIGSYS` if it calls `mount(2)` or
-`ptrace`.
+`/etc/shadow` (`FileNotFoundError` — it simply isn't mounted) and dies with
+`SIGSYS` if it calls `mount(2)` or `ptrace`. A workspace without `allow_net`
+cannot open a network socket (`OSError`); a workspace with `allow_net` can reach
+the public internet and a public resolver but not the host LAN (measured by
+[`scripts/tunnel-check.sh`](../scripts/tunnel-check.sh)).
 
 ### 5.3 UID/GID mapping — the trickiest part
 
@@ -640,20 +643,32 @@ flowchart LR
     C4 --> C5
 ```
 
-### 5.6 Name resolution inside the jail
+### 5.6 Egress and name resolution inside the jail
 
-`clone_newnet: false` (set when `allow_net` is true) shares the host network
-namespace, so a jailed process can open a socket to a raw IP. Name resolution,
-however, is a *userspace* resolver problem: libc reads `/etc/resolv.conf` and
-`/etc/hosts`, and those files were **not** mounted into the jail, so
-`getaddrinfo` failed with `Temporary failure in name resolution` even with the
-network reachable — which broke `pip install` and every hostname-using workload.
-The fix bind-mounts both files read-only, **conditional on `allow_net`**
-(`{{ if .AllowNet }}` in the template), so a workspace without network does not
-leak the host's resolver configuration either. Two render tests pin both
-directions (`TestRenderConfigMountsResolverWhenNetAllowed`,
-`TestRenderConfigOmitsResolverWhenNetDenied`); see
-[VERIFICATION.md §8](VERIFICATION.md).
+An `allow_net` workspace is in its **own** network namespace, connected to the
+public internet only through **chained slirp4netns**:
+
+```
+workspace ns --slirp(UNIX socket)--> relay ns --slirp(UNIX socket)--> host
+```
+
+slirp4netns speaks to its parent over a UNIX socket and creates a tap interface
+only inside the *child* namespace, so there are **zero host interfaces, routes or
+veth pairs**. The engine-owned relay namespace carries a blackhole route for
+every operator-private range, so a workspace reaches the public internet and a
+public resolver but never the host LAN. (The earlier `clone_newnet: false`
+host-network share is gone; see [DECISIONS.md](DECISIONS.md) #64.)
+
+Name resolution is a *userspace* resolver problem: libc reads `/etc/resolv.conf`
+and `/etc/hosts`. Both are bind-mounted read-only **conditional on `allow_net`**
+(`{{ if .AllowNet }}` in the template), but the mounted `resolv.conf` names
+**public** resolvers (`network.resolver`) — the host's own resolver is never
+published. A workspace without `allow_net` gets a private, empty namespace and
+no resolver. Render tests pin both directions
+(`TestRenderConfigMountsResolverWhenNetAllowed`,
+`TestRenderConfigOmitsResolverWhenNetDenied`); the live egress and isolation are
+measured by [`scripts/tunnel-check.sh`](../scripts/tunnel-check.sh); see
+[VERIFICATION.md §8 and §9g](VERIFICATION.md).
 
 ---
 

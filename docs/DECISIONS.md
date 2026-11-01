@@ -8,6 +8,9 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
    Per-UID-per-workspace deferred to v0.1.
 2. **Network**: disabled by default; workspace field `allow_net: bool` (default false).
    _Rationale_: least privilege by default; no host allowlist exists in v0.0.5.
+   **Extended in v0.0.14 (#64):** `allow_net:true` no longer shares the host network
+   namespace. It gives the workspace its own namespace with egress through chained
+   slirp4netns, isolated from the host LAN.
 3. **Log retention**: keep the last 100 runs per workspace, pruned on new run start.
    _Rationale_: bounds disk growth without a background GC.
 4. **Exec vs Runs**: `exec` (sync) and `runs` (async) are separate endpoints but share one executor.
@@ -179,6 +182,9 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     would publish the host's search domain and nameservers to a workload with no network to use
     them. The alternative — mounting the resolver unconditionally — was rejected because it widens
     what a `allow_net:false` workspace can observe for no benefit.
+    **Superseded in part by #64 (v0.0.14):** the mechanism that made name resolution fail was the
+    host-network share, which no longer exists; the resolver mount is retained, but it now names
+    **public resolvers** reached through the chained-slirp4netns egress, never the host's.
 43. **Sandbox behaviour that needs privileges is tested against the rendered config.** Where the
     host cannot run a real nsjail (no `nsjail` binary / unprivileged orchestrator), the assertions
     are made on the **generated nsjail configuration** — e.g.
@@ -518,12 +524,119 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     returns to baseline, and an orphan reaped by a second start after a forced
     daemon death.
 
+## v0.0.14 — per-workspace egress and quick public tunnels
+
+64. **The host-topology design is ABANDONED and deleted; egress is delivered by
+    chained slirp4netns.**
+    _Context_: `allow_net:true` used to render `clone_newnet:false`, putting the
+    workload **inside the host's own network namespace**, so it could bind host
+    ports (including `22`/`8080`/`8081`) and reach the operator's LAN
+    (`10.9.112.0/22`). An earlier "per-workspace networking" attempt tried to fix
+    this by creating host `veth` pairs, assigning addresses and adding routes
+    (`ip link add … type veth peer`, `ip addr add 10.199.0.1/30 dev …`, `ip route
+    add 10.200.0.0/16 via …`). **That attempt took the target host off the network
+    three times in one evening (18:24Z, 20:54Z, 21:42Z), each time needing an
+    out-of-band restart**, and even had a before/after guard that did not
+    prevent it. It is **deleted from this tree** (`internal/network/{network,egress,
+    forwarder,ports}.go` veth/hub code and the published-ports
+    `internal/api/ports.go` + `internal/service/ports.go` are removed).
+    _Decision_: an `allow_net:true` workspace gets its **own** network namespace
+    connected to the public internet only through **chained slirp4netns**:
+    `workspace ns --slirp(UNIX socket)--> relay ns --slirp(UNIX socket)--> host`.
+    slirp4netns speaks to its parent over a **UNIX socket** and wires a tap
+    interface only inside the child namespace, so there are **zero host
+    interfaces, zero host routes and zero veth pairs** — the measured proof is
+    `scripts/tunnel-check.sh` §8 (host `ip -o link`/`ip route` identical before and
+    after). The engine-owned **relay** namespace carries a blackhole route for
+    every operator-private range (`10.0.0.0/8`, `172.16.0.0/12`,
+    `192.168.0.0/16`, `169.254.0.0/16`, `100.64.0.0/10`), so a workspace reaches
+    the public internet and a public resolver but **never the host LAN, the host's
+    own services, or another workspace**. `allow_net:false` gets a private, empty
+    namespace. **The rule is absolute: no `ip link add/del`, `ip addr add`, `ip
+    route add`, `ip netns add` or interface rename on the host, ever.**
+    _Rejected alternatives_: (a) `slirp4netns` alone without the relay — measured
+    to NAT the guest through the **host's** routing table, so the guest reached
+    `10.9.112.7:22`, `10.9.112.1:53` and `10.9.112.4:443` (the operator's own
+    infrastructure); `--disable-host-loopback` does not fix a routed LAN. (b)
+    iptables/nft NAT — **not installed** on the target host. (c) any host
+    veth/bridge/macvlan — the three-outage hazard above.
+
+65. **`createNetns` must never bind the host namespace.**
+    _Context_: a first version of the namespace creator read
+    `/proc/<pid>/ns/net` immediately after `Start()`, **before the child had
+    exec'd `unshare`**; in that window the child was still in the host namespace,
+    so the bind put the **host** netns at `/run/netns/sbxdrelay` and the "relay"
+    connected to the host network (measured: the host grew a `tap0` and a default
+    route). This is the same `$!`-is-`sudo`-not-`unshare` trap the earlier
+    experiments documented.
+    _Decision_: `createNetns` waits until the child's namespace **identity**
+    differs from the host's before binding, then verifies the **bound**
+    namespace's identity and refuses a namespace that resolves to the host.
+    Identity is `stat` dev:inode (a bind-mounted nsfs file is **not** a symlink, so
+    `readlink` on it fails — an earlier check used `readlink` and always "saw" the
+    host). `ensurePrivateNetns` replaces a stale path that resolves to the host;
+    `EnsureRelay` uses it. A namespace that is not distinct from the host is never
+    returned.
+    _Rationale_: a host-netns bind is exactly the catastrophic failure the whole
+    design exists to prevent, so it is defended structurally, not by a diff.
+
+66. **Quick Cloudflare tunnels, and the URL is only ever an observed one.**
+    _Context_: the operator wants one command to expose a workspace port publicly:
+    "لوكل هوست بورت ٥٠٠٠ بأمر واحد يطلع للعام".
+    _Decision_: `POST /v1/workspaces/{id}/tunnels {port:5000}` runs
+    `cloudflared tunnel --url http://localhost:5000` **inside the workspace's own
+    namespace** and returns the `https://<name>.trycloudflare.com` URL captured
+    from **cloudflared's own output** with a bounded wait
+    (`tunnels.url_timeout_sec`). If no URL is observed the create fails with **504
+    `tunnel_url_unavailable`** and leaves no record — **the engine never
+    fabricates a URL**. The user's own simplest path works too: cloudflared is on
+    `PATH` in the sandbox (the sandbox mounts `/usr`), so a shell inside the
+    workspace can run `cloudflared tunnel --url http://localhost:5000` directly.
+    _Rationale_: quick tunnels need **no account and no token**, so the feature
+    needs no Cloudflare credential at all; a fabricated URL would be a lie the
+    house rule forbids. **Quick tunnels only** — no named tunnel, no account, no
+    `GIT_TOKEN`-style secret.
+
+67. **Tunnels are default-deny (two keys) and die with their workspace.**
+    _Decision_: a tunnel is created only when `tunnels.enabled` (server) **and**
+    `limits.allow_tunnels` (workspace) are true, **and** the workspace has
+    `allow_net` (cloudflared must reach Cloudflare); otherwise `422
+    tunnels_disabled` with `details.config` naming the refusing level. This mirrors
+    the `allow_unlimited_runs` two-key pattern exactly. A tunnel dies with its
+    workspace (`stop`/`suspend`/`DELETE`), and **startup reaps orphaned
+    cloudflared processes**, matched by `comm == cloudflared` plus a quick-tunnel
+    argv (`tunnel … --url …`) so an operator's own named tunnel is never touched.
+    _Rationale_: exposing a port to the public internet is a real capacity and
+    abuse risk and must be a doubly-consented, default-deny act; and a public URL
+    that outlives its workspace is a leak.
+
+68. **The egress layer and the relay are default-deny and platform-honest.**
+    _Decision_: `network.enabled` (default false) gates the whole egress fabric.
+    When it is off, or when `nsenter`/`unshare`/`mount`/`slirp4netns` is missing,
+    an `allow_net:true` workspace gets a private **empty** namespace (no egress) —
+    never the host network. `/readyz` and `/v1/meta` report `network` and
+    `tunnels` with `enabled`/`ready`/`reason` truthfully; `PATCH` rejects an
+    opt-in the server forbids with `422` (the F-22 discipline). A slirp interface
+    that does not come up within the bound aborts the setup with a reason rather
+    than hanging.
+    _Rationale_: an operator must be able to see, from `/readyz`, whether egress
+    and tunnels can actually serve; and a missing tool must degrade to **less**
+    capability, never to a host-network share.
+
+69. **The privileged-port rule applies to tunnels.**
+    _Decision_: a tunnel for a port below `1024` is refused with `400`, and a port
+    outside `1–65535` with `400`. _Rationale_: the sandbox runs as an
+    unprivileged uid and can never bind a privileged port, so accepting the
+    request would return a URL that can never answer; refusing it honestly is the
+    only truthful option.
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.
 - **Error codes**: `unauthorized`, `forbidden`, `not_found`, `conflict`, `workspace_suspended`,
-  `validation`, `unprocessable`, `not_directory`, `payload_too_large`, `timeout`, `unavailable`,
-  `internal`. _Rationale_: fixed vocabulary mapped 1:1 from HTTP status.
+  `too_many_sessions`, `session_ended`, `tunnels_disabled`, `too_many_tunnels`, `validation`,
+  `unprocessable`, `not_directory`, `payload_too_large`, `timeout`, `tunnel_url_unavailable`,
+  `unavailable`, `internal`. _Rationale_: fixed vocabulary mapped 1:1 from HTTP status.
 - **CWD default**: `/` normalizes to the workspace root `/workspace` inside the sandbox.
   _Rationale_: the workspace is the only mounted path users should see.
 - **Log offset semantics**: byte offsets into the log file; `next` is the offset to pass on the

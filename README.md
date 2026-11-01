@@ -29,8 +29,14 @@ A secure per-user code execution backend exposed over HTTP/JSON.
   `GET /v1/workspaces/{id}/usage`.
 - **Two-tier Python packages** — a shared read-only tier plus a private writable
   per-workspace tier, with `GET/POST/DELETE .../packages`.
-- **Isolation** — no network by default (`allow_net` opts in); when it is
-  enabled, the resolver is mounted so names resolve.
+- **Isolation** — no network by default (`allow_net` opts in). An `allow_net`
+  workspace gets its own network namespace with outbound internet through
+  **chained slirp4netns over UNIX sockets** (zero host interfaces or routes),
+  isolated from the host LAN. See [docs/DECISIONS.md](docs/DECISIONS.md) #64.
+- **Quick public tunnels** — one command exposes a workspace port to the public
+  internet with cloudflared quick tunnels (no account, no token): `POST
+  /v1/workspaces/{id}/tunnels {"port":5000}` returns the observed
+  `https://…trycloudflare.com` URL. Default-deny, and the URL is never fabricated.
 
 See [docs/API.md](docs/API.md) for the full endpoint reference.
 

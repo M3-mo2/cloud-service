@@ -1242,11 +1242,13 @@ engine namespaces. The unprivileged suite covers the API contract
 
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **63** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **69** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
-service non-goal, and #63, native process control).
+service non-goal, #63, native process control, and #64–69, per-workspace
+egress via chained slirp4netns and quick Cloudflare tunnels, including the
+recorded host-topology hazard of the abandoned veth/route design).
 
 ## 11. OpenAPI
 
