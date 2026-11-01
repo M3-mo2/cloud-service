@@ -245,9 +245,12 @@ curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 List the caller's workspaces.
 
 - **Response 200:** `{"workspaces":[ <workspace>, ... ]}`, newest first, with
-  `status:"active"` entries only.
+  both `status:"active"` and `status:"suspended"` entries (only the internal
+  `deleted` marker, which deletion never writes because it removes the tree, is
+  filtered out).
 - **Errors:** 401 `unauthorized`.
-- **Semantics:** empty result is `{"workspaces":[]}` (never `null`).
+- **Semantics:** empty result is `{"workspaces":[]}` (never `null`). A
+  suspended workspace is still listed; use its `status` field to tell.
 
 ```sh
 curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/workspaces

@@ -274,6 +274,42 @@ current status and signals `false`. A stop both cancels the context and calls
 `runner.Kill`, which kills the whole process group; when a live process was
 signalled the response status is `killed`.
 
+### 4.5 Workspace lifecycle (control plane)
+
+Workspaces have their own small state machine, persisted in `meta.json` (the
+`status` field) so it survives a restart:
+
+```mermaid
+stateDiagram-v2
+    [*] --> active: POST /workspaces
+    active --> suspended: POST /{id}/suspend
+    suspended --> active: POST /{id}/resume
+    active --> active: POST /{id}/stop (stops runs, stays active)
+    suspended --> suspended: POST /{id}/stop (idempotent)
+```
+
+- **`suspend`** refuses *new* work (`exec`, run creation, and package
+  management → `409 workspace_suspended`) while leaving the data readable, and
+  stops every running/queued run.
+- **`resume`** accepts work again; it does not restart anything.
+- **`stop`** kills the workspace's running/queued runs but leaves it `active`
+  (new work is still accepted). It is a distinct control from `suspend`: same
+  kill path, opposite policy on future work.
+
+Both `status` and the mutable `limits` are written through `store.UpdateWorkspace`
+(atomic write-temp + rename), so a PATCH/suspend survives a process restart and
+is re-projected on load.
+
+**Control plane vs data plane.** The mutating, workspace-*state* endpoints are
+the control plane — `PATCH /workspaces/{id}`, `POST .../{suspend,resume,stop}`,
+the `DELETE .../runs*` purges, and package management
+(`POST .../packages/install`, `DELETE .../packages`). They change what the
+workspace *is* or *may do*. The data plane is everything that moves bytes or
+runs a workload: file CRUD, `exec`, `POST/GET .../runs`, run logs, and the
+read-only `GET .../usage` and `GET .../packages` observations. The split is not
+just naming: **suspension gates the work-starting control/data operations**
+(`exec`, `runs`, package management) while pure reads still answer.
+
 ---
 
 ## 5. The isolation model (the heart of the project)
@@ -315,6 +351,9 @@ flowchart TB
         H1["/usr /lib /lib64 /bin /sbin\n(read-only bind)"]
         H2["/etc/{passwd,group,nsswitch.conf,ld.so.cache}\n/etc/ssl/certs /etc/alternatives\n(read-only bind)"]
         H3["/dev/{null,zero,urandom}\n(read-only bind)"]
+        H7["/etc/{resolv.conf,hosts}\n(read-only bind, ONLY when allow_net)"]
+        H8["shared packages dir\n(read-only bind, if configured)"]
+        H9["{ws}/packages\n(read-write bind, per workspace)"]
         H4["/etc/shadow  → NOT mounted"]
         H5["host /proc   → NOT mounted"]
         H6["other tenants → NOT mounted"]
@@ -327,16 +366,43 @@ flowchart TB
         J3["/dev/* RO"]
         J4["/workspace  ← RW bind of\n./data/workspaces/{ws}/files"]
         J5["/tmp  ← RW private per-run dir"]
+        J7["/etc/{resolv.conf,hosts}\nRO (allow_net only)"]
+        J8["/opt/python/shared  ← RO bind\n(shared tier)"]
+        J9["/opt/python/private ← RW bind\n(private tier)"]
         J6["cwd = /workspace"]
     end
 
     H1 --> J1
     H2 --> J2
     H3 --> J3
+    H7 --> J7
+    H8 --> J8
+    H9 --> J9
     H4 -.->|absent| JAIL
     H5 -.->|absent| JAIL
     H6 -.->|absent| JAIL
 ```
+
+**Package tiers in the mount picture.** A workload imports from two tiers, added
+to the interpreter's search path via `PYTHONPATH`, **shared first, private
+second**:
+
+- `/opt/python/shared` — bind-mounted **read-only** (`rw:false`) from a single
+  host directory (`packages.shared_dir`). One package set, visible to every
+  workspace, and **no workspace can write it**; that kernel-enforced `rw:false`
+  is why the shared set can be trusted across tenants. It is omitted entirely if
+  the directory is missing/unreadable, and a run then degrades to private-only.
+- `/opt/python/private` — bind-mounted **read-write** (`rw:true`) from
+  `{data_dir}/workspaces/{ws_id}/packages`, chowned to the workspace's sandbox
+  uid. Writable because `pip install` targets it, and per-workspace because it
+  lives in the workspace's own tree (deleted with the workspace). A package
+  installed here is importable only in that workspace.
+
+**Conditional DNS mounts.** `/etc/resolv.conf` and `/etc/hosts` are bind-mounted
+read-only **only when `allow_net` is true**. Without `allow_net`, the network
+namespace is cloned and there is nothing to resolve, so the host resolver is not
+exposed; with `allow_net`, the mounts are required or `getaddrinfo` fails with
+`Temporary failure in name resolution` even though raw-IP TCP works (see §5.6).
 
 Consequences proven by the acceptance transcript: a jailed process cannot read
 `/etc/shadow` (`FileNotFoundError` — it simply isn't mounted), cannot open a
@@ -404,6 +470,21 @@ flowchart LR
     C3 -->|no| C5["done"]
     C4 --> C5
 ```
+
+### 5.6 Name resolution inside the jail
+
+`clone_newnet: false` (set when `allow_net` is true) shares the host network
+namespace, so a jailed process can open a socket to a raw IP. Name resolution,
+however, is a *userspace* resolver problem: libc reads `/etc/resolv.conf` and
+`/etc/hosts`, and those files were **not** mounted into the jail, so
+`getaddrinfo` failed with `Temporary failure in name resolution` even with the
+network reachable — which broke `pip install` and every hostname-using workload.
+The fix bind-mounts both files read-only, **conditional on `allow_net`**
+(`{{ if .AllowNet }}` in the template), so a workspace without network does not
+leak the host's resolver configuration either. Two render tests pin both
+directions (`TestRenderConfigMountsResolverWhenNetAllowed`,
+`TestRenderConfigOmitsResolverWhenNetDenied`); see
+[VERIFICATION.md §8](VERIFICATION.md).
 
 ---
 
@@ -686,11 +767,13 @@ Deferred to v0.1 (documented, not bugs):
 
 ## 13. Decision index
 
-The 34 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
+The 43 frozen product decisions live in [`docs/DECISIONS.md`](DECISIONS.md),
 including the isolation model, network default-off, retention (100 runs),
 exec-vs-runs split, disk-quota strategy, caps, path safety, process kill, error
 envelope, ULID IDs, health-probe semantics, the cgroup/rlimit/env/lifecycle
-corrections, and run recovery.
+corrections, run recovery, the workspace control plane (runtime-mutable limits,
+suspend vs stop, run filter/purge, usage accounting), the two-tier package model,
+and the conditional resolver mounts.
 
 ---
 

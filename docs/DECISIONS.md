@@ -168,6 +168,31 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     **400**, and `?name=` together with `?all=true` is a **400**. _Rationale_: an empty-name delete
     must never silently wipe a workspace's packages.
 
+## v0.0.8 — resolver mounts and verification scope
+
+42. **The resolver is mounted only when `allow_net` is set.** `/etc/resolv.conf` and `/etc/hosts`
+    are bind-mounted read-only into the jail **iff** the workspace has `allow_net:true`; a
+    workspace without network gets neither file. _Rationale_: sharing the host network namespace
+    (`clone_newnet:false`) without a `resolv.conf` made `getaddrinfo` fail with
+    `Temporary failure in name resolution` even though raw-IP TCP worked, which broke `pip install`
+    and any hostname-using workload; conversely, leaking the host resolver into a no-network jail
+    would publish the host's search domain and nameservers to a workload with no network to use
+    them. The alternative — mounting the resolver unconditionally — was rejected because it widens
+    what a `allow_net:false` workspace can observe for no benefit.
+43. **Sandbox behaviour that needs privileges is tested against the rendered config.** Where the
+    host cannot run a real nsjail (no `nsjail` binary / unprivileged orchestrator), the assertions
+    are made on the **generated nsjail configuration** — e.g.
+    `TestRenderConfigMountsResolverWhenNetAllowed` /
+    `TestRenderConfigOmitsResolverWhenNetDenied` assert the exact `mount { src, dst, is_bind, rw }`
+    blocks and `clone_newnet`, and the package-mount tests assert the shared tier renders `rw:false`
+    and the private tier `rw:true`. _Rationale_: the mount/rlimit/uidmap behaviour *is* the rendered
+    text, so asserting on it is a faithful test of the decision that needs no kernel privileges;
+    every claim that genuinely needs a live jail (actual `EROFS`, actual name resolution, actual
+    namespace isolation) is labelled **[requires privileged container]** in
+    [VERIFICATION.md](VERIFICATION.md) rather than implied to have run. The rejected alternative —
+    skipping the assertions entirely when nsjail is absent — would leave the resolver and tier
+    decisions untested on exactly the hosts most likely to regress them.
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.

@@ -11,7 +11,11 @@ execution backend exposed over HTTP/JSON.
 
 ## 0. GROUND RULES
 
-- Language: Go 1.22.
+- Language: Go 1.22 (the brief targeted 1.22; `go.mod` requires Go 1.23 because
+  the mandated koanf YAML parser declares a `go 1.23` floor — see
+  [DECISIONS.md](DECISIONS.md)). The service version string is `0.0.5`
+  (`model.Version`), which is independent of the per-feature decision groups in
+  DECISIONS.md.
 - OS: Ubuntu Noble (24.04), x86_64.
 - Router: `github.com/go-chi/chi/v5`.
 - Config: `github.com/knadh/koanf` (YAML).
@@ -40,8 +44,8 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 ### 2.1 Meta
 
 - `GET /healthz` → 200 `{"status":"ok"}`
-- `GET /readyz` → 200 or 503 `{"status","nsjail":bool,"data_dir":bool}`
-- `GET /v1/meta` → `{"version":"0.0.5","api_version":"v1","runtimes":["python3"],"limits_defaults":{...}}`
+- `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool}`
+- `GET /v1/meta` → `{"version":"0.0.5","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...}}`
 - `GET /metrics` → Prometheus text
 
 ### 2.2 Workspaces
@@ -49,13 +53,56 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 - `POST /v1/workspaces` body `{"name","limits?":{cpu_cores,memory_mb,disk_mb,max_wall_time_sec,max_runs,allow_net}}` → 201 `{workspace}`
 - `GET /v1/workspaces` → `{"workspaces":[...]}` (owned by caller)
 - `GET /v1/workspaces/{id}` → `{workspace}`
+- `PATCH /v1/workspaces/{id}` body `{"name?","limits?":{...}}` → 200 `{workspace}`
+  (runtime-mutable settings; see below)
 - `DELETE /v1/workspaces/{id}` → 204 (stop all runs, rm -rf workspace dir)
 
 Workspace JSON:
 
 ```json
-{"id":"ws_...","owner_id":"user_...","name":"...","created_at":"...","status":"active","limits":{}}
+{"id":"ws_...","owner_id":"user_...","name":"...","created_at":"...","status":"active","limits":{},"last_activity_at":"..."}
 ```
+
+`status` is `active` or `suspended` (`deleted` exists in the type vocabulary but
+is never persisted: a deleted workspace is removed outright). The status is
+persisted and survives a restart.
+
+**`PATCH` — runtime-mutable settings.** All fields are optional; an absent field
+**or an explicit `null`** keeps the current value (a `null` never resets a field
+to zero). Mutable: `name` (non-empty after trimming, `<= 128` chars) and every
+`limits` field (`cpu_cores`, `memory_mb`, `disk_mb`, `max_wall_time_sec`,
+`max_runs`, `allow_net`). `suspended` is **not** patchable — use the lifecycle
+endpoints. A numeric limit `<= 0` or **above the server maximum** is rejected
+with `422 unprocessable` (`details` carries `field`/`value`/`max`); it is never
+silently clamped. Lowering a limit applies to the **next** run/exec; a run
+already in flight finishes under its existing limits. The change is persisted
+atomically and survives a restart.
+
+**Lifecycle.**
+
+- `POST /v1/workspaces/{id}/suspend` → 200
+  `{"workspace","changed","stopped_run_ids","stopped_run_count"}`. Sets
+  `status:"suspended"` and stops every running/queued run (same kill path as
+  `stop`). While suspended, **work is refused**: `POST .../exec` and
+  `POST .../runs` return **`409 workspace_suspended`**, as do the package
+  management endpoints; reads (files, runs, logs) keep working. Idempotent
+  (`changed:false` when already suspended). Survives restart.
+- `POST /v1/workspaces/{id}/resume` → 200 `{"workspace","changed"}`. Sets
+  `status:"active"`; idempotent; does not restart stopped runs.
+- `POST /v1/workspaces/{id}/stop` → 200
+  `{"workspace","stopped_run_ids","stopped_run_count"}`. Kills every tracked run
+  but leaves the workspace `active` (accepting new work). Idempotent; a no-op
+  success when nothing is running.
+
+**Usage.** `GET /v1/workspaces/{id}/usage` → 200 with `workspace_id`, `status`,
+`created_at`, `last_activity_at`, `disk_bytes`, `disk_bytes_complete`, `disk_mb`,
+`disk_percent`, `runs_total`, `runs_by_status` (map status→count), `active_runs`
+(queued+running), `max_runs`, and the effective `limits`. `disk_bytes` is a
+**bounded walk** of the workspace `files/` tree (at most 100 000 directory
+entries); if the bound is hit, `disk_bytes_complete` is `false` and
+`disk_bytes` is a lower bound. `disk_percent` is
+`disk_bytes / (disk_mb * 1024 * 1024) * 100`. `last_activity_at` is the most
+recent run/mutation (run start/stop, purge, PATCH, suspend/resume/stop).
 
 ### 2.3 Files (per workspace)
 
@@ -84,20 +131,84 @@ Hard cap timeout (default 60 s). Captures capped at §1.8.
   - `{"kind":"file","file":"/main.py","args":[...],"env":{...},"timeout_sec":300}`
   - `{"kind":"command","argv":["python3","main.py"],"env":{...},"timeout_sec":300}`
   → 202 `{run}`
-- `GET /v1/workspaces/{id}/runs` → `{"runs":[...]}`
+- `GET /v1/workspaces/{id}/runs?status=&kind=&limit=&offset=` →
+  `{"runs":[...],"total":N,"limit":L,"offset":O}`
 - `GET /v1/workspaces/{id}/runs/{runId}` → `{run}`
+- `DELETE /v1/workspaces/{id}/runs` → 200 `{"deleted":N}` (purge finished history)
+- `DELETE /v1/workspaces/{id}/runs/{runId}` → 204 (delete one finished run)
 - `POST /v1/workspaces/{id}/runs/{runId}/stop` → 202 (idempotent; SIGTERM→SIGKILL per §1.11)
 - `GET /v1/workspaces/{id}/runs/{runId}/logs?stream=stdout|stderr&offset=0&limit=65536` → `{"data":"...","offset":0,"next":123,"eof":false,"truncated":false}`
 
 Run JSON:
 
 ```json
-{"id":"run_...","workspace_id":"ws_...","kind":"file|command","argv":[...],"status":"queued|running|exited|killed|timeout|failed","exit_code":0,"started_at":"...","ended_at":"...","logs":{"stdout_bytes":0,"stderr_bytes":0,"truncated":false}}
+{"id":"run_...","workspace_id":"ws_...","kind":"file|command","argv":[...],"status":"queued|running|exited|killed|timeout|failed|interrupted","exit_code":0,"started_at":"...","ended_at":"...","logs":{"stdout_bytes":0,"stderr_bytes":0,"truncated":false}}
 ```
+
+**`POST /exec` does not create a run record.** Only the asynchronous
+`POST .../runs` persists a `Run`; `exec` returns its output inline and leaves no
+`run_` id, no log files and no listing entry. A client that wants a pollable,
+auditable record must use `runs`.
+
+**Listing is filtered and paginated.** `GET .../runs` accepts `status`
+(repeatable or comma-separated; each value must be one of
+`queued,running,exited,killed,timeout,failed,interrupted`, else `400`), `kind`
+(`file` or `command`, else `400`), `limit` (`0`/absent means all remaining) and
+`offset` (default 0). It returns newest-first and includes `total` (the count of
+runs matching the filter **before** pagination) so offset pagination is
+deterministic.
+
+**Purge.** `DELETE .../runs` removes only finished runs and returns
+`{"deleted":N}`; if any run is still `queued`/`running` the whole purge
+**refuses** with **`409 conflict`** (`details.run_id` names one such run) and
+deletes nothing. `DELETE .../runs/{runId}` removes one run (204) or returns
+`409 conflict` if that run is still live.
 
 Run persistence layout: `data/workspaces/{ws_id}/runs/{run_id}/meta.json`,
 `stdout.log`, `stderr.log`. Update `meta.json` on every state transition
 (write-temp + rename for atomicity).
+
+### 2.5.1 Python packages (two tiers)
+
+Each workspace sees two package tiers, added to the interpreter search path via
+`PYTHONPATH` (**shared first, private second**):
+
+- **Shared, read-only** — host directory `packages.shared_dir`, bind-mounted
+  `rw:false` at `/opt/python/shared`, visible to every workspace, never
+  installable.
+- **Private, writable** — `{data_dir}/workspaces/{ws_id}/packages`, bind-mounted
+  `rw:true` at `/opt/python/private`, owned by the workspace's sandbox uid.
+
+- `GET /v1/workspaces/{id}/packages` → 200
+  `{"packages":[{"name","version"}],"count","truncated","shared_enabled","shared_available","shared_path","private_path"}`.
+  Lists the private tier (read from `*.dist-info`/`*.egg-info`) sorted by name,
+  bounded to 1000 distributions (`truncated:true` past that). `shared_path` is
+  `""` when the shared tier is unavailable; `private_path` is always
+  `/opt/python/private`.
+- `POST /v1/workspaces/{id}/packages/install` body `{"packages":[...]}` → 200
+  `{"exit_code","output","stdout","timed_out","truncated","duration_ms","target"}`.
+  Runs `python3 -m pip install --target /opt/python/private <reqs...>` **inside
+  the workspace's own sandbox**. Requirements are validated strictly (see below)
+  and passed to `pip` as individual argv elements, never through a shell. Needs
+  network: with `allow_net:false` the index fetch fails and is reported through
+  `exit_code`/`output`, not as an HTTP error. Bounded by
+  `packages.install_timeout_sec` (default 120 s) and
+  `packages.install_output_kb` (default 256 KiB).
+- `DELETE /v1/workspaces/{id}/packages?name=<dist>` → 204 (remove one, PEP 503
+  name-normalized). `DELETE .../packages?all=true` → 200
+  `{"removed":N,"all":true}` (remove all). A bare delete (neither, or both) is
+  `400` so "remove everything" can never be a footgun.
+
+**Requirement validation.** Each element is rejected with `422 unprocessable`
+(and never reaches a command line) when it is empty, whitespace-only, longer than
+200 characters, does not start with a letter or digit, contains a character
+outside `[A-Za-z0-9._+~*=<>,!\[\]-]`, or has unbalanced brackets. An empty
+`packages` list is also `422`.
+
+**Suspension.** The three package endpoints are workspace *management*, so all
+three are refused with **`409 workspace_suspended`** while the workspace is
+suspended (this is the one exception to "reads keep working" — listing packages
+is refused too).
 
 ### 2.6 Auth
 
@@ -108,6 +219,31 @@ endpoint checks `workspace.owner_id == principal_id` → else 403 `forbidden`.
 
 Every request logged as JSON to slog: `{ts, principal_id, workspace_id?,
 run_id?, method, path, status, duration_ms, error_code?}`.
+
+### 2.8 Error model
+
+All errors share the envelope
+`{"error":{"code","message","details?":"string→string"}}`. The complete code
+vocabulary defined in `internal/model/errors.go` (every constant must appear in
+the table) is:
+
+| Code | HTTP | Meaning |
+|------|------|---------|
+| `unauthorized` | 401 | Missing/invalid credentials. |
+| `forbidden` | 403 | Valid key, resource owned by another principal. |
+| `not_found` | 404 | Unknown workspace/run/file/package or unknown route. |
+| `conflict` | 409 | Purging run history (or deleting one run) while a run is still queued/running. |
+| `workspace_suspended` | 409 | Work (exec/run/package management) requested on a suspended workspace. |
+| `validation` | 400 | Bad JSON, unknown field, failed `validate` tag, bad filter/query. Also carries **405** for method-not-allowed. |
+| `unprocessable` | 422 | Unsafe path/symlink escape, `cwd` escape, command not found, a limit `<= 0` or above the server maximum, invalid package requirement. |
+| `payload_too_large` | 413 | Body/file over a hard cap. |
+| `insufficient_storage` | 507 | Workspace disk quota exceeded. **Emitted as a string literal in `internal/api/errors.go`; not defined as a constant in `internal/model/errors.go`.** |
+| `timeout` | 504 | **Defined but never emitted** by any handler (retained in the vocabulary and the OpenAPI enum). |
+| `unavailable` | 503 | nsjail missing, or nsjail could not set up/launch the sandbox. |
+| `internal` | 500 | Unexpected server error; unmapped filesystem conditions (e.g. listing a path that is a file). |
+
+The code is not always a 1:1 mirror of the status: a **405 method not allowed**
+carries `code:"validation"`.
 
 ## 3. SECURITY / NSJAIL
 
@@ -129,6 +265,16 @@ config template `configs/nsjail_python.cfg.tmpl` must include:
   `setns`, `unshare`, `clone3` if problems — but allow `clone`/`clone3` with
   restrictions; default to documented safe list
 - `--disable_proc` (or read-only `/proc`)
+- DNS: mount `/etc/resolv.conf` and `/etc/hosts` read-only **only when
+  `allow_net=true`**. With the host network namespace shared, name resolution
+  otherwise fails with `Temporary failure in name resolution` (the resolver has
+  no nameserver to query) even though TCP to a raw IP works — this is what made
+  `pip install` impossible for an `allow_net` workspace. A workspace without
+  `allow_net` must not see the host resolver at all.
+- package tiers: when the shared tier is configured and available, bind-mount it
+  read-only at `/opt/python/shared`; always bind-mount the workspace's private
+  tier read-write at `/opt/python/private`; inject both (shared first) via
+  `PYTHONPATH`
 - `--env` filtered to an allowlist for user-provided env only
   (`PYTHONPATH`, `PYTHONUNBUFFERED`, `PYTHONDONTWRITEBYTECODE`, `PYTHONHASHSEED`,
   `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`); loader-injection names such as

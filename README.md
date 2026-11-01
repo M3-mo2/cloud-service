@@ -7,6 +7,27 @@ A secure per-user code execution backend exposed over HTTP/JSON.
 
 > Status: **v0.0.5** (pre-alpha). SSE log streaming and multi-node storage are deferred to v0.1.
 
+## Features
+
+- **Workspaces** — create, list, inspect and delete per-principal workspaces; mutate
+  `name` and resource limits at runtime with `PATCH` (above-maximum values are
+  rejected, not clamped).
+- **Lifecycle** — `suspend` (refuse new work, stop running runs, keep data
+  readable), `resume`, and `stop` (kill running runs, keep accepting work).
+- **Files** — list, read (text/base64), write, mkdir, rename and multipart
+  upload, with path-traversal/symlink defense and a per-workspace disk quota.
+- **Execution** — synchronous `exec` (hard 60 s cap, capped output) and
+  asynchronous `runs` (streamed logs, filterable/paginated listing, purge of
+  history, stop).
+- **Usage** — disk use, run counters and effective limits via
+  `GET /v1/workspaces/{id}/usage`.
+- **Two-tier Python packages** — a shared read-only tier plus a private writable
+  per-workspace tier, with `GET/POST/DELETE .../packages`.
+- **Isolation** — no network by default (`allow_net` opts in); when it is
+  enabled, the resolver is mounted so names resolve.
+
+See [docs/API.md](docs/API.md) for the full endpoint reference.
+
 ## Quick start
 
 ```sh
