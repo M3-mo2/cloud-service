@@ -929,14 +929,26 @@ filesystem access. Network is available only when the workspace sets
 ```
 running ──┬──► exited     (shell exited on its own; exit_code recorded)
           ├──► killed     (DELETE, workspace delete, suspend, shutdown)
-          └──► timed_out  (idle timeout or absolute lifetime)
+          ├──► timed_out  (idle timeout or absolute lifetime)
+          └──► failed     (relay could not start: PTY/sandbox failure)
+
+POST /sessions ──► failed   (the relay died at startup; create reports it)
 ```
 
-`running, exited, killed, timed_out` are the four values of `status`. A session
-also carries a `reason` for its terminal transition (`shell_exited`,
+`running, exited, killed, timed_out, failed` are the five values of `status`. A
+session also carries a `reason` for its terminal transition (`shell_exited`,
 `user_closed`, `idle_timeout`, `lifetime`, `workspace_deleted`,
 `workspace_suspended`, `service_shutdown`, `interrupted`,
 `sandbox_unavailable`). All terminal states are final.
+
+A **`failed`** session could not start at all: the sandbox could not be launched
+or the PTY relay could not allocate a terminal (typically a missing `/dev/ptmx`
+/ devpts). It carries a **`diagnostic`** string with the actionable cause and
+never leaves a Python traceback in the output stream. `StartSession` waits a
+short, bounded window (`sessions.start_probe_ms`) for such an early relay death,
+so the **create response itself** reports `failed` rather than a `201 … running`
+that is already dead; if the relay dies after that window the record still
+transitions to `failed` when the session goroutine reaps it.
 
 #### Session limits and config (`sessions:` in config)
 
@@ -949,6 +961,7 @@ also carries a `reason` for its terminal transition (`shell_exited`,
 | `sessions.max_input_kb` | 64 | Cap on a single input request's `data`. |
 | `sessions.shell` | `/bin/sh` | Default shell (an absolute path in the sandbox image). |
 | `sessions.kill_grace_sec` | 3 | SIGHUP→SIGKILL grace when a session is closed or times out. |
+| `sessions.start_probe_ms` | 250 | How long create waits for a relay that dies at startup, so a failed start is reported as `failed` (not `running`). Capped at 2 s. |
 
 The service starts with none of these set (all have defaults).
 
@@ -977,6 +990,16 @@ Start an interactive terminal session.
     "started_at":"2026-01-02T15:04:05Z","ended_at":"","exit_code":null,
     "output_bytes":0,"output_truncated":false}}
   ```
+
+  If the relay cannot start (a PTY or sandbox failure), the same `201` carries a
+  terminal session instead — no traceback in the output:
+
+  ```json
+  {"session":{"id":"ses_01J...","status":"failed","reason":"sandbox_unavailable",
+    "ended_at":"2026-01-02T15:04:05Z",
+    "diagnostic":"sandbox unavailable: PTY allocation failed: sandboxd-pty-error: out of pty devices",
+    "output_bytes":0,"output_truncated":false}}
+  ```
 - **Errors:** 400 `validation`, 401 `unauthorized`, 403 `forbidden`, 404
   `not_found` (workspace), 409 `workspace_suspended`, **409
   `too_many_sessions`** (the per-workspace cap is reached), 413
@@ -1001,7 +1024,7 @@ shape as the runs list.
 - **Path parameter:** `workspaceID`.
 - **Query parameters:**
   - `status` (string, repeatable or comma-separated) — one or more of
-    `running,exited,killed,timed_out`; an unknown value is `400`.
+    `running,exited,killed,timed_out,failed`; an unknown value is `400`.
   - `limit` (int) — max sessions to return; `0`/absent means all remaining.
   - `offset` (int) — sessions to skip (default 0).
 - **Response 200:** `{"sessions":[ <session>, ... ], "total": N, "limit": L, "offset": O}`.

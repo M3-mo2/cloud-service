@@ -123,6 +123,11 @@ const (
 	SessionExited   SessionStatus = "exited"
 	SessionKilled   SessionStatus = "killed"
 	SessionTimedOut SessionStatus = "timed_out"
+	// SessionFailed is a session that could not start: the sandbox could not be
+	// launched, or the PTY relay could not allocate a terminal. It carries a
+	// Diagnostic so a client can act on the cause instead of reading a Python
+	// traceback out of the output stream.
+	SessionFailed SessionStatus = "failed"
 )
 
 // Terminal reports whether the status is final.
@@ -161,6 +166,9 @@ type Session struct {
 	// "idle_timeout", "lifetime", "shell_exited", "workspace_deleted",
 	// "service_shutdown", "interrupted"). It is empty while running.
 	Reason string `json:"reason,omitempty"`
+	// Diagnostic is set for a failed session: the actionable cause of the
+	// failure (e.g. a missing PTY or a sandbox launch error). Empty otherwise.
+	Diagnostic string `json:"diagnostic,omitempty"`
 	// OutputBytes is the number of bytes of PTY output persisted to the log.
 	OutputBytes int64 `json:"output_bytes"`
 	// OutputTruncated is set when the output cap (caps.run_log_mb) was hit.

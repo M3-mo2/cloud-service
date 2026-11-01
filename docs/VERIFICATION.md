@@ -63,13 +63,15 @@ $ docker run --rm --privileged --cgroupns=host \
 --- PASS: TestIntegrationPythonHello (0.04s)
 === RUN   TestIntegrationTimeout
 --- PASS: TestIntegrationTimeout (2.00s)
+=== RUN   TestIntegrationSessionRealPTY
+--- PASS: TestIntegrationSessionRealPTY (0.13s)
 PASS
 ```
 
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **219** (217 unit + 2 `integration`-tagged), including regression
+Test functions: **225** (222 unit + 3 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -80,7 +82,9 @@ tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestNewEndpointsEnforceOwnership`), for the two-tier packages
 (`TestInstallPackages*`, `TestListPrivatePackages`, `TestRemovePackage*`,
 `TestPrivateTierIsolatedBetweenWorkspaces`, `TestPackagesCrossOwnerForbidden`)
-and for terminal sessions (`TestPTYHelper*`, `TestSession*`; see §9b).
+and for terminal sessions (`TestPTYHelper*`, `TestSession*`,
+`TestRenderSessionConfigMountsHostDevpts`, `TestRenderConfigOmitsDevptsForOneShotExec`,
+`TestPTYFailureDetectedFromHelperStderr`; see §9b).
 
 The count is the number of `^func Test` declarations across every `*_test.go`
 file (the same measure `scripts/docs-consistency.sh` asserts against):
@@ -393,23 +397,123 @@ curl …/workspaces/$B/exec -d '{"cmd":["python3","-c","import six"]}'
 
 ## 9b. Terminal sessions (acceptance)
 
-Server-side interactive terminal sessions have three layers of evidence:
+Server-side interactive terminal sessions have four layers of evidence, the last
+of which is the **measured real-nsjail before/after** for the devpts fix:
 
 1. **A real PTY** — the relay helper is exercised directly as a subprocess
    (`internal/executor/pty_test.go`), no nsjail required, proving `pty.fork()`
    gives a real `/dev/pts/N`.
 2. **The sandbox changes** — the rendered nsjail config is asserted to mount the
-   helper read-only and keep the full workload isolation (also no nsjail
-   required).
+   helper read-only, to bind `/dev/pts` and `/dev/ptmx` **for a PTY session
+   only**, and to keep the full workload isolation (also no nsjail required).
 3. **The HTTP contract** — handler-level tests over the `FakeRunner`
    (`internal/api/sessions_test.go`) assert every status/code, including the
-   timeouts.
+   timeouts **and the loud PTY failure** (`TestSessionPTYFailureIsLoud`).
+4. **A real session inside a real nsjail** (`TestIntegrationSessionRealPTY`,
+   `//go:build integration`, [requires privileged container]) — the measured
+   transcript below.
+
+### 9b.1 The measured devpts failure and fix
+
+`nsjail` has no PTY support; the relay helper allocates the terminal with
+`pty.fork()`, which opens **`/dev/ptmx`** and needs a working **devpts**. The
+one-shot `/dev` (null/urandom/zero only) has neither, so the helper dies. The
+measured sequence, run on this host by hand inside `nsjail` with the *exact*
+per-run mounts, and then re-confirmed by the integration test:
+
+```
+# Failure: the relay under the unpatched run config (no devpts mount).
+$ nsjail --config <one-shot-style>.cfg   # exec_bin = python3 /run/sandboxd/pty_relay.py
+Traceback (most recent call last):
+  File "/run/sandboxd/pty_relay.py", line 190, in main
+    child, master = pty.fork()
+  File "/usr/lib/python3.12/pty.py", line 107, in fork
+    master_fd, slave_fd = openpty()
+  ...
+OSError: out of pty devices
+
+# A private devpts instance was measured NOT to work: it creates
+# /dev/pts/ptmx but not /dev/ptmx, which openpty() opens.
+$ grep -c "newinstance" privdevpts.cfg && nsjail --config <privdevpts>.cfg
+PTY_FORK_FAIL: [Errno 2] No such file or directory: '/dev/ptmx'
+# /dev listing with a private devpts:  ['null', 'pts', 'urandom', 'zero']  (no /dev/ptmx)
+
+# The fix: bind the host's /dev/pts AND /dev/ptmx (read-only, PTY sessions only).
+# /dev listing after the fix: ['null', 'ptmx', 'pts', 'urandom', 'zero']
+$ nsjail --config <host-devpts>.cfg        # exec_bin = pty_relay.py '{"shell":"/bin/sh",...}'
+$ echo MARKER_42
+tty
+test -t 1 && echo TTY_OK
+MARKER_42
+$ /dev/pts/3
+$ TTY_OK
+```
+
+Exact mounts that make it work (rendered only when `Request.PTY` is set):
+
+```
+mount { src: "/dev/pts"  dst: "/dev/pts"  is_bind: true rw: false mandatory: false }
+mount { src: "/dev/ptmx" dst: "/dev/ptmx" is_bind: true rw: false mandatory: false }
+```
+
+Both are read-only binds of device nodes: a PTY is a **terminal** (a byte stream
+plus a window size), not a filesystem or process view. uid/gid, seccomp,
+`clone_newnet`/`newns`/`newpid`/… and `mount_proc: false` are unchanged; the
+sandbox is not weakened. See [DECISIONS.md](DECISIONS.md) #52–53 and
+[ARCHITECTURE.md](ARCHITECTURE.md) §5.2.
+
+### 9b.2 The measured real-nsjail session transcript
+
+`TestIntegrationSessionRealPTY` runs a session through the real `Start` path
+under root with the compiled nsjail and asserts the session output. Observed on
+this host (nsjail built from source, `--privileged`, root):
+
+```
+$ go test -tags integration -run TestIntegrationSessionRealPTY -v ./internal/executor/
+=== RUN   TestIntegrationSessionRealPTY
+--- PASS: TestIntegrationSessionRealPTY (0.13s)
+PASS
+ok  	sandboxd/internal/executor	0.131s
+```
+
+The test asserts, on the persisted session output:
+
+- `tty` printed a device matching `/dev/pts/` (a real slave terminal);
+- `test -t 1 && echo TTY_OK` printed `TTY_OK` (stdout **is** a tty);
+- the output contains **neither** `out of pty devices` **nor** `Traceback`;
+- `cat marker.txt` output arrived and is readable through the byte-offset reader
+  from 0 and from a late offset (the same `offset`/`next` mechanism
+  `GET .../sessions/{id}/output` uses).
+
+The full unit suite (`go test ./...`) and `go test -race ./...` remain green.
+
+### 9b.3 The loud-failure contract
+
+A relay that cannot allocate a PTY no longer leaves a `running` session with a
+traceback. The helper writes `sandboxd-pty-error: …` to stderr and exits
+`69` (EX_UNAVAILABLE):
+
+```
+# patched helper, unpatched (no devpts) config:
+$ nsjail --config <one-shot-style>.cfg
+sandboxd-pty-error: cannot allocate a PTY: out of pty devices
+the sandbox is missing a working /dev/ptmx and devpts
+exit=69
+```
+
+The executor turns that marker into a `SandboxError`, and the service records
+the session as `failed` / `sandbox_unavailable` with the actionable
+`diagnostic`; `StartSession` waits the short `sessions.start_probe_ms` window
+(250 ms default, 2 s cap) so even the create response is honest. Verified
+unprivileged by `TestSessionPTYFailureIsLoud` (API over the `FakeRunner`) and
+`TestPTYFailureDetectedFromHelperStderr` (executor classification), and asserted
+against the embedded helper by `TestPTYRelayScriptHandlesAllocationFailure`.
 
 The full matrix that the spec required:
 
 | # | Scenario | Test (all pass) |
 |---|----------|-----------------|
-| 1 | session starts; a real `tty` is reported (`test -t 1`) | `TestPTYHelperRealTTY` (real PTY) + `TestSessionCreateAndInspect` (API, asserts the PTY launch path) |
+| 1 | session starts; a real `tty` is reported (`test -t 1`) | `TestPTYHelperRealTTY` (real PTY) + `TestIntegrationSessionRealPTY` (real nsjail) + `TestSessionCreateAndInspect` (API, asserts the PTY launch path) |
 | 2 | state persists: `cd /tmp` then `pwd` → `/tmp` | `TestPTYHelperRealTTY` (real PTY) |
 | 3 | `alias` and a function persist to the next command | `TestPTYHelperStatePersists` (real PTY); also asserts **no framing bytes** leak into the stream |
 | 4 | `signal INT` interrupts `sleep 30`, session survives and runs again | `TestPTYHelperSignalInterruptsForeground` (real PTY) + `TestSessionSignalRelayed` (API, status stays `running`) |
@@ -421,7 +525,9 @@ The full matrix that the spec required:
 | 10 | foreign principal gets 403 on every session route | `TestSessionOwnership` |
 | 11 | idle timeout and absolute lifetime fire with documented status/reason | `TestSessionIdleTimeout`, `TestSessionLifetime`, `TestSessionLifetimeRequestedShorter` |
 | 12 | no leaked process after `DELETE` | `TestSessionNoLeakAfterDelete` (live-process interface; real process tree is nsjail's) |
-| 13 | `gofmt`/`vet`/`test`/`test -race` green | the build/test transcript above |
+| 13 | a PTY failure is a `failed` session with a diagnostic, never `running` | `TestSessionPTYFailureIsLoud`, `TestPTYFailureDetectedFromHelperStderr`, `TestPTYRelayScriptHandlesAllocationFailure` |
+| 14 | a PTY session renders the host `/dev/pts`+`/dev/ptmx` mounts; one-shot does not | `TestRenderSessionConfigMountsHostDevpts`, `TestRenderConfigOmitsDevptsForOneShotExec` |
+| 15 | `gofmt`/`vet`/`test`/`test -race` green | the build/test transcript above |
 
 Plus: `TestRenderSessionConfigHelperMount` (helper mounted `rw:false` at
 `/run/sandboxd`, seccomp/uidmap/`mount_proc:false` retained),
@@ -437,17 +543,22 @@ Plus: `TestRenderSessionConfigHelperMount` (helper mounted `rw:false` at
 Observed (unprivileged host; real helper subprocess, fake sandbox for HTTP):
 
 ```
-$ go test ./internal/executor/ -run 'PTY|RenderSession' -v
+$ go test ./internal/executor/ -run 'PTY|RenderSession|RenderConfigOmitsDevpts' -v
 --- PASS: TestPTYRelayScriptIsStdlibOnly
 --- PASS: TestPTYHelperRealTTY                    # test -t 1 → TTY_OK; cd /tmp; pwd → /tmp; stty size → 50 120
 --- PASS: TestPTYHelperStatePersists              # alias + function persist; no framing in output
 --- PASS: TestPTYHelperSignalInterruptsForeground # sleep 30 interrupted; session runs again
 --- PASS: TestPTYHelperInjectionProof             # {"type":"close"} arrives as literal text
 --- PASS: TestPTYHelperCloseEndsSession
+--- PASS: TestPTYRelayScriptHandlesAllocationFailure
+--- PASS: TestPTYFailureDetectedFromHelperStderr
+--- PASS: TestRenderSessionConfigMountsHostDevpts    # host /dev/pts + /dev/ptmx RO, PTY only
+--- PASS: TestRenderConfigOmitsDevptsForOneShotExec  # one-shot /dev stays null/zero/urandom
 --- PASS: TestRenderSessionConfigHelperMount      # /run/sandboxd mounted rw:false; seccomp+uidmap kept
 --- PASS: TestRenderSessionConfigNoHelperMount
 
 $ go test ./internal/api/ -run 'Session' -v
+--- PASS: TestSessionPTYFailureIsLoud              # failed + diagnostic, never running
 --- PASS: TestSessionCreateAndInspect
 --- PASS: TestSessionDefaultSize
 --- PASS: TestSessionRejectsAbsurdSize
@@ -462,6 +573,7 @@ $ go test ./internal/api/ -run 'Session' -v
 --- PASS: TestSessionHostileInput
 --- PASS: TestSessionOwnership
 --- PASS: TestSessionIdleTimeout
+--- PASS: TestSessionOutputCountsAsActivity
 --- PASS: TestSessionLifetime
 --- PASS: TestSessionLifetimeRequestedShorter
 --- PASS: TestSessionNoLeakAfterDelete
@@ -471,21 +583,12 @@ $ go test ./internal/api/ -run 'Session' -v
 ```
 
 **[requires privileged container] Real-nsjail session transcript.** The session
-inside a real nsjail instance (a real jail, a real shell on a real PTY, real
-process-tree checks) was **not** run in this environment (no nsjail binary,
-unprivileged orchestrator). The launch path is asserted against the rendered
-config and the live-process interface instead. The expected real-nsjail
-transcript:
-
-```sh
-# create, then: test -t 1 && echo REAL_TTY ; cd /tmp ; pwd
-curl -s -H "$AUTH" -H "$JSON" -d '{"cols":80,"rows":24}' $BASE/v1/workspaces/$WS/sessions
-# 201 {"session":{"id":"ses_...","status":"running",...}}
-curl -s -H "$AUTH" "$BASE/v1/workspaces/$WS/sessions/$SES/output?offset=0"
-# {"data":"... REAL_TTY\n ... /tmp\n","next":N,"eof":false,...}
-curl -s -H "$AUTH" -H "$JSON" -d '{"signal":"INT"}' $BASE/v1/workspaces/$WS/sessions/$SES/signal
-# 204; session status remains "running"
-```
+inside a real nsjail instance was run on this host with a real jail, a real shell
+on a real PTY (`/dev/pts/3`), a real `test -t 1`, and a real file read through
+the offset reader (`TestIntegrationSessionRealPTY`, transcript in §9b.2). The
+unprivileged suite asserts the launch path against the rendered config and the
+live-process interface instead, so the feature is covered on hosts without nsjail
+too.
 
 ## 10. Decisions
 

@@ -329,6 +329,17 @@ matters: the interactive shell cannot rewrite the code that allocates its
 terminal, and the helper executes as the sandbox uid with the same mounts and
 seccomp policy as any workload. No sandbox control is relaxed for sessions.
 
+**The terminal needs two devices.** `pty.fork()` opens `/dev/ptmx` and needs a
+working devpts, so a PTY session's config adds read-only binds of the host's
+`/dev/pts` and `/dev/ptmx` (the `{{ if .PTY }}` block); a one-shot `exec` does
+not get them. A private devpts instance does not work — `openpty()` opens
+`/dev/ptmx`, which `newinstance` does not create. See
+[DECISIONS.md](DECISIONS.md) #52 and [VERIFICATION.md](VERIFICATION.md) §9b for
+the measured before/after. If the devices are missing the helper does **not**
+leave a traceback in the stream: it writes `sandboxd-pty-error: …` to its own
+stderr and exits non-zero, and the session is recorded `failed` with a
+`diagnostic`.
+
 **The control protocol.** The helper reads line-delimited JSON on its stdin and
 performs exactly four operations: `{"type":"input","data":"..."}` (write bytes
 to the PTY), `{"type":"signal","signal":"INT|TERM|QUIT|HUP|..."}` (signal the
@@ -353,10 +364,12 @@ unchanged.
 ```mermaid
 stateDiagram-v2
     [*] --> running: POST /sessions
+    [*] --> failed: relay cannot start (PTY/sandbox failure)
     running --> exited: shell exits (reason shell_exited)
     running --> killed: DELETE / delete / suspend / shutdown
     running --> timed_out: idle or absolute lifetime
     running --> killed: restart recovery (reason interrupted)
+    failed --> [*]
     exited --> [*]
     killed --> [*]
     timed_out --> [*]
@@ -451,6 +464,7 @@ flowchart TB
         H1["/usr /lib /lib64 /bin /sbin\n(read-only bind)"]
         H2["/etc/{passwd,group,nsswitch.conf,ld.so.cache}\n/etc/ssl/certs /etc/alternatives\n(read-only bind)"]
         H3["/dev/{null,zero,urandom}\n(read-only bind)"]
+        H10["/dev/pts + /dev/ptmx\n(read-only bind, ONLY for a PTY session)"]
         H7["/etc/{resolv.conf,hosts}\n(read-only bind, ONLY when allow_net)"]
         H8["shared packages dir\n(read-only bind, if configured)"]
         H9["{ws}/packages\n(read-write bind, per workspace)"]
@@ -464,6 +478,7 @@ flowchart TB
         J1["/usr /lib /lib64 /bin /sbin\nRO"]
         J2["/etc/{passwd,group,...}\nRO"]
         J3["/dev/* RO"]
+        J10["/dev/pts + /dev/ptmx RO\n(PTY session only)"]
         J4["/workspace  ← RW bind of\n./data/workspaces/{ws}/files"]
         J5["/tmp  ← RW private per-run dir"]
         J7["/etc/{resolv.conf,hosts}\nRO (allow_net only)"]
@@ -475,6 +490,7 @@ flowchart TB
     H1 --> J1
     H2 --> J2
     H3 --> J3
+    H10 --> J10
     H7 --> J7
     H8 --> J8
     H9 --> J9
@@ -482,6 +498,32 @@ flowchart TB
     H5 -.->|absent| JAIL
     H6 -.->|absent| JAIL
 ```
+
+**The `/dev` picture for a PTY session.** A one-shot `exec` sees only
+`/dev/{null,zero,urandom}` — enough for a program that writes to stdout. A
+**terminal session** additionally bind-mounts the host's `/dev/pts` and
+`/dev/ptmx` read-only (`configs/nsjail_python.cfg.tmpl`, `{{ if .PTY }}`). This
+is required but not exotic: nsjail exposes no PTY of its own, so the relay
+helper allocates the terminal with `pty.fork()`, and CPython's `openpty()` opens
+**`/dev/ptmx`** and passes it to `grantpt`/`unlockpt`, which need a working
+**devpts**. Without those two mounts the helper fails with `out of pty devices`.
+
+What this does and does not expose, stated plainly:
+
+- **It exposes the host's pty pool (a terminal), not a filesystem or process
+  view.** `/dev/pts` is where the kernel puts terminal slave nodes and
+  `/dev/ptmx` is the multiplexer that allocates them; a pty carries a byte
+  stream and a window size, nothing else. The sandbox cannot read another
+  tenant's files or see a host process through it.
+- **A private devpts instance is not a substitute.** `mount { dst: "/dev/pts"
+  fstype: "devpts" options: "newinstance,..." }` makes `/dev/pts/ptmx` appear but
+  does **not** create `/dev/ptmx`, which is what `openpty()` opens; measured, it
+  fails with ENOENT. Binding the host's devices is the measured minimum.
+- **Isolation is otherwise unchanged.** The uid/gid map, the seccomp deny list,
+  `clone_newnet`/`clone_newns`/`clone_newpid`/… and `mount_proc: false` are all
+  identical to a one-shot run; the two new mounts are read-only binds of device
+  nodes, not new privileges. A PTY session is a normal sandbox process that
+  happens to have a controlling terminal.
 
 **Package tiers in the mount picture.** A workload imports from two tiers, added
 to the interpreter's search path via `PYTHONPATH`, **shared first, private
@@ -645,7 +687,7 @@ erDiagram
         string cwd
         int cols
         int rows
-        string status "running/exited/killed/timed_out"
+        string status "running/exited/killed/timed_out/failed"
         string reason
         int exit_code
         time created_at
@@ -801,6 +843,7 @@ sessions:                    # interactive terminal sessions (all defaulted)
   max_input_kb: 64           # per-request input cap
   shell: "/bin/sh"           # default shell in the image
   kill_grace_sec: 3          # SIGHUP → SIGKILL grace
+  start_probe_ms: 250        # startup reap window → honest failed vs running
 keys:                        # static bearer keys → principal_id (1:N allowed)
   - { key: "dev-key-please-rotate", principal_id: "user_dev" }
 ```

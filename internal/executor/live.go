@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -153,8 +154,16 @@ func (r *NsjailRunner) Start(req Request) (LiveProcess, error) {
 	cmd.Stdout = outW
 	// The helper's diagnostics are not part of the terminal stream; send them
 	// to the same capped log so a helper failure is observable, never to the
-	// client's byte stream.
-	cmd.Stderr = outW
+	// client's byte stream. For a PTY session a small tail of stderr is also
+	// mirrored in memory so an early PTY-allocation failure can be recognised
+	// and turned into a failed session (see PTYErrorMarker).
+	var helperTail *tailBuffer
+	if req.PTY {
+		helperTail = newTailBuffer(8192)
+		cmd.Stderr = io.MultiWriter(outW, helperTail)
+	} else {
+		cmd.Stderr = outW
+	}
 
 	if err := cmd.Start(); err != nil {
 		outF.Close()
@@ -166,14 +175,15 @@ func (r *NsjailRunner) Start(req Request) (LiveProcess, error) {
 	closeWriteEnd(cmd)
 
 	lp := &liveProcess{
-		cmd:       cmd,
-		stdin:     stdin,
-		out:       outW,
-		outFile:   outF,
-		runTmp:    runTmp,
-		cfgPath:   cfgPath,
-		diagDone:  diagDone,
-		killGrace: r.cfg.Sandbox.KillGrace(),
+		cmd:        cmd,
+		stdin:      stdin,
+		out:        outW,
+		outFile:    outF,
+		runTmp:     runTmp,
+		cfgPath:    cfgPath,
+		diagDone:   diagDone,
+		helperTail: helperTail,
+		killGrace:  r.cfg.Sandbox.KillGrace(),
 	}
 	return lp, nil
 }
@@ -196,6 +206,11 @@ type liveProcess struct {
 
 	runTmp  string
 	cfgPath string
+
+	// helperTail mirrors the tail of the helper's stderr for a PTY session so
+	// an early PTY-allocation failure (PTYErrorMarker) is recognisable without
+	// re-reading the capped output log.
+	helperTail *tailBuffer
 
 	diagDone  <-chan string
 	killGrace time.Duration
@@ -250,7 +265,60 @@ func (p *liveProcess) Wait() (Result, error) {
 	if err := (&NsjailRunner{}).classify(&res, waitErr, context.Background(), diagnostic); err != nil {
 		return res, err
 	}
+	// A PTY session whose helper could not allocate a terminal must surface as a
+	// sandbox failure with an actionable diagnostic, never as a running session
+	// whose output is a Python traceback. The helper writes PTYErrorMarker to
+	// stderr and exits non-zero in that case; an ordinary shell exit is
+	// unaffected (the shell's own output goes to the PTY, not the helper's
+	// stderr, and any status may still be a normal exit code).
+	if perr := ptyFailure(p.helperTail, res.ExitCode); perr != nil {
+		return res, perr
+	}
 	return res, nil
+}
+
+// ptyFailure reports a PTY-allocation failure when the relay's stderr carries
+// PTYErrorMarker and the process did not exit cleanly. It is nil for a healthy
+// session (including one whose shell exited non-zero on its own, because the
+// marker is absent).
+func ptyFailure(tail *tailBuffer, exitCode int) *SandboxError {
+	if tail == nil || exitCode == 0 || !tail.contains(PTYErrorMarker) {
+		return nil
+	}
+	return &SandboxError{Diagnostic: "PTY allocation failed: " + tail.lineContaining(PTYErrorMarker)}
+}
+
+// tailBuffer keeps the last limit bytes written to it. It has a single writer
+// (the os/exec copy goroutine feeding stderr) and is read only after the
+// process has been waited for, so it needs no locking.
+type tailBuffer struct {
+	limit int
+	buf   []byte
+}
+
+func newTailBuffer(limit int) *tailBuffer { return &tailBuffer{limit: limit} }
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.limit {
+		t.buf = t.buf[len(t.buf)-t.limit:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) contains(sub string) bool {
+	return strings.Contains(string(t.buf), sub)
+}
+
+// lineContaining returns the trimmed line that carries sub, or the whole tail
+// when no newline-delimited line does.
+func (t *tailBuffer) lineContaining(sub string) string {
+	for _, line := range strings.Split(string(t.buf), "\n") {
+		if strings.Contains(line, sub) {
+			return strings.TrimSpace(line)
+		}
+	}
+	return strings.TrimSpace(string(t.buf))
 }
 
 // stdoutClose closes the parent's handle to the log file once the child exits.

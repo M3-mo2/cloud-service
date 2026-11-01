@@ -49,6 +49,9 @@ func newHarnessAt(t *testing.T, dataDir string) *harness {
 	cfg.Sandbox.NsjailPath = "/nonexistent/nsjail"
 	cfg.Caps.JSONBodyMB = 1
 	cfg.Caps.FileWriteMB = 1
+	// The session-start reap window is a short startup probe; keep it small in
+	// tests so a healthy (never-exiting) fake session does not slow the suite.
+	cfg.Sessions.StartProbeMS = 20
 
 	store, err := storage.New(cfg.Storage.DataDir)
 	if err != nil {

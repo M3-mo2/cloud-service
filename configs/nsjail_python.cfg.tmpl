@@ -161,6 +161,34 @@ mount {
   mandatory: false
 }
 
+{{- if .PTY }}
+
+# Terminal sessions only: the relay helper allocates the PTY with pty.fork(),
+# which needs a usable /dev/ptmx and devpts. nsjail has no PTY support of its
+# own, and a private devpts instance is not enough: CPython's openpty() opens
+# /dev/ptmx, which a `newinstance` devpts does not provide (measured: openpty
+# then fails with ENOENT). Binding the HOST's /dev/pts and /dev/ptmx is the
+# measured minimum that makes pty.fork() succeed inside the jail. Both are
+# read-only binds of device nodes -- a terminal is not a filesystem or process
+# view -- and uid/gid, seccomp, mount and namespace isolation are unchanged.
+# Omitted for one-shot exec, which needs no terminal.
+mount {
+  src: "/dev/pts"
+  dst: "/dev/pts"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "/dev/ptmx"
+  dst: "/dev/ptmx"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+{{- end }}
+
 # The workspace, writable, at /workspace.
 mount {
   src: "{{ .WorkspaceRoot }}"

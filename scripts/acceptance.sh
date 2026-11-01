@@ -215,7 +215,45 @@ else
 fi
 check "stop.no_survivors" "$([ -z "$n" ] && echo 0 || echo "$n")" "0"
 
-echo "### 21. delete workspace (expect 204) and get after delete (expect 404)"
+echo "### 21. terminal session: a real PTY inside the sandbox"
+# Create a session, run `tty` and `test -t 1`, and read the output back through
+# the byte-offset reader. This is the real-nsjail fix guard: without the host
+# /dev/pts + /dev/ptmx mounts the session would fail with "out of pty devices"
+# (now surfaced as status=failed with a diagnostic, not a running traceback).
+SES_JSON=$(curl -s -H "$K" -H "$JSON" -d '{"cols":80,"rows":24}' "$B/v1/workspaces/$WS/sessions")
+SES=$(printf '%s' "$SES_JSON" | jsonfield "['session']['id']")
+SES_STATUS=$(printf '%s' "$SES_JSON" | jsonfield "['session']['status']")
+if [ "$SES_STATUS" = "failed" ]; then
+  check "session.start" "$(printf '%s' "$SES_JSON" | jsonfield "['session']['diagnostic']")" "<none>"
+else
+  check "session.start_status" "$SES_STATUS" "running"
+fi
+curl -s -o /dev/null -H "$K" -H "$JSON" \
+  -d '{"data":"tty; test -t 1 && echo TTY_OK; echo /dev/pts\n"}' \
+  "$B/v1/workspaces/$WS/sessions/$SES/input"
+SES_OUT=""
+for _ in $(seq 1 50); do
+  SES_OUT=$(curl -s -H "$K" "$B/v1/workspaces/$WS/sessions/$SES/output?offset=0&limit=65536" | jsonfield "['data']")
+  case "$SES_OUT" in *TTY_OK*|*"out of pty devices"*|*Traceback*) break;; esac
+  sleep 0.1
+done
+check_contains "session.tty_device" "$SES_OUT" "/dev/pts/"
+check_contains "session.is_a_tty" "$SES_OUT" "TTY_OK"
+case "$SES_OUT" in
+  *"out of pty devices"*|*Traceback*)
+    fail=$((fail + 1)); printf 'FAIL %-28s session output shows a PTY failure\n' "session.no_pty_error" ;;
+  *)
+    pass=$((pass + 1)); printf 'ok   %-28s no PTY error / traceback\n' "session.no_pty_error" ;;
+esac
+# The output is readable from a later offset (same reader as run logs).
+NEXT=$(curl -s -H "$K" "$B/v1/workspaces/$WS/sessions/$SES/output?offset=0&limit=65536" | jsonfield "['next']")
+check_contains "session.offset_suffix" \
+  "$(curl -s -H "$K" "$B/v1/workspaces/$WS/sessions/$SES/output?offset=$((NEXT-4))&limit=65536" | jsonfield "['data']")" \
+  "$(printf '%s' "$SES_OUT" | tail -c4)"
+curl -s -o /dev/null -X DELETE -H "$K" "$B/v1/workspaces/$WS/sessions/$SES"
+check "session.delete" "$(httpcode -X DELETE -H "$K" "$B/v1/workspaces/$WS/sessions/$SES")" "200"
+
+echo "### 22. delete workspace (expect 204) and get after delete (expect 404)"
 check "delete.workspace" "$(httpcode -X DELETE -H "$K" "$B/v1/workspaces/$WS")" "204"
 check "get.after_delete" "$(httpcode -H "$K" "$B/v1/workspaces/$WS")" "404"
 

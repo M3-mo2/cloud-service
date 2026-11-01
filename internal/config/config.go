@@ -51,6 +51,16 @@ type SessionsConfig struct {
 	// KillGraceSec is the SIGHUP->SIGKILL grace applied when a session is
 	// closed (DELETE or a timeout).
 	KillGraceSec int `koanf:"kill_grace_sec"`
+	// StartProbeMS is how long a session create waits for a relay that dies at
+	// startup (e.g. it cannot allocate a PTY), so the create response can report
+	// the session already failed rather than `running`. It is a short window: a
+	// healthy shell keeps running and the create is not delayed by it.
+	StartProbeMS int `koanf:"start_probe_ms"`
+}
+
+// StartProbe returns the session-start reap window.
+func (s SessionsConfig) StartProbe() time.Duration {
+	return time.Duration(s.StartProbeMS) * time.Millisecond
 }
 
 // IdleTimeout returns the session idle-timeout duration.
@@ -236,6 +246,7 @@ func Default() Config {
 			MaxInputKB:      64,
 			Shell:           "/bin/sh",
 			KillGraceSec:    3,
+			StartProbeMS:    250,
 		},
 		Keys: []KeyConfig{},
 	}
@@ -367,6 +378,9 @@ func (c *Config) applyDefaults() {
 	if sess.KillGraceSec <= 0 {
 		sess.KillGraceSec = d.Sessions.KillGraceSec
 	}
+	if sess.StartProbeMS < 0 {
+		sess.StartProbeMS = d.Sessions.StartProbeMS
+	}
 }
 
 func rawDefaults() []byte {
@@ -416,5 +430,6 @@ sessions:
   max_input_kb: 64
   shell: "/bin/sh"
   kill_grace_sec: 3
+  start_probe_ms: 250
 `)
 }

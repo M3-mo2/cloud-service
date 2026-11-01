@@ -181,7 +181,39 @@ func (s *Service) StartSession(w *model.Workspace, spec StartSessionSpec) (*mode
 
 	go s.runSession(ls, lp)
 
+	// Reap a relay that dies immediately (e.g. it cannot allocate a PTY) before
+	// returning, so the create response is honest: the caller sees a failed
+	// session with a diagnostic, not a session reported running whose terminal
+	// stream is a traceback. The wait is short and bounded; a healthy session
+	// keeps running and this returns as soon as the reap window elapses.
+	waitSessionReap(ls, s.cfg.Sessions.StartProbe())
+
+	// Read the persisted record rather than the in-memory pointer, which the
+	// session goroutine owns: this avoids racing a terminal transition and
+	// reflects whether the relay already failed.
+	if current, gerr := s.store.GetSession(w.ID, sess.ID); gerr == nil {
+		return cloneSession(current), nil
+	}
 	return cloneSession(sess), nil
+}
+
+// maxSessionReapWindow caps the session-start reap window regardless of
+// configuration, so a slow host is never waited on indefinitely.
+const maxSessionReapWindow = 2 * time.Second
+
+// waitSessionReap waits until the session reaches a terminal state or the
+// window elapses.
+func waitSessionReap(ls *liveSession, window time.Duration) {
+	if window <= 0 {
+		window = 250 * time.Millisecond
+	}
+	if window > maxSessionReapWindow {
+		window = maxSessionReapWindow
+	}
+	select {
+	case <-ls.done:
+	case <-time.After(window):
+	}
 }
 
 // runSession owns the session's lifecycle: it waits for the process, records
@@ -206,13 +238,17 @@ func (s *Service) runSession(ls *liveSession, lp executor.LiveProcess) {
 	status := model.SessionExited
 	reason := model.SessionReasonShellExited
 	var exitCode *int
+	var diagnostic string
 	switch {
 	case err != nil:
-		// The session never produced a shell (e.g. nsjail could not set up the
-		// sandbox). Record it as killed with the sandbox reason, never as a
-		// clean shell exit.
-		status = model.SessionKilled
+		// The session never produced a shell: the sandbox could not be launched
+		// or the PTY relay could not allocate a terminal (e.g. /dev/ptmx or
+		// devpts was not mounted). Record it as failed with the actionable
+		// diagnostic -- never a running session whose output is a traceback, and
+		// never a clean shell exit.
+		status = model.SessionFailed
 		reason = model.SessionReasonSandboxUnavailable
+		diagnostic = truncateDiagnostic(err.Error(), 512)
 	case ls.pendingEnded():
 		p := ls.pending()
 		switch p {
@@ -232,7 +268,16 @@ func (s *Service) runSession(ls *liveSession, lp executor.LiveProcess) {
 		exitCode = &code
 	}
 
-	s.finishSession(ls, status, reason, exitCode, outputBytes, truncated)
+	s.finishSession(ls, status, reason, exitCode, diagnostic, outputBytes, truncated)
+}
+
+// truncateDiagnostic caps a stored session diagnostic so a verbose error cannot
+// bloat the session record.
+func truncateDiagnostic(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max]
 }
 
 // watchSession enforces the idle timeout and the absolute lifetime. "Activity"
@@ -328,7 +373,7 @@ func (s *Service) endSession(ls *liveSession, reason string) {
 // the session lock across the save so a concurrent activity update (input,
 // signal, resize) can never persist a stale running status after the terminal
 // transition: markActivity re-checks ls.ended under the same lock.
-func (s *Service) finishSession(ls *liveSession, status model.SessionStatus, reason string, exitCode *int, outputBytes int64, truncated bool) {
+func (s *Service) finishSession(ls *liveSession, status model.SessionStatus, reason string, exitCode *int, diagnostic string, outputBytes int64, truncated bool) {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 	if ls.ended {
@@ -338,6 +383,7 @@ func (s *Service) finishSession(ls *liveSession, status model.SessionStatus, rea
 	sess := ls.session
 	sess.Status = status
 	sess.Reason = reason
+	sess.Diagnostic = diagnostic
 	sess.EndedAt = time.Now().UTC()
 	sess.OutputBytes = outputBytes
 	sess.OutputTruncated = truncated || sess.OutputTruncated

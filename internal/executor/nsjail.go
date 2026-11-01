@@ -527,6 +527,11 @@ type tmplData struct {
 	// there without a writable code path. Empty for non-session requests.
 	HelperDir string
 
+	// PTY, when set, adds the host /dev/pts and /dev/ptmx bind mounts a terminal
+	// session needs (pty.fork() requires a working /dev/ptmx and devpts). It is
+	// false for one-shot exec, which gets the smaller /dev.
+	PTY bool
+
 	// Two-tier package mounts. SharedPackagesDir is the host directory
 	// bind-mounted read-only; PrivatePackagesDir is the workspace's host
 	// directory bind-mounted writable. Both are optional (empty = not mounted).
@@ -647,6 +652,8 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		SeccompPolicy: seccompPolicy(),
 
 		HelperDir: helperDir,
+
+		PTY: req.PTY,
 
 		SharedPackagesDir:  sharedDir,
 		PrivatePackagesDir: privateDir,

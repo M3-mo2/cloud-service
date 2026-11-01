@@ -39,6 +39,13 @@ func (e *SandboxError) Error() string {
 // Is lets errors.Is(err, ErrSandboxUnavailable) match a *SandboxError.
 func (e *SandboxError) Is(target error) bool { return target == ErrSandboxUnavailable }
 
+// PTYErrorMarker is the prefix the PTY relay helper writes to its stderr when it
+// cannot allocate a PTY inside the sandbox (typically because /dev/ptmx or
+// devpts was not mounted). It lets the executor recognise a terminal-session
+// startup failure and surface it as a failed session rather than a running one
+// whose output is a Python traceback.
+const PTYErrorMarker = "sandboxd-pty-error:"
+
 // Request describes a single execution inside a workspace sandbox.
 type Request struct {
 	Workspace     *model.Workspace

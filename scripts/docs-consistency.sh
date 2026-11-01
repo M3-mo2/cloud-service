@@ -167,9 +167,11 @@ REQUIRED_TERMS=(
   "privileged"
   "session"
   "PTY"
+  "devpts"
   "idle"
   "lifetime"
   "stdin"
+  "diagnostic"
 )
 for term in "${REQUIRED_TERMS[@]}"; do
   if grep -qi -- "$term" docs/DECISIONS.md; then

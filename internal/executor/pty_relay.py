@@ -65,6 +65,14 @@ MAX_CONTROL_BUF = 1 << 20
 # Grace between SIGHUP and SIGKILL when tearing the shell down (milliseconds).
 SHUTDOWN_GRACE_MS = 3000
 
+# A PTY allocation failure is reported as a distinct, machine-recognisable
+# diagnostic on stderr and a dedicated exit code. The executor turns this into a
+# failed session with the diagnostic (never a running session whose terminal
+# output is a Python traceback). The host /dev/pts and /dev/ptmx mounts are what
+# make pty.fork() succeed inside the jail; if they are missing this fires.
+PTY_ERROR_PREFIX = "sandboxd-pty-error:"
+PTY_ERROR_EXIT = 69  # EX_UNAVAILABLE (sysexits.h); not an nsjail launch code.
+
 
 def set_winsize(fd, rows, cols):
     try:
@@ -187,7 +195,18 @@ def main():
     cols = cols if cols > 0 else 80
     rows = rows if rows > 0 else 24
 
-    child, master = pty.fork()
+    try:
+        child, master = pty.fork()
+    except OSError as exc:
+        # The sandbox has no usable PTY: /dev/ptmx and devpts were not mounted
+        # (or are broken). Emit one clean line -- never a traceback -- so the
+        # service records a failed session with an actionable diagnostic.
+        sys.stderr.write(
+            "%s cannot allocate a PTY: %s\n"
+            "the sandbox is missing a working /dev/ptmx and devpts\n" % (PTY_ERROR_PREFIX, exc)
+        )
+        sys.stderr.flush()
+        os._exit(PTY_ERROR_EXIT)
     if child == 0:
         # Child: the PTY is already its controlling terminal (pty.fork sets
         # this up), so it is the session leader.

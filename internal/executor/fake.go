@@ -21,6 +21,7 @@ type FakeRunner struct {
 	// Sessions: when LiveOutput is set, Start writes it to the session's
 	// StdoutPath and stays alive until Kill/Close (or the lifetime delay).
 	StartErr   error
+	LiveErr    error
 	LiveOutput string
 	LiveDelay  time.Duration
 
@@ -39,6 +40,7 @@ type fakeLive struct {
 	stdin  *fakeStdin
 	done   chan struct{}
 	res    Result
+	err    error
 	closed sync.Once
 	killed bool
 }
@@ -219,17 +221,25 @@ func (f *FakeRunner) Start(req Request) (LiveProcess, error) {
 		stdin: &fakeStdin{},
 		done:  make(chan struct{}),
 		res:   Result{ExitCode: f.ExitCode, Streamed: true},
+		err:   f.LiveErr,
 	}
 	lp.stdin.owner = lp
 	f.live[pid] = lp
 	out := f.LiveOutput
 	delay := f.LiveDelay
+	liveErr := f.LiveErr
 	f.mu.Unlock()
 
 	if req.StdoutPath != "" {
 		_ = appendFile(req.StdoutPath, out)
 	}
 	go func() {
+		if liveErr != nil {
+			// Model a relay that dies at startup (e.g. no PTY): it ends at once
+			// with its error, so the service can record a failed session.
+			lp.finish(Result{ExitCode: f.ExitCode, Streamed: true})
+			return
+		}
 		if delay > 0 {
 			select {
 			case <-time.After(delay):
@@ -285,7 +295,7 @@ func (l *fakeLive) Kill() bool {
 // Wait blocks until the fake process finishes.
 func (l *fakeLive) Wait() (Result, error) {
 	<-l.done
-	return l.res, nil
+	return l.res, l.err
 }
 
 func appendFile(path, data string) error {

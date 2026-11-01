@@ -269,6 +269,37 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
     reaches the client. _Rationale_: the input channel and the control channel
     share one pipe; the only safe design is that the client's bytes can never be
     promoted into a command.
+52. **Mount the host `/dev/pts` and `/dev/ptmx`, read-only, only for a PTY
+    session.** nsjail has no PTY support of its own, so the relay helper
+    allocates the terminal with `pty.fork()` — which opens **`/dev/ptmx`** and
+    needs a usable **devpts**. The one-shot `/dev` (null/urandom/zero only)
+    leaves both absent, and the helper dies with `OSError: out of pty devices`.
+    A **private** devpts instance (`fstype: devpts`,
+    `newinstance,ptmxmode=0666,mode=0620`) was measured **not** to help: it makes
+    `/dev/pts/ptmx` appear, but `openpty()` opens `/dev/ptmx`, which that
+    configuration does not create, so it still fails — now with ENOENT. Binding
+    the **host's** `/dev/pts` **and** `/dev/ptmx` is the measured minimum that
+    makes `pty.fork()` succeed inside the jail; both are read-only binds of
+    device nodes, added **only when `Request.PTY` is set** so ordinary `exec`
+    keeps the narrower `/dev` (a one-shot process needs no terminal). _Rationale_:
+    the sandbox now sees the host's pty pool — **a terminal, not a filesystem or
+    process view** — which is exactly the capability a terminal requires and
+    nothing more; uid/gid, seccomp, mount and namespace isolation are otherwise
+    unchanged. See the measured before/after in
+    [VERIFICATION.md](VERIFICATION.md) §9b.
+53. **A PTY (or sandbox-launch) failure is a `failed` session with a
+    diagnostic, never a `running` one.** The relay writes `sandboxd-pty-error:`
+    to stderr and exits non-zero when it cannot allocate a terminal; the executor
+    recognises that marker and returns a `SandboxError`, and the service records
+    the session as `failed` / `sandbox_unavailable` with the actionable
+    `diagnostic` (never a Python traceback in the output). `StartSession` also
+    waits a short, bounded window (`sessions.start_probe_ms`, default 250 ms,
+    capped at 2 s) for a relay that dies immediately, so even the **create
+    response** is honest rather than a `201 … running` that is already dead.
+    _Rationale_: the original bug was silent at the API level — a client only
+    learned of the failure by reading the output stream. The same treatment
+    covers any immediate relay death (e.g. a missing interpreter), because the
+    helper's non-zero exit arrives within the probe window.
 
 ## Additional defaults chosen during implementation
 

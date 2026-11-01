@@ -284,6 +284,104 @@ func TestPTYHelperCloseEndsSession(t *testing.T) {
 	}
 }
 
+// TestPTYRelayScriptHandlesAllocationFailure guards the loud-failure contract
+// of the helper: it must catch a PTY allocation error, emit the machine-readable
+// PTYErrorMarker (never a traceback), and exit with the dedicated code.
+func TestPTYRelayScriptHandlesAllocationFailure(t *testing.T) {
+	s := string(PTYRelayScript)
+	for _, want := range []string{
+		`PTY_ERROR_PREFIX = "sandboxd-pty-error:"`,
+		"except OSError as exc:",
+		"os._exit(PTY_ERROR_EXIT)",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("helper must handle PTY allocation failure; missing %q", want)
+		}
+	}
+}
+
+// TestPTYFailureDetectedFromHelperStderr proves the executor turns the helper's
+// marker into a SandboxError and does not misfire on a healthy session.
+func TestPTYFailureDetectedFromHelperStderr(t *testing.T) {
+	tail := newTailBuffer(1024)
+	_, _ = tail.Write([]byte("noise\nsandboxd-pty-error: cannot allocate a PTY: out of pty devices\n" +
+		"the sandbox is missing a working /dev/ptmx and devpts\n"))
+	err := ptyFailure(tail, 69)
+	if err == nil {
+		t.Fatal("expected a PTY failure")
+	}
+	if !strings.Contains(err.Error(), "PTY allocation failed") || !strings.Contains(err.Error(), "out of pty devices") {
+		t.Fatalf("diagnostic = %q", err.Error())
+	}
+	// A clean exit is never a failure, even if the marker were present.
+	if ptyFailure(tail, 0) != nil {
+		t.Error("exit 0 must not be a PTY failure")
+	}
+	// A tail without the marker (an ordinary shell exit) is not a PTY failure.
+	clean := newTailBuffer(64)
+	_, _ = clean.Write([]byte("$ exit 2\n"))
+	if ptyFailure(clean, 2) != nil {
+		t.Error("a shell that exits 2 without the marker must not be a PTY failure")
+	}
+	if ptyFailure(nil, 69) != nil {
+		t.Error("a non-PTY process has no tail and must not be reclassified")
+	}
+}
+
+// TestRenderSessionConfigMountsHostDevpts proves a PTY session's rendered config
+// binds the host /dev/pts and /dev/ptmx read-only. This is the measured minimum
+// that lets pty.fork() succeed inside the jail; without it the relay dies with
+// "out of pty devices".
+func TestRenderSessionConfigMountsHostDevpts(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{ID: "ws_test", Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+	path, err := r.renderConfig(Request{
+		Workspace:     ws,
+		WorkspaceRoot: "/tmp/wsroot",
+		Cwd:           "/",
+		PTY:           true,
+		Argv:          []string{"/usr/bin/python3", "/run/sandboxd/pty_relay.py", `{"shell":"/bin/sh","cols":80,"rows":24}`},
+	}, "/tmp/session-tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+
+	for _, dev := range []string{"/dev/pts", "/dev/ptmx"} {
+		mount := `src: "` + dev + `"
+  dst: "` + dev + `"
+  is_bind: true
+  rw: false`
+		if !strings.Contains(out, mount) {
+			t.Errorf("a PTY session must bind-mount the host %s read-only:\n%s", dev, out)
+		}
+	}
+}
+
+// TestRenderConfigOmitsDevptsForOneShotExec proves a one-shot exec renders no
+// pty devices: the mount is added only for a session, so ordinary execution
+// keeps the narrower /dev (null/urandom/zero only).
+func TestRenderConfigOmitsDevptsForOneShotExec(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+	path, err := r.renderConfig(Request{Workspace: ws, WorkspaceRoot: "/tmp/x", Argv: []string{"/bin/true"}}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+
+	if strings.Contains(out, "/dev/pts") || strings.Contains(out, "/dev/ptmx") {
+		t.Errorf("a one-shot exec must not get pty devices:\n%s", out)
+	}
+	for _, dev := range []string{"/dev/null", "/dev/urandom", "/dev/zero"} {
+		if !strings.Contains(out, `src: "`+dev+`"`) {
+			t.Errorf("one-shot exec must still mount %s:\n%s", dev, out)
+		}
+	}
+}
+
 // TestRenderSessionConfigHelperMount proves the rendered nsjail config mounts
 // the PTY helper read-only and runs it as the entry command with the shell and
 // initial size in its JSON argument. This is the unprivileged-environment

@@ -165,15 +165,17 @@ Session JSON:
 
 ```json
 {"id":"ses_...","workspace_id":"ws_...","shell":"/bin/sh","cwd":"/","cols":80,"rows":24,
- "status":"running|exited|killed|timed_out","created_at":"...","last_activity_at":"...",
+ "status":"running|exited|killed|timed_out|failed","created_at":"...","last_activity_at":"...",
  "started_at":"...","ended_at":"...","exit_code":null,"reason":"...",
- "output_bytes":0,"output_truncated":false}
+ "diagnostic":"... (only for failed)","output_bytes":0,"output_truncated":false}
 ```
 
 **Lifecycle.** `running` → `exited` (shell exits), `killed` (DELETE /
-workspace delete / suspend / service shutdown), or `timed_out` (idle timeout or
-absolute lifetime). Each terminal transition carries a `reason`. All terminal
-states are final.
+workspace delete / suspend / service shutdown), `timed_out` (idle timeout or
+absolute lifetime), or `failed` (the relay could not start — a PTY or sandbox
+launch failure). Each terminal transition carries a `reason`; a `failed` session
+also carries an actionable `diagnostic` and never leaves a traceback in its
+output. All terminal states are final.
 
 **Limits.** A per-workspace concurrent-session cap (`sessions.max_per_workspace`,
 default 4) returns **409 `too_many_sessions`**. An idle timeout
@@ -193,8 +195,8 @@ ending the session; `POST .../runs/{id}/stop` instead terminates the run.
 its `output` readable.
 
 **Config keys** (`sessions:`): `max_per_workspace`, `idle_timeout_sec`,
-`lifetime_sec`, `output_kb`, `max_input_kb`, `shell`, `kill_grace_sec`. The
-service starts with none of them set.
+`lifetime_sec`, `output_kb`, `max_input_kb`, `shell`, `kill_grace_sec`,
+`start_probe_ms`. The service starts with none of them set.
 
 Run JSON:
 
@@ -350,9 +352,15 @@ helper** as the entry command, with the helper materialized in the session's
 private `/tmp` and bind-mounted read-only at `/run/sandboxd`. The helper
 allocates the PTY, runs the shell as a session leader, and relays a
 line-delimited JSON control protocol from its stdin; its stdout is the terminal
-byte stream. The session runs with the same uid/gid, mounts and seccomp policy
-as any workload — the sandbox is never weakened. Client `data` is written to the
-PTY as raw bytes and is never interpreted as a helper command. See
+byte stream. `pty.fork()` opens `/dev/ptmx` and needs devpts, so a **PTY
+session** additionally bind-mounts the host's `/dev/pts` and `/dev/ptmx`
+read-only (only for a session; one-shot `exec` does not); a private devpts
+instance does not work because `openpty()` opens `/dev/ptmx`. A terminal is a
+device, not a filesystem or process view, and the session otherwise runs with the
+same uid/gid, mounts and seccomp policy as any workload — the sandbox is never
+weakened. Client `data` is written to the PTY as raw bytes and is never
+interpreted as a helper command. If the PTY cannot be allocated the session is
+recorded `failed` with a `diagnostic`, never `running` with a traceback. See
 [ARCHITECTURE.md](ARCHITECTURE.md) and [DECISIONS.md](DECISIONS.md).
 
 Process kill must kill the process group (nsjail + children) per §1.11.

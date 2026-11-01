@@ -26,6 +26,7 @@ type sessionJSON struct {
 	EndedAt         string `json:"ended_at"`
 	ExitCode        *int   `json:"exit_code"`
 	Reason          string `json:"reason,omitempty"`
+	Diagnostic      string `json:"diagnostic,omitempty"`
 	OutputBytes     int64  `json:"output_bytes"`
 	OutputTruncated bool   `json:"output_truncated"`
 }
@@ -45,6 +46,7 @@ func toSessionJSON(s *model.Session) sessionJSON {
 		EndedAt:         formatTime(s.EndedAt),
 		ExitCode:        s.ExitCode,
 		Reason:          s.Reason,
+		Diagnostic:      s.Diagnostic,
 		OutputBytes:     s.OutputBytes,
 		OutputTruncated: s.OutputTruncated,
 	}
@@ -172,7 +174,7 @@ func parseSessionFilter(r *http.Request) (service.SessionFilter, error) {
 
 func validSessionStatus(s string) bool {
 	switch model.SessionStatus(s) {
-	case model.SessionRunning, model.SessionExited, model.SessionKilled, model.SessionTimedOut:
+	case model.SessionRunning, model.SessionExited, model.SessionKilled, model.SessionTimedOut, model.SessionFailed:
 		return true
 	}
 	return false

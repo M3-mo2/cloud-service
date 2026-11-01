@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -53,6 +54,45 @@ func sessionJSONOf(t *testing.T, body []byte) sessionJSON {
 	return resp.Session
 }
 
+// TestSessionPTYFailureIsLoud covers the loud-failure contract: a relay that
+// cannot allocate a PTY must surface as a failed session with a diagnostic, not
+// a session reported running whose output is a Python traceback. The fake
+// runner models the relay dying at startup with a sandbox error.
+func TestSessionPTYFailureIsLoud(t *testing.T) {
+	h := newHarness(t)
+	h.runner.LiveErr = errors.New("PTY allocation failed: sandboxd-pty-error: out of pty devices")
+	ws := h.createWorkspace("ses")
+	rec := h.doJSON("POST", "/v1/workspaces/"+ws+"/sessions", keyA, map[string]any{})
+	if rec.Code != 201 {
+		t.Fatalf("create = %d body=%s", rec.Code, rec.Body.String())
+	}
+	sess := sessionJSONOf(t, rec.Body.Bytes())
+	if sess.Status != "failed" {
+		t.Fatalf("session reported %q, want failed (must not stay running): %+v", sess.Status, sess)
+	}
+	if sess.Reason != "sandbox_unavailable" {
+		t.Fatalf("reason = %q, want sandbox_unavailable", sess.Reason)
+	}
+	if !strings.Contains(sess.Diagnostic, "out of pty devices") {
+		t.Fatalf("diagnostic = %q, want the PTY error", sess.Diagnostic)
+	}
+	// A failed session is terminal: no live process is left behind.
+	if h.runner.LiveCount() != 0 {
+		t.Fatalf("live processes = %d, want 0 after a failed start", h.runner.LiveCount())
+	}
+	// The failure is also visible through the get endpoint.
+	rec = h.doJSON("GET", "/v1/workspaces/"+ws+"/sessions/"+sess.ID, keyA, nil)
+	got := sessionJSONOf(t, rec.Body.Bytes())
+	if got.Status != "failed" || got.Diagnostic == "" {
+		t.Fatalf("get session = %+v, want failed with a diagnostic", got)
+	}
+}
+
+// executorError is a minimal error carrying a diagnostic string.
+type executorError struct{ msg string }
+
+func (e *executorError) Error() string { return e.msg }
+
 // TestSessionCreateAndInspect covers scenario 1 (a session starts; the record
 // reports the interactive launcher) and the inspect shape. The real-PTY proof
 // (`test -t 1`) lives in internal/executor (TestPTYHelperRealTTY) because the
@@ -60,6 +100,8 @@ func sessionJSONOf(t *testing.T, body []byte) sessionJSON {
 // through the PTY path with the configured shell and window size.
 func TestSessionCreateAndInspect(t *testing.T) {
 	h := newHarness(t)
+	// Keep the relay alive so the create reports a running session.
+	h.runner.LiveDelay = 10 * time.Second
 	ws := h.createWorkspace("ses")
 	id, _ := h.createSession(ws, map[string]any{"shell": "/bin/bash", "cols": 100, "rows": 40})
 
