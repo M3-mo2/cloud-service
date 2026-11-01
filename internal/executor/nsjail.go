@@ -196,7 +196,7 @@ func (r *NsjailRunner) Run(req Request) (Result, error) {
 		defer cancel()
 	}
 
-	cmd := exec.CommandContext(ctx, bin, "-q", "-L", "3", "--config", cfgPath)
+	cmd := nsjailCommand(ctx, bin, cfgPath, req.NetnsPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Ensure context cancellation (timeout or explicit stop) tears down the whole
 	// process group rather than only the direct child.
@@ -611,21 +611,66 @@ func writeAppend(path string, rd io.Reader) error {
 	return err
 }
 
+// nsjailCommand builds the nsjail command, entering the workspace's private
+// network namespace first when one is configured. `nsenter --no-fork` replaces
+// itself (no intermediate helper process), so the direct child remains nsjail
+// and the cgroup resolver keeps working unchanged. When no namespace is given,
+// nsjail is executed directly and creates its own empty namespace.
+func nsjailCommand(ctx context.Context, bin, cfgPath, netns string) *exec.Cmd {
+	nsjailArgs := []string{"-q", "-L", "3", "--config", cfgPath}
+	if netns == "" {
+		return exec.CommandContext(ctx, bin, nsjailArgs...)
+	}
+	args := append([]string{"--no-fork", "--net=" + netns, bin}, nsjailArgs...)
+	return exec.CommandContext(ctx, "nsenter", args...)
+}
+
+// withEgressEnv appends fixed service-chosen proxy variables to the sandbox
+// environment. A caller-supplied value of the same key is dropped so the
+// engine's proxy address always wins (the variables point at the workspace's
+// own hub peer, which is service-owned, not caller-owned).
+func withEgressEnv(env, egress []string) []string {
+	if len(egress) == 0 {
+		return env
+	}
+	managed := map[string]bool{}
+	for _, kv := range egress {
+		if k, _, ok := strings.Cut(kv, "="); ok {
+			managed[k] = true
+		}
+	}
+	out := env[:0]
+	for _, kv := range env {
+		if k, _, ok := strings.Cut(kv, "="); ok && managed[k] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	out = append(out, egress...)
+	sortStrings(out)
+	return out
+}
+
 // tmplData is the data passed to the nsjail config template.
 type tmplData struct {
-	Argv          []string
-	Env           []string
-	Cwd           string
-	TimeLimitSec  int
-	CPUCores      float64
-	CPUMilli      int
-	MemoryMB      int
-	MemoryBytes   int64
-	PidsMax       int
-	FsizeMB       int
-	AsMB          int
-	AllowNet      bool
-	DisableNet    bool
+	Argv         []string
+	Env          []string
+	Cwd          string
+	TimeLimitSec int
+	CPUCores     float64
+	CPUMilli     int
+	MemoryMB     int
+	MemoryBytes  int64
+	PidsMax      int
+	FsizeMB      int
+	AsMB         int
+	AllowNet     bool
+	DisableNet   bool
+	// JoinNetns, when true, means the runner has already entered the
+	// workspace's own network namespace and nsjail must not create another one
+	// (clone_newnet:false). It is never a host-network share.
+	JoinNetns     bool
+	ResolverConf  string
 	User          string
 	Group         string
 	SandboxUID    int
@@ -753,7 +798,7 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 
 	data := tmplData{
 		Argv:          req.Argv,
-		Env:           withPackagePath(formatEnv(req.Env), pkgPath),
+		Env:           withPackagePath(withEgressEnv(formatEnv(req.Env), req.EgressEnv), pkgPath),
 		Cwd:           cwd,
 		TimeLimitSec:  timeoutSec,
 		CPUCores:      lim.CPUCores,
@@ -765,6 +810,8 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		AsMB:          lim.MemoryMB,
 		AllowNet:      lim.AllowNet,
 		DisableNet:    !lim.AllowNet,
+		JoinNetns:     req.NetnsPath != "",
+		ResolverConf:  req.ResolverConf,
 		User:          r.cfg.Sandbox.User,
 		Group:         r.cfg.Sandbox.Group,
 		SandboxUID:    r.identity.SandboxUID,

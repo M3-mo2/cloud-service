@@ -324,6 +324,102 @@ func (s *Store) DeleteSession(wsID, sessionID string) error {
 	return os.RemoveAll(s.SessionDir(wsID, sessionID))
 }
 
+// portsDir returns the ports directory for a workspace.
+//
+// Ports are persisted as one JSON file per port under a per-workspace
+// directory, so a restart can enumerate every record and reap orphan listeners
+// that belong to no live workspace.
+func (s *Store) portsDir(wsID string) string {
+	return filepath.Join(s.WorkspaceDir(wsID), "ports")
+}
+
+// PortPath returns the JSON path of a published port.
+func (s *Store) PortPath(wsID, portID string) string {
+	return filepath.Join(s.portsDir(wsID), portID+".json")
+}
+
+// CreatePort persists a new published-port record.
+func (s *Store) CreatePort(p *model.PublishedPort) error {
+	return writeJSONAtomic(s.PortPath(p.WorkspaceID, p.ID), p)
+}
+
+// SavePort atomically rewrites a published-port record.
+func (s *Store) SavePort(p *model.PublishedPort) error {
+	return writeJSONAtomic(s.PortPath(p.WorkspaceID, p.ID), p)
+}
+
+// GetPort loads a published port by ID.
+func (s *Store) GetPort(wsID, portID string) (*model.PublishedPort, error) {
+	var p model.PublishedPort
+	if err := readJSON(s.PortPath(wsID, portID), &p); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, model.ErrNotFound
+		}
+		return nil, err
+	}
+	return &p, nil
+}
+
+// ListPorts returns all published ports for a workspace, newest first.
+func (s *Store) ListPorts(wsID string) ([]*model.PublishedPort, error) {
+	entries, err := os.ReadDir(s.portsDir(wsID))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []*model.PublishedPort{}, nil
+		}
+		return nil, err
+	}
+	out := make([]*model.PublishedPort, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(e.Name(), ".json")
+		p, err := s.GetPort(wsID, id)
+		if err != nil {
+			continue
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+// ListAllPorts returns every published port across every workspace, for
+// startup reaping.
+func (s *Store) ListAllPorts() ([]*model.PublishedPort, error) {
+	entries, err := os.ReadDir(s.WorkspacesDir())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return []*model.PublishedPort{}, nil
+		}
+		return nil, err
+	}
+	var out []*model.PublishedPort
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), model.WorkspaceIDPrefix) {
+			continue
+		}
+		ports, err := s.ListPorts(e.Name())
+		if err != nil {
+			continue
+		}
+		out = append(out, ports...)
+	}
+	return out, nil
+}
+
+// DeletePort removes a published-port record.
+func (s *Store) DeletePort(wsID, portID string) error {
+	if !strings.HasPrefix(portID, model.PortIDPrefix) {
+		return fmt.Errorf("invalid port id %q", portID)
+	}
+	if err := os.Remove(s.PortPath(wsID, portID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // CreateRun creates a run directory and writes its metadata.
 func (s *Store) CreateRun(wsID string, r *model.Run) error {
 	if err := os.MkdirAll(s.RunDir(wsID, r.ID), 0o755); err != nil {

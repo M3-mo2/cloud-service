@@ -69,6 +69,11 @@ func (s *Server) Router() http.Handler {
 				r.Get("/processes", s.handleListProcesses)
 				r.Post("/processes/{processID}/stop", s.handleStopProcess)
 
+				r.Post("/ports", s.handlePublishPort)
+				r.Get("/ports", s.handleListPorts)
+				r.Get("/ports/{portID}", s.handleGetPort)
+				r.Delete("/ports/{portID}", s.handleUnpublishPort)
+
 				r.Get("/packages", s.handleListPackages)
 				r.Post("/packages/install", s.handleInstallPackages)
 				r.Delete("/packages", s.handleDeletePackages)
@@ -127,21 +132,68 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	dataOK := s.dataDirWritable()
 	nsjailOK := s.svc.Runner().Available()
 	cgroupsOK := s.svc.Runner().CgroupsUsable()
+	// The isolated network layer is reported truthfully: when ports are enabled
+	// but the layer cannot serve, readiness is not claimed.
+	netAvail, netReady, netReason := s.svc.NetworkStatus()
+	portsEnabled, portsReady, portsReason := s.svc.PortsStatus()
 	status := http.StatusOK
 	if !dataOK || !nsjailOK || !cgroupsOK {
 		status = http.StatusServiceUnavailable
 	}
-	writeJSON(w, status, map[string]any{
+	if portsEnabled && !portsReady {
+		status = http.StatusServiceUnavailable
+	}
+	if netAvail && !netReady && s.cfg.Ports.Enabled {
+		status = http.StatusServiceUnavailable
+	}
+	body := map[string]any{
 		"status":   map[bool]string{true: "ready", false: "not_ready"}[status == http.StatusOK],
 		"nsjail":   nsjailOK,
 		"cgroups":  cgroupsOK,
 		"data_dir": dataOK,
-	})
+		"network": map[string]any{
+			"available": netAvail,
+			"ready":     netReady,
+		},
+		"ports": map[string]any{
+			"enabled": portsEnabled,
+			"ready":   portsReady,
+		},
+	}
+	if netReason != "" {
+		body["network"].(map[string]any)["reason"] = netReason
+	}
+	if portsReason != "" {
+		body["ports"].(map[string]any)["reason"] = portsReason
+	}
+	writeJSON(w, status, body)
 }
 
 func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	l := s.cfg.Limits
 	m := s.cfg.MaxLimits
+	portsEnabled, portsReady, portsReason := s.svc.PortsStatus()
+	portsCap := map[string]any{
+		"enabled":           portsEnabled,
+		"ready":             portsReady,
+		"host_range":        s.cfg.Ports.HostRange,
+		"bind_addr":         s.cfg.Ports.BindAddr,
+		"max_per_workspace": s.cfg.Ports.MaxPerWorkspace,
+		"max_per_principal": s.cfg.Ports.MaxPerPrincipal,
+	}
+	if portsReason != "" {
+		portsCap["reason"] = portsReason
+	}
+	netAvail, netReady, netReason := s.svc.NetworkStatus()
+	netCap := map[string]any{
+		"available":      netAvail,
+		"ready":          netReady,
+		"egress":         s.svc.EgressEnabled(),
+		"workspace_cidr": "10.200.0.0/16",
+	}
+	if netReason != "" {
+		netCap["reason"] = netReason
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":     model.Version,
 		"api_version": model.APIVersion,
@@ -154,6 +206,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 			"max_runs":             l.MaxRuns,
 			"allow_net":            l.AllowNet,
 			"allow_unlimited_runs": l.AllowUnlimitedRuns,
+			"allow_ports":          l.AllowPorts,
 		},
 		"limits_maxima": map[string]any{
 			"cpu_cores":            m.CPUCores,
@@ -164,6 +217,8 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 			"allow_net":            m.AllowNet,
 			"allow_unlimited_runs": m.AllowUnlimitedRuns,
 		},
+		"ports":               portsCap,
+		"network":             netCap,
 		"interpreters":        model.SupportedInterpreters(),
 		"runnable_extensions": model.SupportedExtensions(),
 	})

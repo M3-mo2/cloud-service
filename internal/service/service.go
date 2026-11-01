@@ -22,6 +22,11 @@ type Service struct {
 	runner executor.Runner
 	logger *slog.Logger
 
+	// net is the per-workspace networking + published-port layer. It is nil
+	// when no networking is configured (runs then get a fresh empty namespace
+	// and published ports are disabled).
+	net Network
+
 	mu       sync.Mutex
 	runs     map[string]*runningRun
 	sessions map[string]*liveSession
@@ -74,7 +79,7 @@ func (s *Service) CreateWorkspace(principalID, name string, limits *model.Limits
 	lim := s.defaultLimits()
 	if limits != nil {
 		lim = applyLimits(lim, *limits)
-		if err := checkMaxima(lim, s.maxLimits()); err != nil {
+		if err := checkMaxima(lim, s.maxLimits(), s.cfg.Ports.Enabled); err != nil {
 			return nil, err
 		}
 	}
@@ -95,7 +100,7 @@ func (s *Service) CreateWorkspace(principalID, name string, limits *model.Limits
 }
 
 // checkMaxima rejects a limits value that exceeds any server-level maximum.
-func checkMaxima(l, max model.Limits) error {
+func checkMaxima(l, max model.Limits, portsEnabled bool) error {
 	switch {
 	case l.CPUCores > max.CPUCores:
 		return maxExceeded("cpu_cores", l.CPUCores, max.CPUCores)
@@ -109,6 +114,8 @@ func checkMaxima(l, max model.Limits) error {
 		return maxExceeded("max_runs", l.MaxRuns, max.MaxRuns)
 	case l.AllowUnlimitedRuns && !max.AllowUnlimitedRuns:
 		return UnlimitedForbiddenByServer()
+	case l.AllowPorts && !portsEnabled:
+		return PortsForbiddenByServer()
 	}
 	return nil
 }
@@ -152,6 +159,7 @@ func (s *Service) defaultLimits() model.Limits {
 		MaxRuns:            l.MaxRuns,
 		AllowNet:           l.AllowNet,
 		AllowUnlimitedRuns: l.AllowUnlimitedRuns,
+		AllowPorts:         l.AllowPorts,
 	}
 }
 
@@ -174,6 +182,7 @@ func applyLimits(base, over model.Limits) model.Limits {
 	}
 	base.AllowNet = over.AllowNet
 	base.AllowUnlimitedRuns = over.AllowUnlimitedRuns
+	base.AllowPorts = over.AllowPorts
 	return base
 }
 
@@ -207,8 +216,13 @@ func (s *Service) DeleteWorkspace(id, principalID string) error {
 	s.StopWorkspaceSessions(w.ID, model.SessionReasonWorkspaceDeleted)
 	// A detached process started from a session must not outlive the workspace.
 	s.StopDetachedProcesses(w)
+	// Ports die with the workspace: stop every forwarder and drop the records
+	// before the tree is removed.
+	s.ReleaseWorkspacePorts(w)
 	if err := s.store.DeleteWorkspace(w.ID); err != nil {
 		return err
 	}
+	// Tear the private network down last, once no process can still reference it.
+	s.ReleaseWorkspaceNetwork(w.ID)
 	return nil
 }

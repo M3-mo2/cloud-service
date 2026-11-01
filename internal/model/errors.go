@@ -37,6 +37,26 @@ const (
 	// ...). Deleting a session removes its record, so subsequent operations
 	// return not_found instead.
 	CodeSessionEnded = "session_ended"
+
+	// CodePortUnreachable is returned (HTTP 502) when a request reaches a
+	// published port's forwarder but nothing answers inside the workspace
+	// (the app never bound, bound only to 127.0.0.1, or has exited). It is a
+	// distinct machine-readable code so a client can tell a live mapping whose
+	// app is down from a mapping that does not exist (not_found) or a broken
+	// engine (a bare 500). The port record is honest: its status is
+	// `unreachable`.
+	CodePortUnreachable = "port_unreachable"
+
+	// CodePortsDisabled is returned (HTTP 422) when a port is published for a
+	// workspace that has not opted in (limits.allow_ports=false) or when the
+	// server-level ports.enabled switch is false. Publishing therefore requires
+	// both keys, exactly like allow_unlimited_runs.
+	CodePortsDisabled = "ports_disabled"
+
+	// CodeTooManyPorts is returned (HTTP 422) when publishing would exceed the
+	// configured per-workspace or per-principal cap. The message names the
+	// limit; nothing extra is published.
+	CodeTooManyPorts = "too_many_ports"
 )
 
 // Error is the canonical API error, carrying an HTTP mapping and a code.

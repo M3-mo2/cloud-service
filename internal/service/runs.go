@@ -202,6 +202,13 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		s.logger.Warn("prune runs failed", "workspace_id", w.ID, "error", err)
 	}
 
+	// Prepare the workspace's isolated network before recording the run, so a
+	// networking failure refuses the request instead of leaving a queued run
+	// that can never get a sandbox.
+	if _, err := s.EnsureWorkspaceNetwork(w.ID); err != nil {
+		return nil, model.New(503, model.CodeUnavailable, "workspace network unavailable: "+err.Error())
+	}
+
 	// Resolve the two package tiers before the run starts. A failure to
 	// prepare the private tier is fatal; a missing shared tier is not.
 	sharedHost, privateHost, err := s.packageDirs(w)
@@ -257,6 +264,13 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 
 		SharedPackagesDir:  sharedHost,
 		PrivatePackagesDir: privateHost,
+	}
+	// Attach the workspace's own isolated network to the executor request.
+	req, err = s.ApplyNetwork(w, req)
+	if err != nil {
+		cancel()
+		_ = s.store.DeleteRun(w.ID, run.ID)
+		return nil, err
 	}
 
 	rr := &runningRun{runID: run.ID, wsID: w.ID, cancel: cancel, done: make(chan struct{})}

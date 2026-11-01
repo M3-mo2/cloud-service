@@ -134,8 +134,44 @@ func TestRenderConfigAllowNet(t *testing.T) {
 	}
 	defer os.Remove(path)
 	b, _ := os.ReadFile(path)
-	if !strings.Contains(string(b), "clone_newnet: false") {
-		t.Errorf("allow_net should disable network namespace isolation:\n%s", b)
+	// allow_net is now an EGRESS capability, not a host-network share. With no
+	// engine-managed namespace the runner lets nsjail create a fresh empty one,
+	// so isolation holds even for an allow_net workspace.
+	if !strings.Contains(string(b), "clone_newnet: true") {
+		t.Errorf("allow_net must never share the host network namespace:\n%s", b)
+	}
+	if strings.Contains(string(b), "clone_newnet: false") {
+		t.Errorf("allow_net rendered a host-network share (clone_newnet:false) with no managed namespace:\n%s", b)
+	}
+}
+
+// TestRenderConfigJoinsWorkspaceNetns proves that when the runner is given the
+// workspace's own namespace it renders clone_newnet:false (stay in the already
+// entered namespace) and mounts the generated egress resolver.
+func TestRenderConfigJoinsWorkspaceNetns(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1, AllowNet: true}}
+	path, err := r.renderConfig(Request{
+		Workspace:     ws,
+		WorkspaceRoot: "/tmp/x",
+		Argv:          []string{"/bin/true"},
+		NetnsPath:     "/run/netns/sbxdws-abc123",
+		ResolverConf:  "/data/tmp/egress-resolv-abc123.conf",
+		EgressEnv:     []string{"HTTP_PROXY=http://10.200.0.1:3128"},
+	}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+	if !strings.Contains(out, "clone_newnet: false") {
+		t.Errorf("joining the workspace namespace must render clone_newnet:false:\n%s", out)
+	}
+	if !strings.Contains(out, "/data/tmp/egress-resolv-abc123.conf") {
+		t.Errorf("the generated egress resolver must be mounted:\n%s", out)
+	}
+	if !strings.Contains(out, "HTTP_PROXY=http://10.200.0.1:3128") {
+		t.Errorf("the egress proxy env must be injected:\n%s", out)
 	}
 }
 
@@ -476,12 +512,17 @@ func TestKillProcessGroupReal(t *testing.T) {
 }
 
 // TestRenderConfigMountsResolverWhenNetAllowed is a regression guard for a real
-// breakage found by exercising the running service: with allow_net the container
-// shares the host network namespace (clone_newnet: false) and TCP to a raw IP
-// works, but name resolution fails outright with "Temporary failure in name
-// resolution" because no /etc/resolv.conf is mounted into the jail. That breaks
-// `pip install` and any workload that resolves a hostname, which is exactly what
-// the private package tier exists to support.
+// breakage found by exercising the running service: an allow_net workspace that
+// stays in the host network namespace (clone_newnet:false) had TCP to a raw IP
+// work, but name resolution failed outright with "Temporary failure in name
+// resolution" because no /etc/resolv.conf was mounted into the jail. That broke
+// `pip install` and any hostname-using workload.
+//
+// The model changed with isolated networking: allow_net no longer shares the
+// host namespace (it never does now). Instead a workspace with allow_net joins
+// its OWN namespace and gets a generated resolver naming the engine's userspace
+// egress proxy. /etc/hosts is still mounted; the host's /etc/resolv.conf is
+// deliberately never mounted into an isolated workspace.
 func TestRenderConfigMountsResolverWhenNetAllowed(t *testing.T) {
 	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
 	ws := &model.Workspace{Limits: model.Limits{
@@ -490,6 +531,8 @@ func TestRenderConfigMountsResolverWhenNetAllowed(t *testing.T) {
 		Workspace:     ws,
 		WorkspaceRoot: "/tmp/wsroot",
 		Argv:          []string{"/bin/true"},
+		NetnsPath:     "/run/netns/sbxdws-abc",
+		ResolverConf:  "/data/tmp/egress-resolv-abc.conf",
 	}, "/tmp/rt")
 	if err != nil {
 		t.Fatal(err)
@@ -497,18 +540,24 @@ func TestRenderConfigMountsResolverWhenNetAllowed(t *testing.T) {
 	defer os.Remove(path)
 	out := readFile(t, path)
 
-	for _, want := range []string{"/etc/resolv.conf", "/etc/hosts"} {
-		mount := `src: "` + want + `"
-  dst: "` + want + `"
+	// /etc/hosts is still mounted.
+	hostsMount := `src: "/etc/hosts"
+  dst: "/etc/hosts"
   is_bind: true
   rw: false`
-		if !strings.Contains(out, mount) {
-			t.Errorf("allow_net must bind-mount %s read-only so DNS resolves inside the jail:\n%s",
-				want, out)
-		}
+	if !strings.Contains(out, hostsMount) {
+		t.Errorf("allow_net must bind-mount /etc/hosts read-only:\n%s", out)
+	}
+	// The generated egress resolver is mounted at /etc/resolv.conf.
+	if !strings.Contains(out, `src: "/data/tmp/egress-resolv-abc.conf"`) {
+		t.Errorf("allow_net must mount the generated egress resolver at /etc/resolv.conf:\n%s", out)
+	}
+	// Never the host's own resolver file.
+	if strings.Contains(out, `src: "/etc/resolv.conf"`) {
+		t.Errorf("the host resolver must never be mounted into an isolated workspace:\n%s", out)
 	}
 	if !strings.Contains(out, "clone_newnet: false") {
-		t.Errorf("allow_net must keep the host network namespace:\n%s", out)
+		t.Errorf("a workspace with its own namespace must stay in it (clone_newnet:false):\n%s", out)
 	}
 }
 

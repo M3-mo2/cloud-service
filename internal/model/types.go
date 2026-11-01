@@ -18,7 +18,11 @@ const (
 	WorkspaceIDPrefix = "ws_"
 	RunIDPrefix       = "run_"
 	SessionIDPrefix   = "ses_"
+	PortIDPrefix      = "prt_"
 )
+
+// NewPortID returns a new published-port identifier.
+func NewPortID() string { return NewID(PortIDPrefix) }
 
 // NewID returns a ULID string with the given prefix.
 func NewID(prefix string) string {
@@ -47,6 +51,11 @@ type Limits struct {
 	// the server-level max_limits.allow_unlimited_runs must be true for an
 	// unlimited run to be accepted; otherwise the request is refused with 422.
 	AllowUnlimitedRuns bool `json:"allow_unlimited_runs"`
+	// AllowPorts opts a workspace in to published ports. It is false by default.
+	// Both this workspace flag and the server-level ports.enabled must be true
+	// for POST /v1/workspaces/{id}/ports to publish; otherwise the request is
+	// refused with 422. It mirrors the AllowUnlimitedRuns two-key pattern.
+	AllowPorts bool `json:"allow_ports"`
 }
 
 // Workspace statuses.
@@ -216,3 +225,43 @@ const (
 
 // SetExitCode records a session exit code.
 func (s *Session) SetExitCode(code int) { s.ExitCode = &code }
+
+// Published port statuses. A port is `published` when the workspace is
+// currently listening on it (the engine probed the working end) and
+// `unreachable` when the record exists but nothing answers inside the
+// workspace. The status is honest: it reflects a live observation, never an
+// assumption that publishing succeeded.
+const (
+	PortPublished   = "published"
+	PortUnreachable = "unreachable"
+)
+
+// PublishedPort is an engine-managed host-port mapping onto a workspace's own
+// private port. The forward target is always derived from the workspace's own
+// network allocation (AllocationAddr), never from request data, so the mapping
+// can never be turned into an open relay.
+type PublishedPort struct {
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	OwnerID     string `json:"owner_id"`
+	// Port is the port the workspace listens on inside its own network
+	// namespace.
+	Port int `json:"port"`
+	// Protocol is the transport; only "tcp" is supported.
+	Protocol string `json:"protocol"`
+	// Name is an optional human label.
+	Name string `json:"name,omitempty"`
+	// HostPort is the engine-allocated host port, always inside the configured
+	// host_range and unique across the whole host.
+	HostPort int `json:"host_port"`
+	// Host is the bind address the forwarder listens on.
+	Host string `json:"host"`
+	// Status is PortPublished or PortUnreachable, from the last observation.
+	Status string `json:"status"`
+	// AllocationAddr is the workspace's private address the forwarder dials
+	// (from the workspace network allocation). It is engine-owned, not
+	// request-supplied.
+	AllocationAddr string    `json:"-"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}

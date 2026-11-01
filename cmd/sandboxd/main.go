@@ -6,6 +6,7 @@ import (
 	"flag"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,9 +18,20 @@ import (
 	"sandboxd/internal/config"
 	"sandboxd/internal/executor"
 	"sandboxd/internal/model"
+	"sandboxd/internal/network"
 	"sandboxd/internal/service"
 	"sandboxd/internal/storage"
 )
+
+// mustPrefix parses a CIDR the service relies on; a malformed constant is a
+// programming error and panics at startup rather than degrading silently.
+func mustPrefix(s string) netip.Prefix {
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		panic("invalid network prefix " + s + ": " + err.Error())
+	}
+	return p
+}
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to the YAML configuration file")
@@ -44,6 +56,24 @@ func main() {
 	runner := executor.NewNsjailRunner(cfg, tmplPath, store.TmpDir())
 
 	svc := service.New(cfg, store, runner, logger)
+	// Attach the isolated-network + published-port layer. When the host lacks
+	// the tools, the service still starts (runs get a fresh empty network
+	// namespace) but /readyz reports the network unavailable and ports stay
+	// unusable.
+	netMgr := network.NewManager(network.ManagerConfig{
+		WorkspaceSubnet: mustPrefix("10.200.0.0/16"),
+		HubSubnet:       mustPrefix("10.199.0.0/30"),
+		NetnsDir:        "/run/netns",
+		ResolverDir:     store.TmpDir(),
+		Ports:           cfg.Ports,
+		Egress:          &network.EgressConfig{ProxyPort: 3128, DNSPort: 53},
+	})
+	if cfg.Ports.Enabled {
+		if err := netMgr.EnsureHub(); err != nil {
+			logger.Error("network hub setup failed", "error", err)
+		}
+	}
+	svc.SetNetwork(netMgr)
 	if n, err := svc.RecoverRuns(); err != nil {
 		logger.Error("run recovery failed", "error", err)
 	} else if n > 0 {
@@ -61,6 +91,15 @@ func main() {
 	// before serving, so the "on the way in" half of the no-leak guarantee holds.
 	if n := svc.ReapOrphans(); n > 0 {
 		logger.Info("reaped orphaned sandbox cgroups", "count", n)
+	}
+	// The same discipline for the network: no workspace namespace, veth or
+	// published-port listener survives a restart, so anything present on the way
+	// in is reaped.
+	if n := netMgr.ReapOrphans(nil); n > 0 {
+		logger.Info("reaped orphaned workspace networks", "count", n)
+	}
+	if n := svc.ReapWorkspacePorts(); n > 0 {
+		logger.Info("reaped orphaned published ports", "count", n)
 	}
 	authn := auth.New(cfg.Keys)
 	server := api.NewServer(svc, authn, logger)

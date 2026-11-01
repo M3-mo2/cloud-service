@@ -10,8 +10,13 @@ mode: ONCE
 
 hostname: "sandbox"
 
-# Namespaces. Network is isolated unless the workspace opts in (allow_net).
-clone_newnet: {{ if .AllowNet }}false{{ else }}true{{ end }}
+# Namespaces. The network namespace is NEVER shared with the host. When the
+# workspace has an engine-managed private namespace, the runner asks nsjail to
+# stay in it (clone_newnet set false means "do not create another one"; nsjail
+# is already inside the workspace's own namespace, entered via nsenter). With no
+# managed namespace the runner makes nsjail create a fresh, empty one. No
+# configuration shares the host network namespace.
+clone_newnet: {{ if .JoinNetns }}false{{ else }}true{{ end }}
 clone_newuser: true
 clone_newns: true
 clone_newpid: true
@@ -98,19 +103,21 @@ mount {
 
 {{- if .AllowNet }}
 
-# DNS configuration. Without a resolv.conf inside the jail, name resolution
-# fails with "Temporary failure in name resolution" even though the network
-# namespace is shared with the host: the resolver has no nameserver to query.
-# This is what breaks `pip install` (and any workload that resolves a hostname)
-# for a workspace with allow_net enabled. mandatory:false so a host without
-# /etc/resolv.conf still renders a valid run.
+# Egress configuration. The workspace is in its OWN network namespace with no
+# default route, so the host's /etc/resolv.conf is useless and deliberately NOT
+# mounted (ADR 42/: leaking the host search domain and nameservers into an
+# isolated workload is exactly what isolation avoids). When the engine's
+# userspace egress proxy is running, a per-run resolv.conf naming the hub's DNS
+# forwarder is mounted instead. /etc/hosts still carries the localhost mapping.
+{{- if .ResolverConf }}
 mount {
-  src: "/etc/resolv.conf"
+  src: "{{ .ResolverConf }}"
   dst: "/etc/resolv.conf"
   is_bind: true
   rw: false
   mandatory: false
 }
+{{- end }}
 
 mount {
   src: "/etc/hosts"

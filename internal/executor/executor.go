@@ -90,6 +90,22 @@ type Request struct {
 	Cols  int
 	Rows  int
 
+	// NetnsPath, when set, is the path of the workspace's engine-managed
+	// private network namespace (/run/netns/...). The runner enters it before
+	// exec'ing nsjail and renders `clone_newnet: false`, so the workload stays
+	// in the workspace's own namespace. When empty, nsjail creates a fresh
+	// empty network namespace (never the host's).
+	NetnsPath string
+	// ResolverConf, when set, is a host path bind-mounted read-only at
+	// /etc/resolv.conf so an allow_net workspace can resolve names through the
+	// engine's userspace egress proxy. Empty renders no resolver mount.
+	ResolverConf string
+	// EgressEnv carries fixed KEY=VALUE proxy variables (HTTP_PROXY, ...)
+	// injected into an allow_net workspace so its tools use the engine's
+	// userspace egress proxy. They are service-chosen addresses, never
+	// caller-supplied.
+	EgressEnv []string
+
 	// ProcessKind / ProcessSource tag the sandbox with the identity of the work
 	// it belongs to ("run"/"session"/"exec" and the run/session id). The tag is
 	// inherited by every descendant, so the process inventory can attribute a

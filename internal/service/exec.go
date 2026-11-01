@@ -64,6 +64,12 @@ func (s *Service) Exec(w *model.Workspace, spec ExecSpec) (ExecOutcome, error) {
 		SharedPackagesDir:  sharedHost,
 		PrivatePackagesDir: privateHost,
 	}
+	// Give the exec the workspace's own isolated network. A setup failure is
+	// returned (never a silent fall back to sharing the host network).
+	req, err = s.ApplyNetwork(w, req)
+	if err != nil {
+		return ExecOutcome{}, err
+	}
 	start := time.Now()
 	res, err := s.runner.Run(req)
 	if err != nil {

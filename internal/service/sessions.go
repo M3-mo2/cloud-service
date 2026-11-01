@@ -157,6 +157,12 @@ func (s *Service) StartSession(w *model.Workspace, spec StartSessionSpec) (*mode
 		ProcessKind:   executor.KindSession,
 		ProcessSource: sess.ID,
 	}
+	// Sessions run in the workspace's own isolated network too.
+	req, err = s.ApplyNetwork(w, req)
+	if err != nil {
+		_ = s.store.DeleteSession(w.ID, sess.ID)
+		return nil, err
+	}
 
 	lp, err := s.runner.Start(req)
 	if err != nil {

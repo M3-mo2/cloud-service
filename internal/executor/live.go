@@ -126,7 +126,7 @@ func (r *NsjailRunner) Start(req Request) (LiveProcess, error) {
 		}
 	}
 
-	cmd := exec.Command(bin, "-q", "-L", "3", "--config", cfgPath)
+	cmd := nsjailCommand(context.Background(), bin, cfgPath, req.NetnsPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdin, err := cmd.StdinPipe()

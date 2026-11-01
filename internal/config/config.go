@@ -19,7 +19,55 @@ type Config struct {
 	Caps      CapsConfig     `koanf:"caps"`
 	Packages  PackagesConfig `koanf:"packages"`
 	Sessions  SessionsConfig `koanf:"sessions"`
+	Ports     PortsConfig    `koanf:"ports"`
 	Keys      []KeyConfig    `koanf:"keys"`
+}
+
+// PortsConfig controls published ports: mapping a host port onto a workspace's
+// own private port through the engine's forwarder. It is default-deny, exactly
+// like max_limits.allow_unlimited_runs: both Enabled (server switch) and the
+// workspace's limits.allow_ports must be true to publish.
+//
+// The bind address exists so a future in-host Cloudflare tunnel (phase 2) can
+// point at the forwarder without a refactor; see docs/DECISIONS.md.
+type PortsConfig struct {
+	// Enabled is the server-level switch. False (the default) refuses every
+	// publish with 422 ports_disabled.
+	Enabled bool `koanf:"enabled"`
+	// HostRange is the inclusive host-port range the engine allocates from,
+	// "lo-hi" (default 32000-32999). A host port outside this range is never
+	// allocated, so the forwarder can never bind an operator port.
+	HostRange string `koanf:"host_range"`
+	// BindAddr is the address the forwarder listens on (default 127.0.0.1). A
+	// future local tunnel process binds nothing itself: it connects to this
+	// address.
+	BindAddr string `koanf:"bind_addr"`
+	// MaxPerWorkspace caps published ports per workspace (default 2).
+	MaxPerWorkspace int `koanf:"max_per_workspace"`
+	// MaxPerPrincipal caps published ports across all of a principal's
+	// workspaces (default 5).
+	MaxPerPrincipal int `koanf:"max_per_principal"`
+	// MaxConns caps concurrent connections a single published port accepts
+	// (default 64). A slow client cannot pin a slot forever because of the
+	// idle timeout below.
+	MaxConns int `koanf:"max_conns"`
+	// ConnectTimeoutMS bounds the forwarder's dial into the workspace (default
+	// 1000). An unreachable app therefore fails fast with 502.
+	ConnectTimeoutMS int `koanf:"connect_timeout_ms"`
+	// IdleTimeoutMS bounds how long a connection may sit idle (no bytes in
+	// either direction) before it is closed (default 60000). This is the
+	// half-open/slow-client guard.
+	IdleTimeoutMS int `koanf:"idle_timeout_ms"`
+}
+
+// ConnectTimeout returns the forward-dial timeout.
+func (p PortsConfig) ConnectTimeout() time.Duration {
+	return time.Duration(p.ConnectTimeoutMS) * time.Millisecond
+}
+
+// IdleTimeout returns the per-connection idle timeout.
+func (p PortsConfig) IdleTimeout() time.Duration {
+	return time.Duration(p.IdleTimeoutMS) * time.Millisecond
 }
 
 // SessionsConfig controls first-class server-side terminal sessions.
@@ -154,6 +202,11 @@ type LimitsConfig struct {
 	// an unlimited run is accepted only when both are true; otherwise 422.
 	// Default is false (deny).
 	AllowUnlimitedRuns bool `koanf:"allow_unlimited_runs"`
+	// AllowPorts opts a workspace in to published ports (the per-workspace half
+	// of the two-key switch). It is meaningful only in `limits:`; in
+	// `max_limits:` the server-level switch is ports.enabled. Both must be true
+	// to publish; otherwise 422 ports_disabled. Default false (deny).
+	AllowPorts bool `koanf:"allow_ports"`
 }
 
 // CapsConfig holds hard output/body caps. Sizes are expressed in the unit named
@@ -263,6 +316,16 @@ func Default() Config {
 			Shell:           "/bin/sh",
 			KillGraceSec:    3,
 			StartProbeMS:    250,
+		},
+		Ports: PortsConfig{
+			Enabled:          false,
+			HostRange:        "32000-32999",
+			BindAddr:         "127.0.0.1",
+			MaxPerWorkspace:  2,
+			MaxPerPrincipal:  5,
+			MaxConns:         64,
+			ConnectTimeoutMS: 1000,
+			IdleTimeoutMS:    60000,
 		},
 		Keys: []KeyConfig{},
 	}
@@ -400,6 +463,28 @@ func (c *Config) applyDefaults() {
 	if sess.StartProbeMS < 0 {
 		sess.StartProbeMS = d.Sessions.StartProbeMS
 	}
+	ports := &c.Ports
+	if ports.HostRange == "" {
+		ports.HostRange = d.Ports.HostRange
+	}
+	if ports.BindAddr == "" {
+		ports.BindAddr = d.Ports.BindAddr
+	}
+	if ports.MaxPerWorkspace <= 0 {
+		ports.MaxPerWorkspace = d.Ports.MaxPerWorkspace
+	}
+	if ports.MaxPerPrincipal <= 0 {
+		ports.MaxPerPrincipal = d.Ports.MaxPerPrincipal
+	}
+	if ports.MaxConns <= 0 {
+		ports.MaxConns = d.Ports.MaxConns
+	}
+	if ports.ConnectTimeoutMS <= 0 {
+		ports.ConnectTimeoutMS = d.Ports.ConnectTimeoutMS
+	}
+	if ports.IdleTimeoutMS <= 0 {
+		ports.IdleTimeoutMS = d.Ports.IdleTimeoutMS
+	}
 }
 
 func rawDefaults() []byte {
@@ -421,6 +506,7 @@ limits:
   max_runs: 3
   allow_net: false
   allow_unlimited_runs: false
+  allow_ports: false
 max_limits:
   cpu_cores: 8
   memory_mb: 8192
@@ -453,5 +539,14 @@ sessions:
   shell: "/bin/sh"
   kill_grace_sec: 3
   start_probe_ms: 250
+ports:
+  enabled: false
+  host_range: "32000-32999"
+  bind_addr: "127.0.0.1"
+  max_per_workspace: 2
+  max_per_principal: 5
+  max_conns: 64
+  connect_timeout_ms: 1000
+  idle_timeout_ms: 60000
 `)
 }
