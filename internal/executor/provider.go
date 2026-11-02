@@ -57,31 +57,13 @@ func providerSourceFromPath(target string) bool {
 	return strings.HasPrefix(target, "/usr/local/")
 }
 
-// buildToolsDir materializes the curated /usr/local overlay. When src is a
-// non-empty existing directory it is used as-is (the image's curated tool set);
-// otherwise an empty tree with the standard bin/lib subdirectories is created,
-// which is the safe default: the workspace keeps /usr/bin but sees no host
-// /usr/local material.
-func buildToolsDir(dst, src string) error {
+// buildEmptyToolsDir materializes an empty curated /usr/local overlay with the
+// standard bin/lib subdirectories. It is the safe default when no operator
+// tools directory is configured: the workspace keeps the whole of /usr/bin and
+// sees no host /usr/local material.
+func buildEmptyToolsDir(dst string) error {
 	if err := os.RemoveAll(dst); err != nil {
 		return err
-	}
-	if src != "" {
-		if fi, err := os.Stat(src); err == nil && fi.IsDir() {
-			if err := os.MkdirAll(dst, 0o755); err != nil {
-				return err
-			}
-			entries, err := os.ReadDir(src)
-			if err != nil {
-				return err
-			}
-			for _, e := range entries {
-				if err := os.Symlink(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
 	}
 	for _, sub := range []string{"bin", "lib", "sbin", "share"} {
 		if err := os.MkdirAll(filepath.Join(dst, sub), 0o755); err != nil {
@@ -200,15 +182,27 @@ func filterCABundle(raw []byte) []byte {
 	return out
 }
 
-// materializeProviderOverlays builds the curated /usr/local and /etc/ssl/certs
-// trees under dir. A failure to build /usr/local is returned as an error because
-// its mount would otherwise expose the host directory; a failure to read the
-// host trust store only leaves certsDir empty (the /etc/ssl/certs mount is then
-// omitted, a closed outcome), so it is not an error.
+// materializeProviderOverlays decides the curated /usr/local source and builds
+// the curated /etc/ssl/certs tree under dir. When the operator configured a
+// tools directory it is used directly as the mount source (so a symlink inside
+// it resolves against itself, and the curated set is exactly what the operator
+// chose); otherwise an empty tree is materialized. A failure to build the empty
+// tree is returned as an error because its mount would otherwise expose the host
+// directory; a failure to read the host trust store only leaves certsDir empty
+// (the /etc/ssl/certs mount is then omitted, a closed outcome), so it is not an
+// error.
 func materializeProviderOverlays(dir, toolsSrc string) (toolsDir, certsDir string, err error) {
-	toolsDir = filepath.Join(dir, "usr-local")
-	if err = buildToolsDir(toolsDir, toolsSrc); err != nil {
-		return "", "", fmt.Errorf("build curated /usr/local: %w", err)
+	if toolsSrc != "" {
+		if fi, serr := os.Stat(toolsSrc); serr == nil && fi.IsDir() {
+			toolsDir = toolsSrc
+		} else {
+			return "", "", fmt.Errorf("identity.tools_dir %q is not a directory", toolsSrc)
+		}
+	} else {
+		toolsDir = filepath.Join(dir, "usr-local")
+		if err = buildEmptyToolsDir(toolsDir); err != nil {
+			return "", "", fmt.Errorf("build curated /usr/local: %w", err)
+		}
 	}
 	certsDir = filepath.Join(dir, "ssl-certs")
 	if cerr := buildCertsDir(certsDir, "/etc/ssl/certs"); cerr != nil {
