@@ -1,7 +1,10 @@
 # Decisions
 
-All resolved decisions for sandboxd v0.0.5. Each decision is fixed for this version;
-deferred work is noted explicitly. Do not re-litigate these without a new version.
+All resolved decisions for sandboxd, grouped by the feature version in which
+they landed (v0.0.5, then v0.0.6 … v0.0.15 below). Each decision is fixed for its
+group; deferred work is noted explicitly. Do not re-litigate these without a new
+version. The service version string (`model.Version`) tracks the highest group
+implemented, currently **v0.0.15** (see #17).
 
 1. **Isolation model**: per-run user namespaces + shared `sandbox` UID/GID + per-run cgroups.
    _Rationale_: cheap, portable isolation that works without a per-user UID allocation scheme.
@@ -45,8 +48,14 @@ deferred work is noted explicitly. Do not re-litigate these without a new versio
 16. **Health probes**: `GET /healthz` returns 200 while the process is alive; `GET /readyz` returns
     200 only if the data dir is writable AND the nsjail binary is found, else 503 with a reason.
     _Rationale_: separates liveness from readiness for orchestrators.
-17. **Version**: the service version string is `0.0.5`.
-    _Rationale_: single source of truth matching the API version contract.
+17. **Version**: the service version string is `0.0.15`, the highest feature group
+    resolved in this file.
+    _Rationale_: single source of truth (`model.Version`) for the implementation
+    version. It is deliberately **decoupled from the `/v1` API contract version**
+    (`model.APIVersion`), which changes only on a breaking contract change: the
+    service has gained ten feature groups (v0.0.6 … v0.0.15) without one, so
+    tying the two numbers together would force a spurious `/v2`. The initial
+    `0.0.5` string predated those groups and was stale; it now tracks them.
 18. **cgroup v2 is a hard requirement; `--cgroupns=host` is mandatory.** nsjail applies memory,
     pids and cpu ceilings via cgroup v2, which requires write access to the host/root cgroup
     hierarchy. A container started without `--cgroupns=host` cannot apply them, so nsjail aborts

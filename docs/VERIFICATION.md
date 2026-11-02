@@ -1,14 +1,17 @@
 # Verification
 
-Results for sandboxd v0.0.5 against the acceptance criteria in the spec.
+Results for sandboxd v0.0.15 against the acceptance criteria in the spec.
 
 Environment:
 
-- Host: Ubuntu 26.04 x86_64, kernel `7.1.8-zabbly+`, orchestrator unprivileged
-  (`CapEff=0`, `kernel.apparmor_restrict_unprivileged_userns=1`).
-- nsjail: real binary, `sha256 91e2049e…b680c6` (`/usr/local/bin/nsjail`).
-- Go: `go1.26.8 linux/amd64`.
-- Runtime container: `ubuntu:24.04`, started `--privileged --cgroupns=host`.
+- Host: Ubuntu 24.04.4 LTS, kernel `7.1.8-zabbly+`, x86_64. The orchestrator user
+  is unprivileged (`uid=2023`, `CapEff=0000000000000000`) for the non-root suites.
+- nsjail: real binary at `/usr/local/bin/nsjail`
+  (`sha256 9b9fb1df…c700f2`).
+- slirp4netns 1.2.1, cloudflared 2026.10.7 (pinned).
+- Go: `go1.23.4 linux/amd64`.
+- Runtime container: `ubuntu:24.04`, started `--privileged --cgroupns=host`
+  (used for the container half of the transcript).
 
 The transcript below was produced against **real nsjail** (not the test stub)
 inside a `docker run --privileged --cgroupns=host` container. `--cgroupns=host`
@@ -21,15 +24,29 @@ reports `"cgroups":true`.
 > is now a real test (it exits non-zero on any mismatch) and the results below
 > are copied from a run where every assertion passed.
 
-> Reproducibility note (audit environment). The privileged-container half of
-> this document was produced on the host described above. The audit environment
-> in which the new sections were added runs as an **unprivileged** user
-> (`uid=2023`, `CapEff=0000000000000000`) with **no `nsjail` binary** and no
-> `docker`, so the real-nsjail acceptance transcript and the end-to-end package
-> install could **not** be re-run there. Those parts are marked
-> **[requires privileged container]**. Everything that *can* run unprivileged —
-> `gofmt`, `go build`, `go test ./...`, the handler-level assertions and the
-> sandbox-config render tests — was re-run and its output is copied below.
+> Reproducibility note (current host). This document was assembled across two
+> environments. The container transcript (the `acceptance.sh` run and the
+> end-to-end package install) was produced in `ubuntu:24.04` via
+> `docker run --privileged --cgroupns=host`. On the current host — Ubuntu 24.04.4,
+> kernel `7.1.8-zabbly+` — the orchestrator is still unprivileged
+> (`uid=2023`, `CapEff=0000000000000000`) and `docker` is **not** installed, so
+> that container-only transcript could not be re-run here and is marked
+> **[requires privileged container]**. What is different now: the **real nsjail
+> binary is installed** at `/usr/local/bin/nsjail`, and the nsjail-dependent
+> **host** suites run under `sudo -n` and pass — they were re-run for this
+> revision:
+>
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" HOME=/root go test -tags integration -count=1 ./internal/executor/` → `ok 4.664s`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/process-stop-check.sh` → `25 passed / 0 failed`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/session-nsjail-check.sh` → `18 passed / 0 failed`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh` → `27 passed / 0 failed / 0 skipped`
+>
+> The unprivileged suites (`gofmt`, `go build`, `go vet`, `go test ./...`, the
+> handler-level assertions and the sandbox-config render tests) were re-run and
+> their output is copied below. The container-only parts (the `acceptance.sh`
+> transcript and the end-to-end package install) still require a privileged
+> container because `docker` is absent here; they are the only remaining
+> **[requires privileged container]** items.
 
 ## 1. Build and tests
 
@@ -55,7 +72,7 @@ the host is the privileged environment, so no container is needed:
 ```
 $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" HOME=/root \
     go test -tags integration -count=1 ./internal/executor/
-ok  	sandboxd/internal/executor	4.660s
+ok  	sandboxd/internal/executor	4.664s
 ```
 
 The four `integration` tests are `TestIntegrationPythonHello`,
@@ -159,7 +176,7 @@ ok   readyz.nsjail                True
 ### 1. healthz
 ok   healthz.status               ok
 ### 2. meta
-ok   meta.version                 0.0.5
+ok   meta.version                 0.0.15
 ### 3. create workspace
 workspace id: ws_01M6BNEZGVE2AFRADVKB01FFC2
 ### 4. mkdir /src
@@ -1341,7 +1358,7 @@ passed=<N> failed=0
 - Multi-node storage is deferred; storage is local filesystem JSON.
 - DB-backed/dynamic authentication is deferred; keys are static in the config
   (bearer auth itself is exercised by `TestAuth*`).
-- Per-UID-per-workspace isolation is deferred to v0.1 (v0.0.5 uses a shared
+- Per-UID-per-workspace isolation is deferred to v0.1 (v0.0.15 uses a shared
   `sandbox` UID/GID with per-run user namespaces and cgroups).
 - `rlimit_fsize` bounds a single file, and `disk_mb` is enforced on the file API
   path and via a `du` recheck on workspace load; it is not enforced by the

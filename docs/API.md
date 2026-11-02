@@ -1,7 +1,7 @@
 # API guide
 
 Human-friendly, self-sufficient reference for the sandboxd HTTP/JSON API
-(v0.0.5). The machine-readable contract is
+(v0.0.15). The machine-readable contract is
 [api/openapi.yaml](../api/openapi.yaml); where the two disagree, **this document
 follows the implemented behaviour** and the disagreement is recorded in
 [Known discrepancies](#known-discrepancies) at the end.
@@ -183,7 +183,7 @@ default per-workspace limits.
 
   ```json
   {
-    "version": "0.0.5",
+    "version": "0.0.15",
     "api_version": "v1",
     "runtimes": ["python3"],
     "interpreters": ["bash", "node", "perl", "python3"],
@@ -2123,7 +2123,7 @@ out-of-band changes cannot drift the quota.
   empty (no egress). With `allow_net:true` it is connected to the public internet
   through chained slirp4netns over UNIX sockets — the host network namespace is
   never shared, and the host LAN is blackholed. There is no host allowlist in
-  v0.0.5 (see [Quick tunnels and egress](#quick-tunnels-and-egress)).
+  v0.0.15 (see [Quick tunnels and egress](#quick-tunnels-and-egress)).
 - **Syscalls:** a default-allow seccomp policy KILLs a denylist of dangerous
   syscalls (`mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`,
   module loading, …). `cgroup v2` ceilings require the container to run with
@@ -2153,7 +2153,7 @@ curl -s $BASE/readyz
 # {"cgroups":true,"data_dir":true,"nsjail":true,"status":"ready"}
 
 curl -s -H "$AUTH" $BASE/v1/meta
-# {"version":"0.0.5","api_version":"v1", ... }
+# {"version":"0.0.15","api_version":"v1", ... }
 
 WS=$(curl -s -H "$AUTH" -H "$JSON" \
   -d '{"name":"demo","limits":{"memory_mb":256}}' \
@@ -2234,73 +2234,110 @@ Places where the implemented behaviour differs from `api/openapi.yaml` (and in
 some cases from `docs/SPEC.md`). The service is the source of truth; the spec
 should be updated.
 
+Each item was re-checked against the tree for this revision; items marked
+**Verified** were confirmed by the grep/handler named in the item. Items 1–18
+were written before the egress/tunnel work; items 19–21 cover the new
+`/v1/workspaces/{id}/tunnels…` routes.
+
 1. **Path-parameter name.** The router uses `{workspaceID}` and `{runID}`;
    `openapi.yaml` names them `workspaceId` and `runId`. No client-visible effect
-   (the value is positional), but the spec is inaccurate.
-2. **`timeout` is still defined but never emitted.** It is a constant in
-   `internal/model/errors.go` and appears in the OpenAPI `ErrorCode` enum, but no
-   handler produces it. (`conflict` is now emitted on run purge; see the run
-   endpoints.)
-3. **`insufficient_storage` (507) is emitted but is not a Go constant.** The
-   quota mapping in `internal/api/errors.go` uses the string literal
-   `"insufficient_storage"`; the OpenAPI enum lists it, `errors.go` does not
-   define it.
-4. **405 is not `method_not_allowed`.** `MethodNotAllowed` returns HTTP 405 with
-   `code:"validation"`. OpenAPI has no 405 response (and no `method_not_allowed`
-   code).
-5. **Unknown routes return a documented-shaped 404.** The router's `NotFound`
-   returns `404 not_found` "route not found"; `openapi.yaml` does not describe the
-   catch-all.
-6. **Resolved — reading a file can now return 413.** `GET .../files/content`
-   still returns a capped prefix with `truncated:true` for the default read, but
-   a request `limit` above `caps.file_read_mb` is rejected with
-   `413 payload_too_large`, matching `openapi.yaml`.
-7. **Resolved — `sha256` is over exactly the returned bytes.** The `meta=true`
-   wrapper hashes the bytes in the response (never a larger slice), and reports
-   `range`/`total_size`/`whole_file` so a client can tell a whole-file hash from
-   a partial one from the response alone.
-8. **Resolved — `PUT /files/content` requires `content`.** `putFileRequest.Content`
-   is a pointer, so an omitted field is `400 validation`; an explicit `""` writes
-   a 0-byte file.
-9. **Resolved — wrong-node-type operations return 422, not 500/404.** Listing a
-   file, reading a directory as a file, and writing over a directory now return
-   `422 not_directory` (a new `not_directory` code). The path exists, so it is
-   never `404`, and it is never `500`.
-10. **Resolved — async `cwd` is now accepted.** `POST /runs` accepts `cwd` for
-    both `kind=file` and `kind=command`; it is validated to exist and be a
-    directory (`422` otherwise) and is recorded on the run. Previously a `cwd`
-    field on `POST /runs` was an unknown field → 400.
-11. **`failed` runs have `exit_code:null`.** No exit code is recorded when the
-    executor errors; `openapi.yaml` permits `exit_code` null but the semantic
-    (null on failure) is undocumented.
-12. **Path parameters are named `{workspaceID}`/`{runID}`** in the router while
-    `openapi.yaml` uses `workspaceId`/`runId`; no client-visible effect (the value
-    is positional). Covered by discrepancy 1 above; listed here for the new
-    endpoints too.
-13. **`/readyz` shape is richer than SPEC.md.** SPEC.md §2.1 lists
-    `{"status","nsjail","data_dir"}`; the implementation adds `cgroups` and uses
-    `status` values `ready`/`not_ready`. `openapi.yaml` matches the
-    implementation.
-14. **`LogChunk.truncated` is always false.** The field is in the schema but is
-    never set to true; log truncation is reported on the run's `logs.truncated`.
+   (the value is positional), but the spec is inaccurate. **Verified** — see also
+   discrepancies 12, 16 and 19.
+2. **Verified — `timeout` is still defined but never emitted.** It is a constant
+   in `internal/model/errors.go` (`CodeTimeout`) and appears in the OpenAPI
+   `ErrorCode` enum, but no handler produces it: `grep -rn CodeTimeout internal/`
+   matches only its definition. (`conflict` is now emitted on run purge; see the
+   run endpoints.)
+3. **Verified — `insufficient_storage` (507) is emitted but is not a Go
+   constant.** The quota mapping in `internal/api/errors.go:59` uses the string
+   literal `"insufficient_storage"`; the OpenAPI enum lists it, `errors.go` does
+   not define it (`grep -rn insufficient_storage internal/` matches only that
+   literal).
+4. **Verified — 405 is not `method_not_allowed`.** `MethodNotAllowed`
+   (`internal/api/router.go:120`) returns HTTP 405 with `code:"validation"`.
+   OpenAPI has no 405 response and no `method_not_allowed` code (`grep -n 405
+   api/openapi.yaml` matches nothing).
+5. **Verified — unknown routes return a documented-shaped 404.** The router's
+   `NotFound` (`internal/api/router.go:117`) returns `404 not_found` "route not
+   found"; `openapi.yaml` does not describe the catch-all.
+6. **Resolved — reading a file can now return 413.** **Verified** —
+   `internal/service/files.go:67` rejects a request `limit` above
+   `caps.file_read_mb` with `413 payload_too_large`; the default read still
+   returns a capped prefix with `truncated:true`.
+7. **Resolved — `sha256` is over exactly the returned bytes.** **Verified** —
+   `internal/workspace/fs.go:467` hashes `buf` (the returned slice) and
+   `internal/api/files.go:176-178` reports `range`/`total_size`/`whole_file`
+   alongside it.
+8. **Resolved — `PUT /files/content` requires `content`.** **Verified** —
+   `putFileRequest.Content` is a `*string` (`internal/api/files.go:276`), so an
+   omitted field is `400 validation`; an explicit `""` writes a 0-byte file.
+9. **Resolved — wrong-node-type operations return 422, not 500/404.**
+   **Verified** — `internal/api/errors.go:84-89` maps both the is-a-directory
+   and not-a-directory sentinels to `422 not_directory`, a code defined in
+   `internal/model/errors.go:16`.
+10. **Resolved — async `cwd` is now accepted.** **Verified** —
+    `internal/service/runs.go:93` (`resolveRunCwd`) validates `cwd` for both
+    kinds and rejects a missing/escaping/non-directory path with `422`
+    (`runs.go:110`).
+11. **Verified — `failed` runs have `exit_code:null`.** In
+    `internal/service/runs.go:321-322` an executor error sets `RunFailed` and
+    leaves `EndedAt`/`ExitCode` unset; `openapi.yaml` permits `exit_code` null
+    but the semantic (null on failure) is undocumented.
+12. **Path parameters are named `{workspaceID}`, `{runID}`, `{sessionID}`,
+    `{processID}` and `{tunnelID}`** in the router while `openapi.yaml` uses the
+    lower-case `workspaceId`/`runId`/`sessionId`/`processId`/`tunnelId`; no
+    client-visible effect (the value is positional). Covered by discrepancy 1
+    above; listed here for the new endpoints too.
+13. **`/readyz` shape is richer than SPEC.md.** **Verified** — SPEC.md §2.1
+    (`docs/SPEC.md:56`) lists `{"status","nsjail","cgroups","data_dir"}`, while
+    the implementation (`internal/api/router.go:149-169`) adds `network` and
+    `tunnels` sub-objects (each with `enabled`/`ready` and an optional `reason`).
+    `status` is `ready`/`not_ready`. `openapi.yaml` matches the implementation.
+14. **Verified — `LogChunk.truncated` is always false.** `internal/service/runs.go:637`
+    returns `Truncated: false` unconditionally; the field is in the schema but
+    never set true; run-log truncation is reported on the run's
+    `logs.truncated` (`runLogsJSON.Truncated`).
 15. **Session `DELETE` returns 200, not 204.** Unlike `DELETE .../runs/{id}`
-    (204), `DELETE .../sessions/{id}` returns 200 with a
-    `{session, changed}` body so the idempotency signal and the terminal state
-    are observable. It also retains the terminal record (the run delete removes
-    it), so a repeat DELETE reports `changed:false` rather than 404.
+    (204), `DELETE .../sessions/{id}` returns 200 with a `{session, changed}`
+    body (`internal/api/sessions.go:311`) so the idempotency signal and the
+    terminal state are observable. It retains the terminal record, so a repeat
+    DELETE reports `changed:false` rather than 404. **Verified — and now
+    documented**: `openapi.yaml` describes the 200 (`SessionAction` with
+    `changed`), so this is no longer a spec gap, only a divergence from the
+    run-delete convention.
 16. **Session path parameter is `sessionId` in OpenAPI, `sessionID` in the
-    router** (same class as discrepancy 1). The value is positional, so there
-    is no client-visible effect.
+    router; process is `processId`/`processID` like-wise** (same class as
+    discrepancy 1). The value is positional, so there is no client-visible
+    effect.
 17. **`GET .../sessions/{id}/output` returns 409 `session_ended` after DELETE.**
-    For a session ended by DELETE the output is deliberately a tombstone; a
-    session that ended on its own keeps its output readable. This is the one
-    place the session output differs from the run log (which stays readable).
-18. **Resolved — a bad `cwd` is 422, not 503 (defect N-1).** A run `cwd` (or any
-    run target) that did not resolve produced `503 "sandbox unavailable"`,
-    falsely implying the isolation layer was broken. nsjail's diagnostic for a
-    failed `chdir` is now classified as `ErrInvalidCwd` → `422`. A genuine
-    sandbox setup failure is still `503`. See
-    [VERIFICATION.md §9d](VERIFICATION.md).
+    **Verified** — `internal/service/sessions.go:617-619` returns the tombstone
+    error when status is `killed` with reason `user_closed`; a session that ended
+    on its own keeps its output readable. This is the one place the session
+    output differs from the run log (which stays readable).
+18. **Resolved — a bad `cwd` is 422, not 503 (defect N-1).** **Verified** —
+    `executor.ErrInvalidCwd` is mapped to `422 unprocessable` in
+    `internal/api/errors.go:78-80`. A genuine sandbox setup failure is still
+    `503`. See [VERIFICATION.md §9d](VERIFICATION.md).
+19. **Tunnel path parameter is `tunnelId` in OpenAPI, `tunnelID` in the router**
+    (`internal/api/router.go:74-75`; `openapi.yaml:1108`). Same class as
+    discrepancies 1, 12 and 16 — the value is positional, so there is no
+    client-visible effect. **Verified.**
+20. **`POST .../tunnels` declares its `504` inline, not through a shared
+    response ref.** The endpoint lists the 504 with an inline `ErrorEnvelope`
+    (`openapi.yaml:406-410`) rather than a `$ref`, while its other 4xx/5xx use
+    the shared refs. The `tunnel_url_unavailable` code is in the `ErrorCode`
+    enum (`openapi.yaml:1192`). Worth noting because this 504 is the
+    *rate-limit* path (`429` from Cloudflare, surfaced honestly), not a server
+    fault. **Verified** against `internal/model/errors.go:58`
+    (`CodeTunnelURLUnavailable`) and the `docs/API.md` endpoint section.
+21. **`POST .../tunnels` maps a not-opted-in / server-switch-off refusal to `422
+    tunnels_disabled` (not `403`), but enumerates it only in the `ErrorCode`
+    enum, not next to the route.** The route's 422 uses the generic
+    `Unprocessable` response ref (`openapi.yaml:404`), so the specific
+    `tunnels_disabled`/`too_many_tunnels` codes are not named on the operation
+    even though they are in the enum. **Verified** against
+    `internal/service/tunnels.go:34-45` (`TunnelsAllowed`) and
+    `internal/service/tunnels.go:82-84`.
 
 ## Notes
 

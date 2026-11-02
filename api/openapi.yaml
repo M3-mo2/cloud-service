@@ -1,9 +1,9 @@
 openapi: 3.1.0
 info:
   title: sandboxd API
-  version: 0.0.5
+  version: 0.0.15
   description: |
-    Secure per-user code execution backend. All `/v1` endpoints require a
+    Secure per-principal code execution backend. All `/v1` endpoints require a
     static bearer API key. All timestamps are RFC3339 UTC.
 servers:
   - url: http://127.0.0.1:8080
@@ -1235,7 +1235,7 @@ components:
       type: object
       required: [version, api_version, runtimes, limits_defaults]
       properties:
-        version: { type: string, examples: ["0.0.5"] }
+        version: { type: string, examples: ["0.0.15"] }
         api_version: { type: string, examples: [v1] }
         runtimes:
           type: array

@@ -5,7 +5,7 @@
 > sandbox. Diagrams are [Mermaid](https://mermaid.js.org/); they render on
 > GitHub/GitLab and in most Markdown viewers.
 
-- Version: **0.0.5** (pre-alpha)
+- Version: **0.0.15** (pre-alpha)
 - Language: Go 1.23+
 - Isolation: [`nsjail`](https://github.com/google/nsjail) (Linux namespaces,
   cgroups v2, seccomp, rlimits)
@@ -71,7 +71,7 @@ services** that call it on a user's behalf — not the users themselves.
 
 See [DECISIONS.md](DECISIONS.md) #54 for the decision and its consequences.
 
-### What it deliberately is *not* (v0.0.5)
+### What it deliberately is *not* (v0.0.15)
 
 Pre-alpha scope. It is a single-node, static-key service. Not yet: a hardened
 public-internet multi-tenant platform, a distributed scheduler, or a
@@ -464,7 +464,8 @@ fly (`configs/nsjail_python.cfg.tmpl`). The rendered sandbox has:
 
 | Layer | Setting | Effect | Applied when |
 |-------|---------|--------|--------------|
-| Namespaces | `clone_newpid/ns/ipc/uts/user` always; network is always private (own ns) | Isolated PID, mount, IPC, UTS, user, network | always |
+| Namespaces | `clone_newpid/ns/ipc/uts/user` always; network is always the workspace's **own** namespace (never the host's) | Isolated PID, mount, IPC, UTS, user, network | always |
+| network ns (egress) | `allow_net:false` → private **empty** ns (no egress). `allow_net:true` → own ns reaching the internet only through **chained slirp4netns** over UNIX sockets; the relay blackholes every operator-private range (see §5.6) | Egress without host-network sharing | always; egress fabric itself needs `network.enabled` |
 | mount ns | host `/usr`,`/lib`,`/lib64`,`/bin`,`/sbin` RO; workspace RW at `/workspace`; private `/tmp` | Child sees only the runtime + its own files | always |
 | `/proc` | `mount_proc: false` | Host process table not visible | always |
 | cgroup v2 | `cgroup_mem_max` (bytes), `cgroup_pids_max`, `cgroup_cpu_ms_per_sec` | Memory, process-count, CPU throttling | **only with `--cgroupns=host`** |
@@ -986,11 +987,11 @@ set `NSJAIL=/usr/local/bin/nsjail` and it will verify the binary is real.
 
 Deferred to v0.1 (documented, not bugs):
 
-- **SSE log streaming** — v0.0.5 polls logs with `offset`/`limit`.
+- **SSE log streaming** — v0.0.15 polls logs with `offset`/`limit`.
 - **Multi-node storage / sharding** — storage is a local filesystem.
 - **Dynamic/DB authentication** — keys are static in config (bearer auth itself
   is exercised by `TestAuth*`).
-- **Per-UID-per-workspace isolation** — v0.0.5 uses a shared `sandbox` UID/GID
+- **Per-UID-per-workspace isolation** — v0.0.15 uses a shared `sandbox` UID/GID
   with per-run user namespaces + cgroups.
 - **Kernel-enforced per-run disk quota** — disk is accounted on the file API
   path and rechecked with `du`; the sandbox process is bounded by `rlimit_fsize`
