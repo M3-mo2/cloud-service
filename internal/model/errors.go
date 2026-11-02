@@ -7,18 +7,18 @@ import (
 
 // Error codes used in the JSON error envelope and OpenAPI spec.
 const (
-	CodeUnauthorized    = "unauthorized"
-	CodeForbidden       = "forbidden"
-	CodeNotFound        = "not_found"
-	CodeConflict        = "conflict"
-	CodeValidation      = "validation"
-	CodeUnprocessable   = "unprocessable"
+	CodeUnauthorized  = "unauthorized"
+	CodeForbidden     = "forbidden"
+	CodeNotFound      = "not_found"
+	CodeConflict      = "conflict"
+	CodeValidation    = "validation"
+	CodeUnprocessable = "unprocessable"
 	// CodeUnknownProfile is returned (HTTP 422) when a workspace create names a
 	// profile that is not configured. It is distinct from a general
 	// validation/unprocessable error: the field parsed and the name is
 	// well-formed, but it is not one of the offered profiles. The message and
 	// details name the request's value so a client can correct it.
-	CodeUnknownProfile = "unknown_profile"
+	CodeUnknownProfile  = "unknown_profile"
 	CodeNotDirectory    = "not_directory"
 	CodePayloadTooLarge = "payload_too_large"
 	CodeTimeout         = "timeout"
@@ -36,6 +36,13 @@ const (
 	// per-workspace policy limit (409), distinct from the workspace-level
 	// suspension refusal.
 	CodeTooManySessions = "too_many_sessions"
+
+	// CodeSessionNeedsInterpreter is returned (HTTP 422) when a terminal session
+	// is requested for a workspace whose profile does not provide python3. The
+	// PTY relay that backs a session is a python3 program, so a session on a
+	// shell-only profile (e.g. "minimal") is refused with this stable,
+	// actionable reason rather than a generic command-not-found.
+	CodeSessionNeedsInterpreter = "session_needs_interpreter"
 
 	// CodeSessionEnded is returned when input, a signal or a resize is sent to
 	// a session that has already reached a terminal state but whose record is

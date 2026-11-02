@@ -215,6 +215,11 @@ func (r *NsjailRunner) resolveProfileCommand(pf *profile.Profile, name string) (
 		if !tree.Commands[name] {
 			return "", ErrCommandNotFound
 		}
+		// The command exists in the materialized tree at /usr/bin/<name>, which
+		// is what the jail sees. An alias such as `python` (-> python3) has no
+		// host executable, so resolving on the host PATH would fail; the jail
+		// path is the correct, profile-scoped answer.
+		return binJailPath + "/" + name, nil
 	}
 	return resolveCommand(name)
 }

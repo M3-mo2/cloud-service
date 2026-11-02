@@ -91,6 +91,8 @@ commands:
   - od
   - xxd
   - which
+  - tty
+  - stty
   - tar
   - gzip
   - gunzip

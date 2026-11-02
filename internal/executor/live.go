@@ -379,12 +379,18 @@ func (r *NsjailRunner) renderSessionConfig(req Request, runTmp string) (string, 
 		if err != nil {
 			return "", err
 		}
-		// nsjail's exec_bin.path goes straight to execve (no PATH lookup), so
-		// resolve the interpreter on the host now. The host /usr is mounted at
-		// the same path inside the jail (curated, which keeps python3).
-		py, err := resolveCommand("python3")
+		// The PTY relay is a python3 program, so the workspace's PROFILE must
+		// provide python3. Resolve it profile-aware (the jail path), and fail
+		// with an actionable diagnostic when the profile does not offer it --
+		// a session on a shell-only profile is a real, explained limitation,
+		// never a mysterious nsjail execve error.
+		pf, perr := r.profileFor(req.Workspace)
+		if perr != nil {
+			return "", perr
+		}
+		py, err := r.resolveProfileCommand(pf, "python3")
 		if err != nil {
-			return "", fmt.Errorf("pty helper needs python3: %w", err)
+			return "", fmt.Errorf("%w: profile %q does not provide python3", ErrSessionNeedsInterpreter, pf.Name)
 		}
 		// The relay source is passed as the argument to `-c`; python executes
 		// it without ever reading a file named anything, so there is no relay

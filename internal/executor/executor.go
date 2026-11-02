@@ -30,6 +30,13 @@ var ErrInvalidCwd = errors.New("cwd escapes workspace root")
 // loud failure, never a silent leak.
 var ErrMaskUnavailable = errors.New("host-identity masking unavailable")
 
+// ErrSessionNeedsInterpreter is returned when a terminal session is requested
+// for a workspace whose profile does not provide python3. The PTY relay is a
+// python3 program, so a session on a shell-only profile is a real limitation;
+// it is reported with this stable, actionable reason rather than a generic
+// command-not-found.
+var ErrSessionNeedsInterpreter = errors.New("session requires a profile that provides python3")
+
 // SandboxError reports that nsjail could not set up or launch the sandbox.
 // Diagnostic carries the relevant nsjail log lines.
 type SandboxError struct {

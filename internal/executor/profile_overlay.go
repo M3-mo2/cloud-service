@@ -92,8 +92,17 @@ func materializeProfile(dir, sourceRoot string, p *profile.Profile) (profileOver
 	out := profileOverlay{ExtraMounts: map[string]string{}, Commands: map[string]bool{}}
 	usr := filepath.Join(dir, "usr")
 	binDst := filepath.Join(usr, "bin")
+	// Create the conventional subtrees up front: the template binds /sbin,
+	// /lib and /lib64 to subtrees of this tree, and a mandatory bind of a
+	// missing source directory aborts the run. An empty directory is the
+	// correct state for a profile that names no such tool.
 	if err := os.MkdirAll(binDst, 0o755); err != nil {
 		return out, err
+	}
+	for _, sub := range []string{"sbin", "lib", "lib64", "share"} {
+		if err := os.MkdirAll(filepath.Join(usr, sub), 0o755); err != nil {
+			return out, err
+		}
 	}
 
 	names := map[string]bool{}
@@ -214,8 +223,14 @@ func materializeCommand(sourceRoot, dstBin, name string) error {
 }
 
 // copyEntry reproduces a file, directory or symlink tree at dst, applying the
-// engine/platform filter to names and contents.
+// engine/platform filter to names and contents. It is IDEMPOTENT: base library
+// dirs and profile paths can overlap (e.g. /usr/lib/x86_64-linux-gnu/perl is
+// both a base-library subtree and an explicitly-attached perl tree), so an
+// existing destination entry is replaced rather than erroring on "file exists".
 func copyEntry(src, dst string, fi os.FileInfo) error {
+	if containsDeniedString(filepath.Base(src)) {
+		return nil
+	}
 	switch {
 	case fi.Mode()&os.ModeSymlink != 0:
 		target, err := os.Readlink(src)
@@ -228,19 +243,28 @@ func copyEntry(src, dst string, fi os.FileInfo) error {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return err
 		}
+		_ = os.RemoveAll(dst)
 		return os.Symlink(target, dst)
 	case fi.IsDir():
-		if containsDeniedString(filepath.Base(src)) {
-			return nil
-		}
 		if err := os.MkdirAll(dst, 0o755); err != nil {
 			return err
 		}
-		return buildToolTree(src, dst)
-	default:
-		if containsDeniedString(filepath.Base(src)) {
-			return nil
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return err
 		}
+		for _, e := range entries {
+			sp := filepath.Join(src, e.Name())
+			sfi, lerr := os.Lstat(sp)
+			if lerr != nil {
+				continue
+			}
+			if err := copyEntry(sp, filepath.Join(dst, e.Name()), sfi); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
 		if fi.Mode().IsRegular() && fi.Size() <= maxToolContentScan {
 			if b, rerr := os.ReadFile(src); rerr == nil && containsDeniedBytes(b) {
 				return nil
@@ -249,6 +273,7 @@ func copyEntry(src, dst string, fi os.FileInfo) error {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return err
 		}
+		_ = os.RemoveAll(dst)
 		return cloneOrCopyFile(src, dst, fi.Mode().Perm())
 	}
 }

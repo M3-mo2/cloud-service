@@ -48,14 +48,14 @@ const (
 	// from the curated profile tree; /bin, /sbin, /lib and /lib64 are bound to
 	// subtrees of it so a tenant sees one consistent, allowlisted toolchain at
 	// every conventional path.
-	usrJailPath      = "/usr"
-	binJailPath      = "/bin"
-	sbinJailPath     = "/sbin"
-	libJailPath      = "/lib"
-	lib64JailPath    = "/lib64"
-	certsJailPath    = "/etc/ssl/certs"
-	passwdJailPath   = "/etc/passwd"
-	groupJailPath    = "/etc/group"
+	usrJailPath    = "/usr"
+	binJailPath    = "/bin"
+	sbinJailPath   = "/sbin"
+	libJailPath    = "/lib"
+	lib64JailPath  = "/lib64"
+	certsJailPath  = "/etc/ssl/certs"
+	passwdJailPath = "/etc/passwd"
+	groupJailPath  = "/etc/group"
 )
 
 // maskEnvKeys are the environment variables the shim reads. They carry the

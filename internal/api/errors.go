@@ -78,6 +78,9 @@ func mapError(err error) *model.Error {
 		}
 		return model.Wrap(503, model.CodeUnavailable, "sandbox unavailable: nsjail could not set up or launch the sandbox", details)
 	}
+	if errors.Is(err, executor.ErrSessionNeedsInterpreter) {
+		return model.New(422, model.CodeSessionNeedsInterpreter, err.Error())
+	}
 	if errors.Is(err, executor.ErrCommandNotFound) {
 		return model.New(422, model.CodeUnprocessable, "command not found")
 	}
