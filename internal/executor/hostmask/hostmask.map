@@ -1,0 +1,19 @@
+GLIBC_2.2.5 {
+  global:
+    open; open64; access; readlink; readdir; readdir64; readdir_r;
+    __xstat; __lxstat; canonicalize_file_name;
+};
+GLIBC_2.3 {
+  global: realpath;
+};
+GLIBC_2.4 {
+  global:
+    openat; openat64; faccessat; eaccess; __fxstatat;
+};
+GLIBC_2.28 {
+  global: statx;
+};
+GLIBC_2.33 {
+  global:
+    stat; stat64; lstat; lstat64; fstat; fstat64; fstatat; fstatat64;
+};

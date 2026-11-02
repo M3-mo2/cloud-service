@@ -16,8 +16,14 @@ all: fmt vet shim build test
 # `strings` the shim, so it must carry no engine name, no compiler-version
 # .comment line and no stale source path. `objcopy -R .comment` is required
 # because the `.comment` section survives `strip` (measured).
+#
+# The version script (hostmask.map) is required: glibc VERSIONS its symbols, so
+# the filesystem-hiding interposers must be exported under the version names
+# their callers reference (stat64@GLIBC_2.33 etc.). Without it an unversioned
+# definition does not satisfy a versioned reference and the hiding silently
+# misses python's os.stat and bash's test -f (measured).
 shim:
-	$(CC) -shared -fPIC -O2 -Wall -s -fno-ident -o internal/executor/hostmask.so internal/executor/hostmask/hostmask.c -ldl
+	$(CC) -shared -fPIC -O2 -Wall -s -fno-ident -Wl,-soname,rt.so -Wl,--version-script=internal/executor/hostmask/hostmask.map -o internal/executor/hostmask.so internal/executor/hostmask/hostmask.c -ldl
 	objcopy -R .comment internal/executor/hostmask.so
 
 build: shim

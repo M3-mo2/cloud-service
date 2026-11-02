@@ -19,6 +19,14 @@ import (
 // `env -i`); the file and the shim are bind-mounted read-only so a tenant cannot
 // replace them.
 //
+// The same shim ALSO hides the masking mechanism from the tenant: it answers
+// ENOENT (and drops the directory entry) for /etc/ld.so.preload, its own in-jail
+// path and the engine's legacy directories, so browsing `ls /`, `cat
+// /etc/ld.so.preload` or `strings`ing the shim reveals nothing. The hiding is
+// scoped to already-exec'd processes, so the dynamic loader still reads the
+// preload list before any shim is mapped and a real exec stays masked (asserted
+// by scripts/identity-check.sh). See internal/executor/hostmask/hostmask.c.
+//
 // Masking is ON by default (config.Identity.Enabled). When it is on but the
 // shim cannot be materialized, the runner reports the masking capability as NOT
 // READY (see MaskStatus) so /readyz fails loudly rather than leaking silently.
