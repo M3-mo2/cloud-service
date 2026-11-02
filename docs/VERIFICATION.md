@@ -1769,11 +1769,12 @@ passed=<N> failed=0
 - `rlimit_fsize` bounds a single file, and `disk_mb` is enforced on the file API
   path and via a `du` recheck on workspace load; it is not enforced by the
   kernel against the sandboxed process tree.
-- `node` (V8) reserves a large virtual address space at startup and hits
-  `rlimit_as` (`memory_mb`) on this image, exiting `133` with a V8 OOM — with or
-  without host-identity masking. Raising `memory_mb` or running V8 with
-  `--max-old-space-size` within the limit is the operator's lever; it is a
-  resource-model property, unrelated to masking.
+- A managed runtime (e.g. `node`/V8) reserves a large **virtual** address space
+  at startup (measured: ~1.1 GiB for V8's CodeRange + heap reservations). The
+  engine therefore sets `rlimit_as = memory_mb + 1024` (floored at 2048 MB),
+  not `memory_mb`; the physical ceiling is `cgroup_mem_max = memory_mb` (ADR 82).
+  `rlimit_as` is a coarse virtual backstop; `memory_mb` remains the budget a
+  tenant's committed memory is charged against.
 - `RLIMIT_NPROC` does not bind for the root-run sandbox; the process ceiling is
   therefore provided by `cgroup_pids_max`, which is why `--cgroupns=host` is a
   hard requirement.
