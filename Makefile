@@ -2,7 +2,7 @@ BINARY := sandboxd
 PKG := ./...
 GO ?= go
 
-.PHONY: all build test test-race lint fmt vet run clean tidy integration acceptance session-check process-check
+.PHONY: all build test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check docs-check
 
 all: fmt vet build test
 
@@ -57,6 +57,24 @@ session-check:
 # after a forced daemon death + restart.
 process-check:
 	sudo -E bash scripts/process-stop-check.sh
+
+# Per-workspace egress and quick-tunnel acceptance against REAL nsjail,
+# slirp4netns and cloudflared on the host (needs root, no container). It asserts
+# DNS + fetch + pip install over the chained-slirp4netns egress, that the
+# workspace cannot reach the host LAN, that a quick tunnel returns a real
+# trycloudflare.com URL and that zero host interfaces/routes/namespaces are
+# left behind. Cloudflare's quick-tunnel provisioning is unauthenticated and
+# rate limited: on a 429 the tunnel-dependent assertions are reported as
+# skipped-environment and the script still exits 0, so a run may legitimately
+# report skips for that external reason (never a silent pass).
+tunnel-check:
+	sudo -E bash scripts/tunnel-check.sh
+
+# Documentation-consistency gate. It derives its assertions from the code
+# (router, error constants, test count) rather than the prose, so it fails when
+# the docs stop matching the implementation.
+docs-check:
+	bash scripts/docs-consistency.sh
 
 lint:
 	@if command -v golangci-lint >/dev/null 2>&1; then \
