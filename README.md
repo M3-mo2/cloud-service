@@ -1,11 +1,16 @@
 # sandboxd
 
-A secure per-user code execution backend exposed over HTTP/JSON.
+A secure per-principal code execution backend exposed over HTTP/JSON. End-user
+accounts, per-user quota, plans and rate limiting are the separate frontend
+product's job; this service authenticates only static per-principal API keys.
 
 `sandboxd` lets clients create isolated workspaces, upload files, and run code inside
 [nsjail](https://github.com/google/nsjail) with CPU/memory/disk limits and no network by default.
 
-> Status: **v0.0.5** (pre-alpha). SSE log streaming and multi-node storage are deferred to v0.1.
+> Status: **v0.0.15** (pre-alpha). The service version string (`model.Version`)
+> tracks the highest feature group resolved in [docs/DECISIONS.md](docs/DECISIONS.md),
+> which now runs to v0.0.15; it is independent of the `/v1` API contract version.
+> SSE log streaming and multi-node storage are deferred to v0.1.
 
 ## Features
 
@@ -82,10 +87,78 @@ and runs it.
 
 ## Requirements
 
+Required for every deployment:
+
 - Go 1.23+
 - `nsjail` (the service runs without it, but `/readyz` reports 503 and runs return
   `503 unavailable`)
 - A host user and group named `sandbox` for sandboxed processes
+
+Required only for the opt-in egress and tunnel features:
+
+- `slirp4netns` — only for `allow_net:true` workspaces. Without it the service
+  still starts, but `/readyz` reports the `network` capability as
+  `available:false` and an `allow_net` workspace gets a private **empty**
+  namespace (no egress), never the host network.
+- `cloudflared` — only for tunnels. It must live somewhere the sandbox already
+  bind-mounts **read-only**, e.g. `/usr/local/bin` (the sandbox mounts `/usr`
+  read-only at the same path), so it is on `PATH` inside a workspace and a
+  tenant can execute it but cannot replace it with a Trojan binary.
+
+### Installing the optional tools
+
+```sh
+sudo apt-get install -y slirp4netns
+# cloudflared is not packaged; pin a known-good release into a read-only bind:
+CF=2026.10.7
+sudo curl -fsSL -o /usr/local/bin/cloudflared \
+  "https://github.com/cloudflare/cloudflared/releases/download/$CF/cloudflared-linux-amd64"
+sudo chmod +x /usr/local/bin/cloudflared
+```
+
+### Turning egress and tunnels on
+
+Both features are **default-deny** at the server, and each also needs a
+**per-workspace opt-in**, so enabling the server block alone grants nothing:
+
+```yaml
+# config.yaml
+network:            # egress (outbound internet) — default false
+  enabled: true
+tunnels:            # quick public tunnels — default false
+  enabled: true
+```
+
+```sh
+# per-workspace opt-in; both are needed, and a tunnel also needs allow_net
+curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"web","limits":{"allow_net":true,"allow_tunnels":true}}' \
+  localhost:8080/v1/workspaces
+```
+
+### Expose a port publicly (quick start)
+
+One API call starts `cloudflared tunnel --url` inside the workspace's own
+namespace and returns the observed `https://<name>.trycloudflare.com` URL; the
+URL is never fabricated. `cloudflared` also works from a shell inside the
+workspace (`cloudflared tunnel --url http://localhost:5000`), which is the same
+mechanism:
+
+```sh
+# start an app in the workspace, then expose its port 5000 to the internet
+curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"kind":"command","argv":["python3","-m","http.server","5000","--bind","0.0.0.0"],"no_timeout":true}' \
+  localhost:8080/v1/workspaces/$WS/runs
+curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"port":5000}' localhost:8080/v1/workspaces/$WS/tunnels
+# {"tunnel":{"url":"https://....trycloudflare.com", ...}}
+```
+
+Quick tunnels are **unauthenticated and rate limited** by Cloudflare: repeated
+creation can return `429`, surfaced honestly as `504 tunnel_url_unavailable`,
+and the URL is **ephemeral** (never cache it). See
+[docs/API.md](docs/API.md#quick-tunnels-and-egress) and
+[docs/DECISIONS.md](docs/DECISIONS.md) #70.
 
 ### Installing nsjail
 
