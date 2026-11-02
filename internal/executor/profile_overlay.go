@@ -97,6 +97,13 @@ func resolveInRoot(root, name string) (string, string, error) {
 // host material from sourceRoot ("/" in production).
 func materializeProfile(dir, sourceRoot string, p *profile.Profile) (profileOverlay, error) {
 	out := profileOverlay{ExtraMounts: map[string]string{}, Commands: map[string]bool{}}
+	// Start from a clean tree: a service restart reuses the same tmp dir, and a
+	// stale tree would collide on a symlink or keep an engine entry the profile
+	// no longer names. The profile tree is fully derived from the profile file,
+	// so removing it is safe.
+	if err := os.RemoveAll(dir); err != nil {
+		return out, err
+	}
 	usr := filepath.Join(dir, "usr")
 	binDst := filepath.Join(usr, "bin")
 	// Create the conventional subtrees up front: the template binds /sbin,
@@ -144,7 +151,9 @@ func materializeProfile(dir, sourceRoot string, p *profile.Profile) (profileOver
 			out.Warnings = append(out.Warnings, fmt.Sprintf("alias %q targets %q which is not present; skipped", alias, target))
 			continue
 		}
-		if err := os.Symlink(target, filepath.Join(binDst, alias)); err != nil {
+		aliasPath := filepath.Join(binDst, alias)
+		_ = os.RemoveAll(aliasPath)
+		if err := os.Symlink(target, aliasPath); err != nil {
 			return out, fmt.Errorf("profile %q alias %q: %w", p.Name, alias, err)
 		}
 		out.Commands[alias] = true
