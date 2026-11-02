@@ -713,13 +713,64 @@ ready (`/readyz`: `identity_masking.enabled=true, ready=false`) the renderer
 returns `ErrMaskUnavailable` and the run is refused, so a missing mask is a loud
 `503`, never a silent leak.
 
-The **honest limits** are part of the design: a statically-linked binary, a
-**musl** runtime (whose loader ignores `/etc/ld.so.preload`) and a raw
-`syscall(2)` bypass the interposition and see the real host values. Masking is
+The shim also interposes **`dlsym`** itself. A handle-scoped lookup —
+`ctypes.CDLL("libc.so.6").uname`, which resolves the symbol from libc's own
+handle and normally skips a preload shim — is answered with the shim's own
+function for any handle (measured; the full route list is in
+[VERIFICATION.md §10](VERIFICATION.md)). This closed a bypass that had been
+wrongly filed as inherent. The shim deliberately does **not** interpose `dlvsym`:
+defining both on this glibc makes a versioned reference bind back to the
+unversioned definition and the loader bootstrap recurses, so the residual
+`dlvsym(handle, …)` route (not reachable from `ctypes`) is documented instead.
+
+The **honest limits** are part of the design and kept in two separate classes: a
+statically-linked binary, a **musl** runtime (whose loader ignores
+`/etc/ld.so.preload`), a raw `syscall(2)`, and a handle-scoped `dlvsym(3)` bypass
+the interposition and see the real host values. The raw-syscall result is
+**asserted as a known outcome**, not left a surprise. Masking is
 **defense-in-depth, not a security boundary**; the filesystem view stays closed
-by the mount namespace on every path. See [DECISIONS.md](DECISIONS.md) #71–#73,
+by the mount namespace on every path. See [DECISIONS.md](DECISIONS.md) #71–#76,
 [VERIFICATION.md §10](VERIFICATION.md) for the measured numbers, and
 [`scripts/identity-check.sh`](../scripts/identity-check.sh) for the assertions.
+
+### 5.8 Provider identity: the platform's own tooling and the egress address
+
+The `/usr` bind mount that gives a workspace its toolchain also carries
+`/usr/local`, where the hosting platform keeps its own control binaries
+(`zcp`, `zsc`, `yq`), its vendor CA sources and a vendor-named Go toolchain —
+all of which name the provider in embedded strings. When
+`identity.hide_provider_tools` is on (default), the sandbox overlays
+`/usr/local` with a curated directory (empty by default; operator-providable via
+`identity.tools_dir`) and `/etc/ssl/certs` with a copy of the host trust store
+filtered of provider-named certificates. Both are read-only `mandatory:true`
+binds: a curated tree that cannot be mounted aborts the run rather than expose
+the host directory. The legitimate toolchain lives in `/usr/bin` and is
+unaffected.
+
+```mermaid
+flowchart LR
+    subgraph HOST["Host"]
+      L1["/usr/local\n(zcp, zsc, yq, go, vendor CAs)"]
+      L2["/etc/ssl/certs\n(provider CA subjects)"]
+    end
+    subgraph CUR["Curated overlay (service tmp dir, read-only bind)"]
+      C1["/usr/local\n(empty, or identity.tools_dir)"]
+      C2["/etc/ssl/certs\n(provider certs dropped; DER-matched)"]
+    end
+    L1 -.->|masked by| C1
+    L2 -.->|masked by| C2
+```
+
+The **egress address** is a separate, structural fact: an `allow_net` workspace
+exits through the platform's shared NAT, and that address is registered to the
+provider (`AS43541 VSHosting`, RDAP name `ZEROPS-IO`), so a tenant who fetches
+"what is my IP" learns the provider. No address outside the vendor's registered
+ranges is obtainable on this platform (measured; see
+[DECISIONS.md](DECISIONS.md) #76). An optional `network.egress_proxy` (default
+**off**) injects the standard proxy environment variables; it changes the
+outbound address and therefore the operator's abuse/reputation profile, so it is
+the operator's explicit choice, never a default, and it is a soft mechanism (a
+program that ignores the variables is unaffected).
 
 ---
 

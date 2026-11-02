@@ -101,7 +101,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **316** (312 unit + 4 `integration`-tagged), including regression
+Test functions: **319** (315 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -1332,6 +1332,8 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   service started (pid 109069)
   readyz.identity_masking: {'enabled': True, 'ready': True}
   PASS  readyz.identity_masking.ready (True)
+  PASS  readyz.provider_tools_hidden.ready (True)
+  PASS  meta.provider_tools_hidden.mechanism (curated)
 === 1) the 'already closed' paths are unreadable ===
   PASS  closed.paths_none_readable (0)
 === 2) hostname and internal DNS reveal nothing ===
@@ -1356,10 +1358,25 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   PASS  mask.runtime_python3 (0 'py-ok')
   PASS  mask.runtime_bash (0 'sh-ok')
   PASS  mask.runtime_perl (0 'perl-ok')
+=== 8) the hosting platform's own tooling is hidden ===
+  PASS  provider.zcp_absent (ABSENT)
+  PASS  provider.zsc_absent (ABSENT)
+  PASS  provider.zcli_absent (ABSENT)
+  PASS  provider.no_vendor_strings (0)
+  PASS  provider.no_vendor_certs (0)
+  PASS  provider.audit_scanned (yes)
+  PASS  provider.runtime_python3 (0 'py-ok')
+  PASS  provider.runtime_node (0 'node-ok')
+  PASS  provider.runtime_git (0 'git-ok')
+=== 9) the dlopen-scoped dlsym bypass is closed (syscall(2) is known) ===
+  PASS  bypass.default_handle_masked (0.0.0-sandbox)
+  PASS  bypass.named_handle_masked (0.0.0-sandbox)
+  PASS  bypass.raw_syscall_known_real (7.1.8-zabbly+)
 === 6) measured egress IP on the allow_net:true path ===
   measured egress IP: 93.185.106.128
   PASS  egress.ip_is_public (yes)
-  note: workspace egress IP equals the host's own public egress IP (platform-shared NAT)
+  egress provider identity: ORG AS43541 VSHosting s.r.o. (colo=PRG loc=CZ)
+  note: workspace egress IP equals the host's own public egress IP (platform-shared NAT, ADR 76)
 === 5) masking OFF leaks the host values (the switch is verifiable) ===
   PASS  mask_off.readyz_enabled (False)
   PASS  mask_off.release_leaks_host (7.1.8-zabbly+)
@@ -1372,7 +1389,7 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   PASS  topology.no_new_veth_or_tap (0)
   PASS  topology.netns_empty (0)
 
-================ identity acceptance: 31 passed / 0 failed / 0 skipped ================
+================ identity acceptance: 48 passed / 0 failed / 0 skipped ================
 ```
 
 **Measured: `node` is constrained by `rlimit_as` independently of masking.**
@@ -1422,16 +1439,93 @@ copies `scripts/tunnel-check.sh`'s exact service startup and network block (the
 same `network:` config and `start_service`), because a plain standalone harness
 that did not configure the relay hit `interface did not come up in sbxdws-…`.
 
+**Measured leak the fix closed: the platform's own CLI and vendor material.**
+With `identity.enabled=true, allow_net=true` inside a real workspace, before the
+fix:
+
+```
+$ command -v zcp      → /usr/local/bin/zcp
+$ ls /usr/local/bin/  → cloudflared nsjail yq zcp zsc
+$ strings /usr/local/bin/zcp | grep -i zerops
+    ZEROPS_Y
+    ub.com/zeropsio
+```
+
+The root cause was the `/usr` bind mount bringing `/usr/local` along. A full
+audit found the vendor strings not only in `zcp`/`zsc` but in
+`/usr/local/sbin/includes/basic_inc` (`bubenik@vshosting.cz`), the vendor CA
+sources `Zerops Infra` / `Zerops Service Intermediate`, and the vendor Go
+toolchain. The curated overlays (ADR 74) remove all of it; assertion 8 runs a
+`strings`-style audit over `/usr/local`, `/usr/sbin`, `/opt`, `/sbin` and the
+trust store and asserts **no** file names the vendor (`zcp`/`zsc`/`zcli` absent,
+`PROVIDER_HITS=0`, `CERT_HITS=0`), while `python3`/`node`/`git` still run. The
+TLS filter matches on the **decoded DER** (the provider name is base64 in the PEM
+text, so a substring test finds nothing — measured), and drops the provider
+certificates from both the per-cert files and the `ca-certificates.crt` bundle.
+
+**Measured leak the fix closed: the dlopen-scoped `dlsym` bypass.**
+The previous task's ADR 72 filed this under "inherently bypassable". Measurement
+showed otherwise: inside a masked workspace,
+
+```python
+ctypes.CDLL("libc.so.6", use_errno=True).uname(buf)   # → 7.1.8-zabbly+  (REAL)
+ctypes.CDLL(None).uname(buf)                          # → 0.0.0-sandbox  (masked)
+libc.syscall(63, buf)                                 # → 7.1.8-zabbly+  (raw)
+```
+
+`dlopen("libc.so.6")` returns a specific object handle whose `dlsym` searches
+only libc's local scope, skipping the shim, with **no raw syscall**. The shim now
+interposes `dlsym` (hostmask.c): a request to resolve a masked symbol from **any**
+handle returns the shim's own function — the same value the `RTLD_DEFAULT` path
+already returned. Measured after the fix (assertion 9):
+
+| Route | Before | After |
+|-------|--------|-------|
+| `ctypes.CDLL("libc.so.6").uname` | `7.1.8-zabbly+` | `0.0.0-sandbox` |
+| `ctypes.CDLL(None).uname` | `0.0.0-sandbox` | `0.0.0-sandbox` |
+| `libc.dlopen("libc.so.6")` + `dlsym` | `7.1.8-zabbly+` | `0.0.0-sandbox` |
+| `dlsym(RTLD_NEXT, "uname")` | `7.1.8-zabbly+` | `0.0.0-sandbox` |
+| `dlvsym(handle, "uname", "GLIBC_2.2.5")` | `7.1.8-zabbly+` | `7.1.8-zabbly+` (residual) |
+| `libc.syscall(63, buf)` | `7.1.8-zabbly+` | `7.1.8-zabbly+` (inherent, asserted) |
+
+Why `dlvsym` is not interposed: on this glibc, defining **both** `dlsym` and
+`dlvsym` in the preload object makes a versioned reference (`dlsym@GLIBC_2.2.5`)
+bind back to the shim's own unversioned definition, and the dynamic loader's
+bootstrap recurses at process start — measured, reproducible, drops every
+process. `dlvsym` also requires compiled code or an FFI that exposes it (CPython
+`ctypes` does not; `ctypes.CDLL` is `dlsym`-based), so the one-liner is closed
+and the residual is documented, not hidden. The raw `syscall(2)` path is asserted
+as a **known** result (`bypass.raw_syscall_known_real`), not left a surprise.
+
+**Measured: the egress address names the provider.** An `allow_net:true`
+workspace presented `93.185.106.128` (also the host's own egress). Three
+independent services name the provider:
+
+```
+ipinfo.io        → org: "AS43541 VSHosting s.r.o."  (Prague, CZ)
+rdap.db.ripe.net → name: "ZEROPS-IO"  (93.185.106.0/24, CZ; MNT-VSHOSTING, VS2641-RIPE)
+cloudflare trace → colo=PRG loc=CZ
+```
+
+Reverse DNS of the neighbouring `93.185.106.1` is `gw.vshosting.cz`. The
+NEEDS-CONFIRMATION finding (ADR 76): **no** egress address outside the vendor's
+registered ranges is obtainable here — the host's only public path is the
+`10.9.112.0/22` private interface NATed to `93.185.106.128`, there is no proxy
+configured or available, and the `/24` is registered to `ZEROPS-IO`. The
+optional `network.egress_proxy` knob (default **off**) is the only lever, and it
+changes the operator's abuse/reputation profile, so it is their call.
+
 **The honest limits.** A statically-linked binary, a musl runtime (whose loader
-ignores `/etc/ld.so.preload`) and a raw `syscall(2)` bypass the shim; those
-limits are stated in [DECISIONS.md](DECISIONS.md) #72, in the config example, and
-in `/v1/meta`'s `identity_masking.limits`. Masking is defense-in-depth, not a
-security boundary; the filesystem view stays closed by the mount namespace on
-every path (assertion 1), and that part holds for **every** binary.
+ignores `/etc/ld.so.preload`), a raw `syscall(2)`, and a handle-scoped
+`dlvsym(3)` bypass the shim; those limits are stated in [DECISIONS.md](DECISIONS.md)
+#72, in the config example, and in `/v1/meta`'s `identity_masking.limits`. Masking
+is defense-in-depth, not a security boundary; the filesystem view stays closed by
+the mount namespace on every path (assertion 1), and that part holds for
+**every** binary.
 
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **73** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **76** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -1441,7 +1535,11 @@ host-topology hazard of the abandoned veth/route design, and #70, the
 quick-tunnel rate-limit / ephemeral-URL operational limit and the harness's
 skipped-environment third state), plus #71–#73, the host-identity threat model,
 the /etc/ld.so.preload masking mechanism and its honest limits, and the
-fail-loud opt-out switch.
+fail-loud opt-out switch; #72 was **corrected** this iteration to separate
+"inherently bypassable" from "a gap we closed". #74 covers hiding the platform's
+own tooling and vendor material (the curated /usr/local and /etc/ssl/certs
+overlays), #75 covers closing the dlopen-scoped `dlsym` bypass, and #76 records
+the egress-address finding and the default-off `network.egress_proxy` knob.
 
 ## 11. OpenAPI
 

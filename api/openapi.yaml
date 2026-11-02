@@ -1238,6 +1238,13 @@ components:
             enabled: { type: boolean }
             ready: { type: boolean }
             reason: { type: string }
+        provider_tools_hidden:
+          type: object
+          description: Provider-tool overlay capability, reported truthfully. Enabled-but-not-ready makes the probe 503.
+          properties:
+            enabled: { type: boolean }
+            ready: { type: boolean }
+            reason: { type: string }
     Meta:
       type: object
       required: [version, api_version, runtimes, limits_defaults]
@@ -1284,8 +1291,22 @@ components:
             Host-identity masking capability, reported truthfully. `enabled` is
             the server switch (identity.enabled, default true); `ready` is
             whether the preload shim can be applied; `mechanism`/`limits` state
-            how it works and what it does NOT cover (a statically-linked, musl
-            or raw-syscall binary bypasses it).
+            how it works and what it does NOT cover (a statically-linked, musl,
+            raw-syscall or handle-scoped-dlvsym binary bypasses it).
+          properties:
+            enabled: { type: boolean }
+            ready: { type: boolean }
+            reason: { type: string }
+            mechanism: { type: string }
+            limits: { type: string }
+        provider_tools_hidden:
+          type: object
+          description: >-
+            Provider-tool overlay capability, reported truthfully. `enabled` is
+            the switch (identity.hide_provider_tools, default true); `ready` is
+            whether the curated /usr/local and /etc/ssl/certs trees were
+            materialized; `mechanism`/`limits` state what it hides and that it
+            cannot change the provider the egress address is registered to.
           properties:
             enabled: { type: boolean }
             ready: { type: boolean }

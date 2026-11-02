@@ -53,8 +53,8 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 ### 2.1 Meta
 
 - `GET /healthz` → 200 `{"status":"ok"}`
-- `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str}}`
-- `GET /v1/meta` → `{"version":"0.0.17","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
+- `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str}}`
+- `GET /v1/meta` → `{"version":"0.0.17","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
 - `GET /metrics` → Prometheus text
 
 #### What a workspace can and cannot observe
@@ -79,16 +79,27 @@ It **cannot**:
   report the workspace's limits), or the base image's distro patch level
   (`gnu_get_libc_version`/`confstr` are trimmed to the upstream number);
 - learn the operator's server FQDN or LAN address: the workspace's `/etc/hosts`
-  is a generated file holding only generic localhost entries, never the host's.
+  is a generated file holding only generic localhost entries, never the host's;
+- see the platform's own tooling or vendor material: `/usr/local` and
+  `/etc/ssl/certs` are replaced with curated trees that contain no operator
+  binary (`zcp`/`zsc`/`yq`), no vendor string and no provider-named certificate,
+  while the legitimate toolchain (`python3`, `node`, `bash`, `perl`, `git`) still
+  works;
+- step behind the masking shim through a handle-scoped `dlsym`: a
+  `dlopen("libc.so.6")` + `dlsym` lookup is answered by the shim, so
+  `ctypes.CDLL("libc.so.6").uname` returns the masked value.
 
 It **can**: observe its own cpu/memory limits as configured, run code, read and
 write its own workspace, and — with `allow_net:true` — reach the public internet,
 presenting a **platform-shared NAT address** (measured `93.185.106.128` this
-session); that address is the platform's egress, not a per-host address the
-tenant could use to single out this machine. The honest limits of the masking
-mechanism (a statically-linked binary, a musl runtime, or a raw `syscall(2)`
-bypasses the shim) are documented in [DECISIONS.md](DECISIONS.md) #72 and
-reported by `/v1/meta`'s `identity_masking.limits`.
+session); that address is the platform's egress and names the provider in its
+registration (`AS43541 VSHosting`, `ZEROPS-IO`), which is structural on this
+platform (see [DECISIONS.md](DECISIONS.md) #76). It can also reach the
+**inherent** masking limits — a statically-linked binary, a musl runtime, a raw
+`syscall(2)`, or a handle-scoped `dlvsym(3)` (documented in
+[DECISIONS.md](DECISIONS.md) #72 and reported by `/v1/meta`'s
+`identity_masking.limits`); those are stated, not hidden, and a raw `syscall(2)`
+is asserted as a known result by `scripts/identity-check.sh`.
 
 ### 2.2 Workspaces
 

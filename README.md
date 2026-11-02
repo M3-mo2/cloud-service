@@ -51,11 +51,17 @@ product's job; this service authenticates only static per-principal API keys.
   (on by default, `identity.enabled`) that makes `uname`/`sysconf`/`sysinfo`
   report the **workspace's own** cpu and memory rather than the host's real size
   or a platform kernel fingerprint. The shim is reached through a read-only
-  `/etc/ld.so.preload` a tenant cannot clear, and both files are read-only
-  mounts. The honest limits — a statically-linked, musl or raw-`syscall(2)`
-  binary bypasses it — are documented, not implied away. `GET /readyz` and
-  `GET /v1/meta` report `identity_masking` truthfully. See
-  [docs/DECISIONS.md](docs/DECISIONS.md) #71–#73 and
+  `/etc/ld.so.preload` a tenant cannot clear, both files are read-only mounts,
+  and the shim also interposes `dlsym` so a handle-scoped lookup
+  (`ctypes.CDLL("libc.so.6").uname`) cannot step behind it. The platform's own
+  tooling is hidden too (`identity.hide_provider_tools`): `/usr/local` and
+  `/etc/ssl/certs` are replaced with curated trees, so `zcp`/`zsc`/`yq`, the
+  vendor strings and the provider-named certificates are not visible, while
+  `python3`/`node`/`bash`/`perl`/`git` still work. The honest limits — a
+  statically-linked, musl, raw-`syscall(2)` or handle-scoped-`dlvsym(3)` binary
+  bypasses it — are documented, not implied away. `GET /readyz` and
+  `GET /v1/meta` report `identity_masking` and `provider_tools_hidden`
+  truthfully. See [docs/DECISIONS.md](docs/DECISIONS.md) #71–#76 and
   [scripts/identity-check.sh](scripts/identity-check.sh).
 
 See [docs/API.md](docs/API.md) for the full endpoint reference.
@@ -109,13 +115,26 @@ the code.
 Masking is **on by default** (`identity.enabled: true`). It is an `LD_PRELOAD`
 shim reached through a read-only `/etc/ld.so.preload`, so a workspace sees its
 own cpu/memory limits and a generic kernel string instead of the host's real
-size and platform build. It cannot be cleared with `env -i`, and the shim and
-preload list are read-only bind mounts. Turn it off only to measure what leaks
-(that leak is itself asserted by `scripts/identity-check.sh`). A binary that is
-statically linked, built against musl, or calls a raw `syscall(2)` bypasses the
-shim — the honest limits are in [docs/DECISIONS.md](docs/DECISIONS.md) #72.
-Building the service from source needs a C compiler for the shim; a plain
-`go build ./...` uses the committed `internal/executor/hostmask.so`.
+size and platform build. It cannot be cleared with `env -i`, the shim and
+preload list are read-only bind mounts, and the shim interposes `dlsym` so a
+handle-scoped `dlopen("libc.so.6")` + `dlsym` lookup returns the masked value.
+Turn it off only to measure what leaks (that leak is itself asserted by
+`scripts/identity-check.sh`). A binary that is statically linked, built against
+musl, calls a raw `syscall(2)`, or resolves a masked symbol with `dlvsym(3)`
+bypasses the shim — the honest limits are in
+[docs/DECISIONS.md](docs/DECISIONS.md) #72 (corrected) / #75. Building the
+service from source needs a C compiler for the shim; a plain `go build ./...`
+uses the committed `internal/executor/hostmask.so`.
+
+Hiding the platform's own tooling is also on by default
+(`identity.hide_provider_tools: true`): a curated read-only `/usr/local` (empty,
+or `identity.tools_dir`) and a provider-filtered `/etc/ssl/certs` replace the
+host's, so the operator's CLI (`zcp`, `zsc`, `yq`) and vendor material are not
+visible inside a workspace. The egress address still names the provider (it is
+the platform-shared NAT) — that is structural and documented in
+[docs/DECISIONS.md](docs/DECISIONS.md) #76; an optional, default-off
+`network.egress_proxy` is the only lever and changes the operator's reputation
+profile.
 
 ## Requirements
 

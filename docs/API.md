@@ -148,7 +148,8 @@ Readiness probe. Unauthenticated.
 
 - **Response 200 (ready) / 503 (not ready):** `{"status":"ready"|"not_ready",
   "nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},
-  "tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str}}`.
+  "tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str},
+  "provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str}}`.
 - **Errors:** none; unsuitability is expressed by the 503 and the boolean fields.
 - **Semantics:** `data_dir` is true when a temp file can be created under the
   data directory; `nsjail` when the nsjail binary is found; `cgroups` when the
@@ -156,12 +157,16 @@ Readiness probe. Unauthenticated.
   container started with `--cgroupns=host`). Any false ⇒ 503. When
   `identity_masking.enabled` is true, `ready` reports whether the host-identity
   masking shim can be applied: enabled-but-not-ready makes the whole probe 503,
-  so a deploy that would leak the host identity is never reported ready.
+  so a deploy that would leak the host identity is never reported ready. When
+  `provider_tools_hidden.enabled` is true, `ready` reports whether the curated
+  `/usr/local` and `/etc/ssl/certs` overlays could be materialized; here too,
+  enabled-but-not-ready makes the probe 503, so a deploy that would expose the
+  platform's own tooling is never reported ready.
 
 ```sh
 curl -s localhost:8080/readyz
 # {"cgroups":true,"data_dir":true,"identity_masking":{"enabled":true,"ready":true},
-#  "nsjail":true,"status":"ready"}
+#  "nsjail":true,"provider_tools_hidden":{"enabled":true,"ready":true},"status":"ready"}
 ```
 
 ### GET /metrics
@@ -212,8 +217,13 @@ default per-workspace limits.
     },
     "identity_masking": {
       "enabled": true, "ready": true,
-      "mechanism": "ld.so.preload shim (uname/sysinfo/sysconf/sched_getaffinity/getauxval)",
-      "limits": "a statically-linked binary, a musl runtime, or a raw syscall(2) bypasses the shim"
+      "mechanism": "ld.so.preload shim (uname/sysinfo/sysconf/sched_getaffinity/getauxval/dlsym)",
+      "limits": "a statically-linked binary, a musl runtime, a raw syscall(2), or a handle-scoped dlvsym(3) bypasses the shim"
+    },
+    "provider_tools_hidden": {
+      "enabled": true, "ready": true,
+      "mechanism": "curated read-only /usr/local and /etc/ssl/certs overlays",
+      "limits": "hides the host's own /usr/local and vendor-named certificates; it cannot change the provider the egress address is registered to"
     }
   }
   ```
@@ -233,7 +243,13 @@ default per-workspace limits.
   `enabled` is the server switch (`identity.enabled`, default true), `ready` is
   whether the shim can be applied, `reason` explains a not-ready state, and
   `mechanism`/`limits` state plainly how it works and what it does **not**
-  cover (a statically-linked, musl or raw-`syscall(2)` binary bypasses it).
+  cover (a statically-linked, musl, raw-`syscall(2)` or handle-scoped-`dlvsym(3)`
+  binary bypasses it). `provider_tools_hidden` reports the provider-tool overlay
+  (`identity.hide_provider_tools`, default true): `enabled` is the switch,
+  `ready` whether the curated `/usr/local` and `/etc/ssl/certs` trees were
+  materialized, and `limits` states that it hides the platform's own tooling and
+  vendor-named certificates but cannot change the provider the egress address is
+  registered to (see [DECISIONS.md](DECISIONS.md) ADR 74/76).
 
 ```sh
 KEY=dev-key-please-rotate

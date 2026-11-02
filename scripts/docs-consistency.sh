@@ -250,6 +250,41 @@ else
   fail "identity-masking.documented" "the identity_masking capability is not documented in docs/API.md and api/openapi.yaml"
 fi
 
+# The provider-identity work (this iteration): the overlay switch, the
+# dlsym-bypass closure and the egress-address finding must all be documented and
+# wired, so they cannot silently regress out of the docs.
+if grep -qi 'provider_tools_hidden' docs/API.md && grep -qi 'provider_tools_hidden' api/openapi.yaml; then
+  ok "provider-tools.documented"
+else
+  fail "provider-tools.documented" "provider_tools_hidden is not documented in docs/API.md and api/openapi.yaml"
+fi
+if grep -qF 'hide_provider_tools' configs/config.example.yaml; then
+  ok "provider-tools.config"
+else
+  fail "provider-tools.config" "identity.hide_provider_tools is missing from configs/config.example.yaml"
+fi
+if grep -qF 'dlsym' internal/executor/hostmask/hostmask.c && grep -qi 'dlsym' docs/DECISIONS.md; then
+  ok "dlsym-bypass.documented"
+else
+  fail "dlsym-bypass.documented" "the dlsym interposition / ADR 72 correction is not in both hostmask.c and docs/DECISIONS.md"
+fi
+if grep -qi 'egress_proxy' configs/config.example.yaml && grep -qi 'ZEROPS-IO\|RDAP\|registered' docs/DECISIONS.md; then
+  ok "egress-address.documented"
+else
+  fail "egress-address.documented" "the egress-address ADR / egress_proxy knob is not documented"
+fi
+# The identity harness must assert the two new groups (provider tools + dlsym).
+if grep -qF 'provider.no_vendor_strings' scripts/identity-check.sh; then
+  ok "identity-harness.provider-assertions"
+else
+  fail "identity-harness.provider-assertions" "scripts/identity-check.sh has no provider-tool assertions"
+fi
+if grep -qF 'bypass.named_handle_masked' scripts/identity-check.sh; then
+  ok "identity-harness.bypass-assertions"
+else
+  fail "identity-harness.bypass-assertions" "scripts/identity-check.sh has no dlsym-bypass assertions"
+fi
+
 # The identity harness must be wired into the Makefile (the entry point an
 # operator uses) and be in .PHONY.
 if grep -qE '^identity-check:' Makefile; then
