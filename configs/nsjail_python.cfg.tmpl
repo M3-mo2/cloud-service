@@ -187,12 +187,16 @@ mount {
 # mounts with rw:false: a workspace can neither replace the shim nor edit the
 # preload list. The shim is mounted under /sandboxd (a private root path, not
 # under the read-only /usr bind) so nsjail can create the mount point.
+#
+# mandatory:true is the fail-loud contract: if either mount cannot be applied
+# nsjail aborts the run (reported as 503 sandbox_unavailable) rather than start
+# a sandbox that would leak. A missing mask is never silent.
 mount {
   src: "{{ .MaskShimHost }}"
   dst: "{{ .MaskShimJail }}"
   is_bind: true
   rw: false
-  mandatory: false
+  mandatory: true
 }
 
 mount {
@@ -200,7 +204,7 @@ mount {
   dst: "{{ .MaskPreloadJail }}"
   is_bind: true
   rw: false
-  mandatory: false
+  mandatory: true
 }
 {{- end }}
 
