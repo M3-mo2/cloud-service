@@ -7,8 +7,10 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
-// Version is the service version string.
-const Version = "0.0.5"
+// Version is the service version string. It tracks the highest feature group
+// implemented in docs/DECISIONS.md (v0.0.15); it is independent of APIVersion,
+// which is the HTTP contract prefix and changes only on a breaking API change.
+const Version = "0.0.15"
 
 // APIVersion is the HTTP API version prefix.
 const APIVersion = "v1"

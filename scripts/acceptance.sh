@@ -84,7 +84,7 @@ echo "### 1. healthz"
 check "healthz.status" "$(curl -s "$B/healthz" | jsonfield "['status']")" "ok"
 
 echo "### 2. meta"
-check "meta.version" "$(curl -s -H "$K" "$B/v1/meta" | jsonfield "['version']")" "0.0.5"
+check "meta.version" "$(curl -s -H "$K" "$B/v1/meta" | jsonfield "['version']")" "0.0.15"
 
 echo "### 3. create workspace"
 WS=$(curl -s -H "$K" -H "$JSON" -d '{"name":"demo"}' "$B/v1/workspaces" | jsonfield "['workspace']['id']")
