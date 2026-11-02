@@ -737,29 +737,44 @@ are gone:
 `/etc/ld.so.preload`.** The shim (`internal/executor/hostmask/hostmask.c` →
 `hostmask.so`) interposes `uname`, `sysinfo`, `sysconf`, `sched_getaffinity`,
 `getauxval`, `gnu_get_libc_version` and `confstr`, and answers with the
-**workspace's** limits. Two properties make it robust against the obvious
-evasions, both **measured**:
+**workspace's** limits. It is **stripped and has its `.comment` section removed
+at build time** (`-s -fno-ident` plus `objcopy -R .comment`, which is required
+because the `.comment` compiler line survives `strip`), so `strings` over it
+yields no engine name, no compiler version and no source path. Its in-jail
+mount point is opaque (`/run/.rt.so`) and its configuration variables are
+engine-neutral (`LSM_SYS_CPUS`, `LSM_SYS_MEM`, `LSM_SYS_REL`, `LSM_SYS_VER`),
+because a tenant can `strings` the shim and read its own environment: an
+engine-named variable would announce the engine and the fact that a mask is
+active. Three properties make it robust against the obvious evasions, all
+**measured**:
 
 - **`/etc/ld.so.preload` is read by the dynamic loader for every
   dynamically-linked exec, independent of the environment.** A tenant cannot
   defeat it with `env -u LD_PRELOAD` or `env -i`: `env -i PATH=… nproc` and
   `env -i PATH=… uname -r` still return the masked values
   (`scripts/identity-check.sh` assertion 4). This is the reason `LD_PRELOAD`
-  alone (an environment variable, trivially cleared) was **rejected**.
+  alone (an environment variable, trivially cleared) was **rejected**. The
+  compiled-in fallbacks (1 cpu, 256 MB, `0.0.0-sandbox`) keep the `env -i`
+  answer generic.
 - **Both the shim and the preload list are bind-mounted `rw:false` and the
   mounts are `mandatory:true`.** A tenant cannot replace the shim, and if either
   mount cannot be applied nsjail aborts the run rather than starting a sandbox
   that would leak (`identity-check.sh` asserts the shim and preload files are not
   writable; the Go test asserts the mount is read-only and the render refuses
   with `ErrMaskUnavailable` when the shim cannot be materialized).
+- **The shim is not the only layer.** The curated trees in ADR 74 remove every
+  engine *name* a tenant could otherwise read (the runner, its helpers, the
+  engine-named environment, the relay source). The shim only supplies the
+  syscall answers.
 
-**Inherently bypassable vs a gap we closed — a corrected classification.** An
-earlier version of this ADR filed *every* `dlsym`/`dlopen` route as "not closable
-by this mechanism". That was wrong: a **handle-scoped `dlsym`** of an interposed
-symbol is a gap in the shim, not a property of preload interposition, and it is
-now **closed**. The two classes are kept separate on purpose:
+**Classification: closed, inherent, and not-yet-closed — kept separate on
+purpose.** An earlier version of this ADR filed *every* `dlsym`/`dlopen` route
+as "not closable by this mechanism". That was wrong: a **handle-scoped `dlsym`**
+of an interposed symbol is a gap in the shim, not a property of preload
+interposition, and it is now **closed**. The three classes are kept separate so
+the next reader can tell a shut gap from a permanent limit from an open task:
 
-**A. Closed this iteration (a gap in the shim, now shut).**
+**A. Closed (gaps in the shim/engine, now shut).**
 `dlopen("libc.so.6")` returns a SPECIFIC object handle, and `dlsym(handle, …)`
 on it searches only libc's local scope — deliberately skipping a preload shim.
 Measured before the fix, `ctypes.CDLL("libc.so.6", use_errno=True).uname(buf)`
@@ -789,6 +804,16 @@ one-liner is closed; the residual is documented rather than hidden.
    musl's own loader, which does not read `/etc/ld.so.preload`.
 3. **A direct `syscall(2)`** with a raw `uname`/`sysinfo` completely bypasses
    libc and every interposer by construction.
+
+**C. Not yet closed (the zero-artifact goal; see ADR 77).** The shim itself is
+still a visible file referenced by `/etc/ld.so.preload`, and the loader must
+read that file at the tenant's own uid, so `cat /etc/ld.so.preload` tells a
+tenant that a preload object exists at an opaque path. This is a **real,
+measured, open gap** — it is not "closed" and it is not "inherent". Two
+mechanisms could close it (replace the libc view, or move to seccomp
+`user_notif`); both were measured and neither holds on this host within bounded
+effort. The measurement and the reason are in **ADR 77**, and the harness
+reports them as `skip`, never as a pass.
 
 The masking layer is therefore **defense-in-depth, not a security boundary**. Its
 limits — now split into "closed" and "inherent" — are reported truthfully in
@@ -872,16 +897,35 @@ database templates, `/opt/zerops/bin`, `ZeropsPassword`, and internal
 `/usr/local/share/ca-certificates/` (`O = Zerops Infra`, `CN = Zerops Infra Root
 CA`), and the Go toolchain at `/usr/local/go` (a large host-tree mount).
 
-**Decision.** A new default-on switch `identity.hide_provider_tools`. When it is
-on, the sandbox **overlays** `/usr/local` and `/etc/ssl/certs` with curated,
-read-only copies:
+**Decision — curate every tree the host mounts.** A new default-on switch
+`identity.hide_provider_tools`. The sandbox mounts the host's `/usr`, `/lib`,
+`/etc/passwd` and `/etc/group` so a workload gets a normal toolchain and a
+working runtime; each of those also carries engine and platform material. When
+the switch is on, every such tree is **replaced inside the workspace with a
+curated, read-only copy** that drops the engine/platform entries and reproduces
+the rest:
 
 - **`/usr/local`** is replaced by an operator-providable curated directory
-  (`identity.tools_dir`). When no directory is configured it is **empty**: the
-  workspace keeps the whole of `/usr/bin` (where `python3`, `node`, `bash`,
-  `perl`, `git`, `curl` and the Go-less toolchain live) and sees **no** host
-  `/usr/local` material. A curated directory is preferred over exposing a real
-  host directory because the host directory is exactly what leaks.
+  (`identity.tools_dir`); empty (the default) sees **no** host `/usr/local`
+  material.
+- **`/usr/bin`, `/usr/sbin`** are curated copies (`identity.tools_bin_dir`/
+  `tools_sbin_dir`; default the host trees). An entry is dropped when its
+  **name** is `nsjail`, `slirp4netns`, `runcon`, `setpriv`, `unshare`, `nsenter`
+  or `chroot`, or names the provider/engine; or when a regular file's **content**
+  contains a provider or engine-distinctive string (`zerops`, `vshosting`,
+  `zabbly`, `sandboxd`, `nsjail`, `slirp4netns`). Everything else — `python3`,
+  `node`, `bash`, `perl`, `git`, `curl`, the whole distro toolchain — is
+  reproduced, so a workspace keeps its toolchain with no engine name reachable.
+- **`/usr/lib`** (mounted at **both** `/usr/lib` and `/lib`; the sandbox's `/lib`
+  is its own directory, not the host symlink) is curated the same way. This is
+  what removes the host tooling under `/usr/lib/{code-server,node_modules}` and
+  the provider-named systemd units (`/usr/lib/systemd/system/zerops-*.service`).
+- **`/usr/share/doc` and `/usr/share/man`** are curated (this removes the
+  `slirp4netns` page).
+- **`/etc/passwd` and `/etc/group`** are filtered copies: an entry naming the
+  provider or engine is dropped, and a surviving group's **member list** is
+  filtered too (the host's `sudo`/`www-data` groups list the operator account
+  `zerops`), so `getent passwd`/`id` name no provider.
 - **`/etc/ssl/certs`** is rebuilt from the host's own trust store with every
   certificate that **names the provider** dropped — from the per-certificate
   files and from the concatenated `ca-certificates.crt` bundle. The provider's
@@ -889,25 +933,43 @@ read-only copies:
   the filter decodes each certificate before testing (a base64 substring test
   finds nothing; measured). Generic roots are untouched, so TLS keeps working.
 
-Both mounts are `mandatory: true`: if a curated tree cannot be mounted the run
-**aborts** (`503 sandbox_unavailable`) rather than expose the host's directory —
-the same fail-loud contract as the masking shim. The overlay is materialized by
-the same one-time `masker.prepare()` pass into the service tmp dir, owned by the
-orchestrator; a workspace cannot write it, and it is bind-mounted read-only.
+The word `hostmask` is a **name-only** token, not a content token: it is a
+generic networking term (the inverse of a netmask) used by Python's `ipaddress`
+module and node's `netmask` package, so dropping every file that merely
+*contains* it would break the Python and Node standard libraries. A file
+*NAMED* `hostmask` is still dropped. This is measured: `ipaddress.ip_network(
+"10.0.0.0/8").hostmask` works inside the curated tree.
+
+All these mounts are `mandatory: true`: if a curated tree cannot be mounted the
+run **aborts** (`503 sandbox_unavailable`) rather than expose the host's
+directory — the same fail-loud contract as the masking shim. The overlays are
+materialized by the same one-time `masker.prepare()` pass into the service tmp
+dir, owned by the orchestrator; a workspace cannot write them, and they are
+bind-mounted read-only. On the target host the copies are filesystem clones
+(reflinks; measured), so curating ~2.5 GB of host trees costs ~10 s once and
+almost no disk.
 
 **Why not "hide the strings by stripping binaries"?** The binary is the
 operator's; modifying it would break their tooling and signatures. The workspace
 does not need it, so the correct fix is not to mount it.
 
-**Vendor-string audit is asserted, not assumed.** `scripts/identity-check.sh`
-assertion 8 runs `strings` over **every** mounted binary path (not just checks
-that `zcp` is absent) and asserts none names the provider, while asserting
-`python3`/`node`/`bash`/`perl`/`git` still run. This is the lesson from the
-brief: `zcp`/`zsc` were not the whole list.
+**The audit is asserted, not assumed.** `scripts/identity-check.sh` assertion 8
+runs a `strings` audit over **every** mounted binary path (not just checks that
+`zcp` is absent), and the new zero-signal group (assertion 10) audits every
+reachable file for a whole-word engine or provider name, asserts no path is
+named `hostmask`, asserts no engine tool name resolves, no engine-named
+environment is present, no provider account is in `/etc/passwd`/`/etc/group`,
+and no relay source is readable — while asserting `python3`/`node`/`bash`/
+`perl`/`git` still run. This is the lesson from the brief: `zcp`/`zsc` were not
+the whole list, and the engine's *own* runner (`nsjail`) and helpers were the
+first leak.
 
-**Honest limit.** `/usr/bin` still contains distro packages; the filter hides
-*files that name this provider*, not every byte of a large distro. It does not
-touch the egress address (ADR 76).
+**Honest limit.** The curated trees still contain third-party distro and
+operator tooling that is not this provider's (`code-server`, `agent-browser`,
+the Go-less toolchain): those are generic, not platform-identifying, and are
+kept because a workspace legitimately uses them. It hides *engine and provider
+names*, not every byte of a large distro. It does not touch the egress address
+(ADR 76).
 
 ### ADR 75 — The `dlopen`-scoped `dlsym` bypass is closed, not inherent
 
@@ -969,6 +1031,104 @@ through it (the relay blackholes every private range). The operator can change
 nothing about the address on this platform except by introducing an external
 proxy — which is why the knob is off by default and documented as a reputation
 decision.
+
+## v0.0.17 — zero signal: remove every engine/platform artifact a tenant can read
+
+### ADR 77 — The zero-artifact goal: what Stage 1 removed, and why the shim is not (yet) gone
+
+**The bar.** The operator's bar is **zero signal**, not "hard to find" and not
+"cannot be replaced": a file that exists to hide the host must not be visible to
+the tenant at all. A tenant is *obviously* in a sandbox (they upload a project
+and run it) — that is not the concern. The concern is any artifact that names
+the engine, the platform, or the masking mechanism.
+
+**Stage 1 — every name removed (implemented, asserted).** Measured before this
+iteration, a plain `ls` inside a real workspace showed the engine by name. All
+of the following were removed and are asserted by `scripts/identity-check.sh`:
+
+| Artifact (measured present) | Fix |
+|---|---|
+| `/usr/bin/nsjail`, `/usr/bin/slirp4netns`, `runcon`, `setpriv`, `unshare`, `nsenter`, `chroot` | curated `/usr/bin` + `/usr/sbin` drop them by name (ADR 74) |
+| `/sandboxd/` at the filesystem root holding `hostmask.so` (0644, `strings` → `hostmask.c`, `0.0.0-sandbox`, five `SANDBOXD_MASK_*`, GCC line) | curated trees + shim stripped, renamed, moved to `/run/.rt.so` (ADR 72) |
+| `/etc/ld.so.preload` naming `/sandboxd/hostmask.so` | preload now names `/run/.rt.so`; the string carries no engine name |
+| `SANDBOXD_KIND`, `SANDBOXD_WORKSPACE`, four `SANDBOXD_MASK_*` in the environment | renamed to `PROCESS_KIND`/`WORKSPACE_ID`/`PROCESS_SOURCE` and `LSM_SYS_{CPUS,MEM,REL,VER}` |
+| `/run/sandboxd/pty_relay.py` (10316 bytes, the engine's source, readable) | the relay is passed inline (`python3 -c "<source>"`); no file exists |
+| provider account `zerops` in `/etc/passwd`, `/etc/group` (and group member lists) | `/etc/passwd`+`/etc/group` filtered (ADR 74) |
+| provider-named systemd units and host tooling under `/usr/lib` | `/usr/lib` curated (also mounted at `/lib`) (ADR 74) |
+
+The measured result: inside a 1-CPU/256-MB workspace, `ls /` shows no
+`sandboxd`; `/etc/ld.so.preload` is `/run/.rt.so`; `strings` over every
+reachable file contains **no** whole-word `sandboxd`, `nsjail`, `slirp4netns`,
+`zerops`, `vshosting` or `zabbly`; no path is named `hostmask`; no engine tool
+name resolves; `env` carries **no** engine-named variable; `getent passwd`/`id`
+name no provider; `python3`/`bash`/`perl`/`git` still run. The one allowance is
+that the **generic networking word** `hostmask` survives inside Python's
+`ipaddress` module and node's `netmask` package — it is the inverse of a
+netmask, not this engine's name, and dropping it would break those standard
+libraries (measured: `ipaddress.ip_network("10.0.0.0/8").hostmask` works).
+
+**Stage 2 — honest verdict: the shim still exists, and this is an OPEN gap.**
+Two mechanisms could make the shim stop existing (no file, no preload list, no
+engine-named path at all). **Both were measured; neither holds on this host
+within bounded effort.**
+
+- **(A) Replace the workspace's libc view.** If it worked, the masking *is* the
+  library the tenant already has, with no extra file and no preload entry, and
+  `ctypes.CDLL("libc.so.6").uname()` would be masked by construction. Prototyped
+  and measured: a `libc.so.6` that merely interposes `uname`/`sysconf`/`sysinfo`
+  and forwards via `dlopen`+`dlsym` **aborts every dynamically-linked binary** —
+  the loader reports `no version information available` and
+  `undefined symbol: __libc_start_main, version GLIBC_2.34`. A correct
+  replacement must export the **entire** glibc symbol set *with version
+  information* (a `.map` version script per glibc build) and forward each
+  versioned symbol, or it breaks the runtime. That is a per-glibc-version
+  project whose failure mode is a broken sandbox; shipping an untested prototype
+  would trade a small leak for a large outage, which the brief forbids.
+- **(B) Move interception to seccomp `user_notif`.** The kernel advertises
+  `user_notif` in `/proc/sys/kernel/seccomp/actions_avail` (measured). **This
+  nsjail build has no `--seccomp_unotify` flag** (`unrecognized option`, measured)
+  and **`secdump` is not installed** (measured). The flag it does offer is a
+  seccomp *filter*, and this build's kafel libseccomp binding maps kafel's
+  `USER_NOTIF` action to **`ENOSYS`, not `SECCOMP_RET_USER_NOTIF`**: a rule
+  `USER_NOTIF { sysinfo }` made `sysinfo` fail with `Function not implemented`
+  while `uname` still returned the real `7.1.8-zabbly+` (measured) — i.e. it
+  *blocks* rather than *intercepts*. A real user_notif implementation needs a
+  supervisor process that owns the listener fd returned by
+  `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, …)` and
+  answers each notification; nsjail builds no such supervisor, so there is no
+  hook to attach one without replacing the engine's seccomp handling — and the
+  brief forbids weakening the existing seccomp policy to get there.
+
+**The result is therefore the brief's valid outcome:** the zero-artifact goal is
+**not** reached, the reasons are recorded with the exact measurement, and the
+harness reports them as `skip` (third state), never as a pass. The visible
+shim + `ld.so.preload` reference remain the honest open gap. What *is* asserted
+and unchanged: the shim cannot be tampered with (read-only mounts; eight
+tampering attempts all failed with `Read-only file system`), it survives
+`env -i` (compiled-in generic fallbacks), and a raw `syscall(2)` from a static
+binary remains the documented permanent limit (asserted as the real value, not
+pretended closed).
+
+### ADR 78 — The PTY relay is passed inline, never materialized
+
+**Problem.** The terminal-session relay was written to the session's `/tmp` as
+`pty_relay.py` and bind-mounted read-only at `/run/sandboxd`, so it existed as
+the engine's own source code (10316 bytes, readable) at a path that named the
+engine, inside every session.
+
+**Decision.** The relay source is passed to the interpreter inline
+(`python3 -c "<source>" <config-json>`) as the session's entry command. There is
+no helper file, no fixture directory, and no engine-named path in the sandbox.
+The relay still runs with the session's own uid, mounts and seccomp policy — the
+sandbox is **not** weakened for sessions — and the JSON configuration still
+travels as an argument (not an environment variable), so no engine-named
+variable is introduced. `internal/executor/live.go` builds the argv; the
+`HelperDir` template plumbing and the `/run/sandboxd` mount are gone.
+
+**Asserted.** `TestRenderSessionConfigHelperNoFile` proves the rendered session
+config contains `-c`, no `/run/sandboxd`, and no `pty_relay` name;
+`identity-check.sh` assertion 10 asserts no relay file is readable inside a
+session-capable workspace.
 
 ## Additional defaults chosen during implementation
 

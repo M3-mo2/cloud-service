@@ -231,7 +231,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"enabled":   maskEnabled,
 		"ready":     maskReady,
 		"mechanism": "ld.so.preload shim (uname/sysinfo/sysconf/sched_getaffinity/getauxval/dlsym)",
-		"limits":    "a statically-linked binary, a musl runtime, a raw syscall(2), or a handle-scoped dlvsym(3) bypasses the shim",
+		"limits":    "a statically-linked binary, a musl runtime, a raw syscall(2), or a handle-scoped dlvsym(3) bypasses the shim; the shim file and /etc/ld.so.preload remain the one visible, non-inherent artifact (ADR 77)",
 	}
 	if maskReason != "" {
 		maskCap["reason"] = maskReason
@@ -240,8 +240,8 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	overlayCap := map[string]any{
 		"enabled":   overlayEnabled,
 		"ready":     overlayReady,
-		"mechanism": "curated read-only /usr/local and /etc/ssl/certs overlays",
-		"limits":    "hides the host's own /usr/local and vendor-named certificates; it cannot change the provider the egress address is registered to",
+		"mechanism": "curated read-only overlays for /usr/{bin,sbin,lib,local}, /lib, /usr/share/{doc,man} and /etc/{passwd,group,ssl/certs}",
+		"limits":    "drops engine/platform-named entries and the provider account; it keeps generic third-party tooling and cannot change the provider the egress address is registered to",
 	}
 	if overlayNote != "" {
 		overlayCap["reason"] = overlayNote

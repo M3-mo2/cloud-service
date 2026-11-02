@@ -322,9 +322,9 @@ sequenceDiagram
     C->>API: POST /sessions {shell, cwd, cols, rows}
     API->>SVC: StartSession
     SVC->>EX: Start(Request{PTY:true, StdoutPath, ...})
-    EX->>EX: write helper into session tmp (mount Ro /run/sandboxd)
+    EX->>EX: build argv python3 -c "<relay source>" '{...}' (no file)
     EX->>N: nsjail --config <rendered>
-    N->>H: exec pty_relay.py '{"shell":..,"cols":..,"rows":..}'
+    N->>H: exec python3 -c "<relay source>" '{"shell":..,"cols":..,"rows":..}'
     H->>SH: pty.fork() + exec shell (session leader)
     EX-->>SVC: LiveProcess (stdin pipe owned by service)
     SVC-->>API: *Session (running)
@@ -349,12 +349,12 @@ it cannot allocate a controlling terminal. The sandbox image has no `socat` and
 no `expect`, but its `python3` ships `pty`, `termios` and `fcntl`, and
 `pty.fork()` gives a child a real `/dev/pts/N`. A ~200-line stdlib-only script is
 therefore the smallest, most portable way to allocate a PTY. It is embedded in
-the binary (`internal/executor/embed.go`) and materialized at `Start` time into
-the session's private `/tmp`, which the executor already bind-mounts
-**read-only** at `/run/sandboxd`. That the helper runs from a read-only mount
-matters: the interactive shell cannot rewrite the code that allocates its
-terminal, and the helper executes as the sandbox uid with the same mounts and
-seccomp policy as any workload. No sandbox control is relaxed for sessions.
+the binary (`internal/executor/embed.go`) and passed to the interpreter
+**inline** as the argument to `python3 -c` (see ADR 78): it never exists as a
+file inside the sandbox, so there is no helper source for a tenant to read and
+no engine-named path. The helper executes as the sandbox uid with the same
+mounts and seccomp policy as any workload. No sandbox control is relaxed for
+sessions.
 
 **The terminal needs two devices.** `pty.fork()` opens `/dev/ptmx` and needs a
 working devpts, so a PTY session's config adds read-only binds of the host's
@@ -472,7 +472,8 @@ fly (`configs/nsjail_python.cfg.tmpl`). The rendered sandbox has:
 | rlimits | `as` (MB), `fsize` (MB), `nofile`, `nproc`, `core=0` | Kernel-enforced ceilings | always |
 | seccomp | default-allow, KILL a dangerous denylist | `mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`, modules, keyctl, … | always |
 | identity | uid/gid map + `--user sandbox` | Runs as the unprivileged `sandbox` user | always |
-| host-identity mask | read-only `/etc/ld.so.preload` + shim at `/sandboxd/hostmask.so`; `uname`/`sysinfo`/`sysconf`/`sched_getaffinity`/`getauxval` answer with the workspace's limits | No platform kernel string, host size or hardware fingerprint by syscall | `identity.enabled` (default on); a not-ready mask aborts the run |
+| host-identity mask | read-only `/etc/ld.so.preload` + shim at the opaque `/run/.rt.so`; `uname`/`sysinfo`/`sysconf`/`sched_getaffinity`/`getauxval` answer with the workspace's limits | No platform kernel string, host size or hardware fingerprint by syscall | `identity.enabled` (default on); a not-ready mask aborts the run |
+| zero-signal curation | curated read-only `/usr/{bin,sbin,lib,local}`, `/lib`, `/usr/share/{doc,man}`, `/etc/{passwd,group,ssl/certs}` overlays that drop engine/platform names (ADR 74, 77) | No engine tool name, provider account, engine env or engine/platform string in any reachable file | `identity.hide_provider_tools` (default on); a missing curated tree aborts the run |
 | time | `time_limit` | Wall-clock kill | always |
 
 > **Units and availability (two corrected defects).** nsjail reads `rlimit_as`
@@ -689,13 +690,13 @@ core count), `getauxval(AT_HWCAP)` (a CPU fingerprint) and
 ```mermaid
 flowchart LR
     subgraph HOST["Host"]
-      H1["hostmask.so\n(internal/executor/hostmask.c → .so)"]
-      H2["ld.so.preload\nnames /sandboxd/hostmask.so"]
+      H1["rt.so\n(internal/executor/hostmask.c → .so, stripped)"]
+      H2["ld.so.preload\nnames /run/.rt.so"]
     end
     subgraph JAIL["Workspace sandbox (read-only binds)"]
-      J1["/sandboxd/hostmask.so  (rw:false, mandatory:true)"]
+      J1["/run/.rt.so  (rw:false, mandatory:true)"]
       J2["/etc/ld.so.preload     (rw:false, mandatory:true)"]
-      J3["env SANDBOXD_MASK_CPUS=workspace cpu\nSANDBOXD_MASK_MEM_BYTES=workspace mem\nSANDBOXD_MASK_KERNEL_RELEASE=0.0.0-sandbox"]
+      J3["env LSM_SYS_CPUS=workspace cpu\nLSM_SYS_MEM=workspace mem\nLSM_SYS_REL=0.0.0-sandbox"]
     end
     H1 -->|bind ro| J1
     H2 -->|bind ro| J2
@@ -707,7 +708,8 @@ loader reads `/etc/ld.so.preload` independently of the environment — so cleari
 the environment (`env -i`) does not defeat it, which is the reason a plain
 `LD_PRELOAD` **environment variable** was rejected (it is trivially cleared).
 The shim reads the workspace's own `cpu_cores`/`memory_mb` from the injected
-`SANDBOXD_MASK_*` environment and answers with those, with a floor of one cpu
+`LSM_SYS_*` environment (engine-neutral names, because a tenant reads its own
+environment) and answers with those, with a floor of one cpu
 and one MB. It is **on by default** (`identity.enabled`); when enabled but not
 ready (`/readyz`: `identity_masking.enabled=true, ready=false`) the renderer
 returns `ErrMaskUnavailable` and the run is refused, so a missing mask is a loud

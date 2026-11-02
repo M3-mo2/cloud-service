@@ -188,20 +188,34 @@ tunnels:
 identity:
   # Opt-out switch (default true). Set false only to measure what leaks.
   enabled: true
-  # Hide the hosting platform's own tooling and vendor material (default true).
-  # The sandbox mounts /usr for a normal toolchain, but the host's /usr/local
-  # also carries the platform's control binaries, its vendor CA sources and a
-  # vendor-named Go toolchain, and the TLS trust store names the provider in its
-  # certificate subjects. With this on, /usr/local and /etc/ssl/certs are
-  # replaced inside the workspace with curated, provider-free trees. python3,
-  # node, bash, perl and git all live under /usr and are unaffected.
+  # Hide the hosting platform's own tooling, the engine's own binaries and the
+  # provider account (default true). The sandbox mounts the host's /usr, /lib,
+  # /etc/passwd and /etc/group for a normal toolchain, but those also carry the
+  # engine's runner (nsjail) and sandbox helpers (slirp4netns, unshare, nsenter,
+  # setpriv, runcon, chroot), the platform's control binaries (zcp, zsc, yq) and
+  # vendor CA sources under /usr/local, the host tooling under
+  # /usr/lib/{code-server,node_modules}, the provider-named systemd units
+  # (zerops-*.service), the provider account in /etc/{passwd,group}, and a
+  # vendor-named TLS trust store. With this on, every one of those trees is
+  # replaced inside the workspace with a curated, read-only copy that drops the
+  # engine/platform entries and keeps the rest. python3, node, bash, perl and git
+  # are unaffected.
   hide_provider_tools: true
   # Optional curated directory mounted read-only at /usr/local in place of the
   # host's. It should contain ONLY tools a workspace may use. Empty (the
   # default) mounts an empty curated directory: the workspace keeps all of
   # /usr/bin and sees no host /usr/local material.
   tools_dir: ""
-  # The kernel strings a workspace is told. They must never be a real kernel.
+  # The host directories curated into the workspace's /usr/bin, /usr/sbin,
+  # /usr/lib (also mounted at /lib), /usr/share/doc and /usr/share/man. Empty
+  # uses the host defaults; they exist so an image can point at a smaller tree.
+  tools_bin_dir: ""
+  tools_sbin_dir: ""
+  tools_lib_dir: ""
+  tools_doc_dir: ""
+  tools_man_dir: ""
+  # The kernel strings a workspace is told. They must never be a real kernel and
+  # must not name the engine (a tenant reads them back).
   kernel_release: "0.0.0-sandbox"
   kernel_version: "#1 SMP"
   # Optional override of the compiled shim path; empty uses the copy embedded in

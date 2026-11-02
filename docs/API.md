@@ -519,7 +519,7 @@ started from a terminal session. This is the process inventory.
 - **Semantics (attribution is the point):** the inventory enumerates the members
   of each per-run / per-session **cgroup** and maps each host pid back to its
   owning run/session using a tag the engine injects into every sandbox
-  (`SANDBOXD_WORKSPACE`/`SANDBOXD_KIND`/`SANDBOXD_SOURCE`). A process inside a
+  (`WORKSPACE_ID`/`PROCESS_KIND`/`PROCESS_SOURCE`). A process inside a
   workspace's sandbox that carries no source tag is reported as **`detached`** —
   it is **never hidden**; an inventory that silently omitted a process would be
   worse than one that reports it. A workload that called `os.setsid()` and left

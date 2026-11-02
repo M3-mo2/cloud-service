@@ -572,9 +572,9 @@ per-run mounts, and then re-confirmed by the integration test:
 
 ```
 # Failure: the relay under the unpatched run config (no devpts mount).
-$ nsjail --config <one-shot-style>.cfg   # exec_bin = python3 /run/sandboxd/pty_relay.py
+$ nsjail --config <one-shot-style>.cfg   # exec_bin = python3 -c "<relay source>"
 Traceback (most recent call last):
-  File "/run/sandboxd/pty_relay.py", line 190, in main
+  File "<string>", line 190, in main
     child, master = pty.fork()
   File "/usr/lib/python3.12/pty.py", line 107, in fork
     master_fd, slave_fd = openpty()
@@ -678,8 +678,8 @@ The full matrix that the spec required:
 | 14 | a PTY session renders the host `/dev/pts`+`/dev/ptmx` mounts; one-shot does not | `TestRenderSessionConfigMountsHostDevpts`, `TestRenderConfigOmitsDevptsForOneShotExec` |
 | 15 | `gofmt`/`vet`/`test`/`test -race` green | the build/test transcript above |
 
-Plus: `TestRenderSessionConfigHelperMount` (helper mounted `rw:false` at
-`/run/sandboxd`, seccomp/uidmap/`mount_proc:false` retained),
+Plus: `TestRenderSessionConfigHelperNoFile` (relay passed inline via `-c`, no
+`/run/sandboxd` file or path, seccomp/uidmap/`mount_proc:false` retained),
 `TestRenderSessionConfigNoHelperMount` (non-session config untouched),
 `TestStartLiveProcessRoundTrip` and `TestStartKillProcessGroup` (the real
 `Start`/`LiveProcess` plumbing through a config-parsing nsjail stub),
@@ -703,7 +703,7 @@ $ go test ./internal/executor/ -run 'PTY|RenderSession|RenderConfigOmitsDevpts' 
 --- PASS: TestPTYFailureDetectedFromHelperStderr
 --- PASS: TestRenderSessionConfigMountsHostDevpts    # host /dev/pts + /dev/ptmx RO, PTY only
 --- PASS: TestRenderConfigOmitsDevptsForOneShotExec  # one-shot /dev stays null/zero/urandom
---- PASS: TestRenderSessionConfigHelperMount      # /run/sandboxd mounted rw:false; seccomp+uidmap kept
+--- PASS: TestRenderSessionConfigHelperNoFile       # relay inline via -c; no file/path; seccomp+uidmap kept
 --- PASS: TestRenderSessionConfigNoHelperMount
 
 $ go test ./internal/api/ -run 'Session' -v
@@ -1089,8 +1089,8 @@ before it was written into the code:
   `1` to `<dir>/cgroup.kill`) SIGKILLs every member regardless. Measured: after
   `echo 1 > NSJAIL.<n>/cgroup.kill` the setsid'd process was gone; the base
   binary's pgid-only kill leaves it alive.
-- **The attribution tag is inherited.** `SANDBOXD_WORKSPACE`/`SANDBOXD_KIND`/
-  `SANDBOXD_SOURCE` rendered as nsjail `envar:` entries are present in the
+- **The attribution tag is inherited.** `WORKSPACE_ID`/`PROCESS_KIND`/
+  `PROCESS_SOURCE` rendered as nsjail `envar:` entries are present in the
   `/proc/<pid>/environ` of the jailed process **and of a descendant** (a
   `setsid`'d child), which is what lets the inventory map a detached process back
   to its workspace/session.
@@ -1525,9 +1525,96 @@ is defense-in-depth, not a security boundary; the filesystem view stays closed b
 the mount namespace on every path (assertion 1), and that part holds for
 **every** binary.
 
+## 9i. Zero signal: no engine/platform artifact a tenant can read (acceptance)
+
+The operator's bar for this iteration is **zero signal**: a tenant must not be
+able to tell they are on this platform, nor see the engine's internals. This
+section records what was measured, what was removed, and what could not be.
+
+**Measured before the fix (a real `exec` in a real workspace, `ed973ee`).**
+
+```
+$ ls /usr/bin | grep -iE 'nsjail|sandbox|slirp'
+nsjail
+slirp4netns
+$ command -v runcon setpriv unshare nsenter chroot
+/usr/bin/runcon /usr/bin/setpriv /usr/bin/unshare /usr/bin/nsenter /usr/sbin/chroot
+$ ls /                                → … sandboxd …
+$ ls -la /sandboxd/                   → -rw-r--r-- 16432 hostmask.so
+$ cat /etc/ld.so.preload              → /sandboxd/hostmask.so
+$ strings /sandboxd/hostmask.so       → hostmask.c, 0.0.0-sandbox, 5× SANDBOXD_MASK_*, GCC 13.3.0
+$ env | grep SANDBOXD                 → SANDBOXD_KIND, SANDBOXD_WORKSPACE, SANDBOXD_MASK_{CPUS,MEM_BYTES,KERNEL_RELEASE,KERNEL_VERSION}
+$ ls -la /run/sandboxd/               → -rw-r--r-- 10316 pty_relay.py   (in a session; the engine's source)
+```
+
+**Measured after the fix** (a fresh 1-CPU/256-MB workspace; `identity-check.sh`
+assertion 10, all `PASS`):
+
+```
+ROOTS            ['bin','dev','etc','lib','lib64','opt','run','sbin','tmp','usr','workspace']   # no /sandboxd
+/run             ['.rt.so']                                   # opaque; the shim, OPAQUE name only
+ld.so.preload    /run/.rt.so
+tool names       none        (nsjail slirp4netns runcon setpriv unshare nsenter chroot all absent)
+engine env       none
+name tokens      0           (\b(sandboxd|hostmask|nsjail|slirp4netns|zerops|vshosting|zabbly)\b
+                              over every reachable file; 66 478 files scanned)
+path named hostmask  0
+account files no provider   (passwd zerops: False, group zerops: False)
+relay source     absent      (no /run/sandboxd/pty_relay.py, no /run/sandboxd)
+shim strings     clean       (no engine token in rt.so)
+```
+
+The one documented allowance: the **generic networking word** `hostmask` (the
+inverse of a netmask) survives inside Python's `ipaddress` module and node's
+`netmask` package. Dropping those files to remove the substring would break the
+Python and Node standard libraries, so `hostmask` is a **name-only** token
+(a path named `hostmask` is dropped; a file merely *containing* the word is
+kept). Measured inside the curated tree:
+`ipaddress.ip_network("10.0.0.0/8").hostmask` → `0.255.255.255`.
+
+The runtime still works with the curated trees: `python3`, `bash`, `perl`, `git`
+all run (`node` is constrained by `rlimit_as`, unchanged); `python3 -m pip
+--version`, `import ssl, json, urllib, ipaddress` and `git --version` all
+succeed. Curating `~2.5 GB` of host trees costs **~10 s once** per service start
+(filesystem reflinks; measured) and almost no disk.
+
+**Stage 2 — measured, and honest.** The shim still exists as a readable file
+referenced by `/etc/ld.so.preload`. Two mechanisms could remove the artifact;
+both were measured on this host and **neither holds**:
+
+```
+# (A) libc replacement: a naive wrapper libc.so.6 breaks every dynamic binary.
+$ LD_LIBRARY_PATH=<wrapper> /usr/bin/true
+/usr/bin/true: libc.so.6: no version information available (required by /usr/bin/true)
+/usr/bin/true: symbol lookup error: undefined symbol: __libc_start_main, version GLIBC_2.34
+
+# (B) seccomp user_notif: this nsjail build has no --seccomp_unotify …
+$ nsjail --seccomp_unotify -q -- true
+nsjail: unrecognized option '--seccomp_unotify'
+
+# … and its kafel USER_NOTIF action yields ENOSYS, not SECCOMP_RET_USER_NOTIF:
+$ nsjail --config <USER_NOTIF { sysinfo } + DEFAULT ALLOW>
+sysinfo: Function not implemented          # blocked, not intercepted
+uname=7.1.8-zabbly+                        # still the real value
+```
+
+`secdump` is not installed; `/proc/sys/kernel/seccomp/actions_avail` advertises
+`user_notif` but no supervisor owns a listener fd. The kernel cannot be made to
+lie either: writing `/proc/sys/kernel/osrelease`/`version` fails with
+`Permission denied` (re-measured this session). The zero-artifact goal is
+therefore **not** reached, recorded precisely (ADR 77), and the harness reports
+both as `skip` (third state), never as a pass. What remains asserted: the shim
+is untamperable (read-only mounts; tampering attempts all `Read-only file
+system`) and survives `env -i`, and the raw `syscall(2)` path is the documented
+permanent limit (asserted as the real value).
+
+**identity-check.sh this session: `57 passed / 0 failed / 2 skipped`.** The two
+skips are the Stage 2 mechanisms above (each with its measurement as the
+reason).
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **76** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **78** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -1537,11 +1624,16 @@ host-topology hazard of the abandoned veth/route design, and #70, the
 quick-tunnel rate-limit / ephemeral-URL operational limit and the harness's
 skipped-environment third state), plus #71–#73, the host-identity threat model,
 the /etc/ld.so.preload masking mechanism and its honest limits, and the
-fail-loud opt-out switch; #72 was **corrected** this iteration to separate
-"inherently bypassable" from "a gap we closed". #74 covers hiding the platform's
-own tooling and vendor material (the curated /usr/local and /etc/ssl/certs
-overlays), #75 covers closing the dlopen-scoped `dlsym` bypass, and #76 records
-the egress-address finding and the default-off `network.egress_proxy` knob.
+fail-loud opt-out switch; #72 was **corrected** twice, most recently to a
+three-way split: "closed", "inherent", and "not yet closed (the visible shim)".
+#74 covers the engine/platform curation of every mounted tree (the engine's
+runner and helpers, the platform's tooling and vendor material, the provider
+account, the provider-named systemd units), #75 covers closing the
+dlopen-scoped `dlsym` bypass, #76 records the egress-address finding and the
+default-off `network.egress_proxy` knob, **#77** records the zero-artifact
+goal, the Stage 1 removals and the measured reason Stage 2 (libc replacement /
+seccomp user_notif) is not reachable, and **#78** records the PTY relay being
+passed inline rather than materialized.
 
 ## 11. OpenAPI
 

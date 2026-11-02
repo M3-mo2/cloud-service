@@ -595,13 +595,23 @@ config template `configs/nsjail_python.cfg.tmpl` must include:
   (it names the operator's server FQDN and LAN address). A workspace without
   `allow_net` must not see any resolver or hosts file at all.
 - host-identity masking (`identity.enabled`, default on): bind-mount a compiled
-  preload shim read-only at `/sandboxd/hostmask.so` and a read-only
+  preload shim read-only at the opaque `/run/.rt.so` and a read-only
   `/etc/ld.so.preload` naming it, and inject the workspace's own
-  `cpu_cores`/`memory_mb` so the shim answers `uname`, `sysinfo`, `sysconf`,
+  `cpu_cores`/`memory_mb` (as the engine-neutral `LSM_SYS_*` variables) so the
+  shim answers `uname`, `sysinfo`, `sysconf`,
   `sched_getaffinity`, `getauxval` and the libc version strings with the
   workspace's values instead of the host's. The mounts are `mandatory:true`:
   a mask that cannot be applied aborts the run rather than leaking. See
   [DECISIONS.md](DECISIONS.md) #71–#73.
+- zero-signal curation (`identity.hide_provider_tools`, default on): the host's
+  `/usr/{bin,sbin,lib,local}`, `/lib`, `/usr/share/{doc,man}` and
+  `/etc/{passwd,group,ssl/certs}` are each replaced inside the workspace with a
+  curated, read-only copy that drops every entry naming the engine (`nsjail`,
+  `slirp4netns`, `runcon`, `setpriv`, `unshare`, `nsenter`, `chroot`,
+  `sandboxd`, `hostmask`) or the platform (`zerops`, `vshosting`, `zabbly`) and
+  reproduces the rest. This removes the engine's own runner, its helper
+  binaries, the engine-named environment, the provider account and the
+  provider-named systemd units. See [DECISIONS.md](DECISIONS.md) #74, #77.
 - package tiers: when the shared tier is configured and available, bind-mount it
   read-only at `/opt/python/shared`; always bind-mount the workspace's private
   tier read-write at `/opt/python/private`; inject both (shared first) via
@@ -618,8 +628,9 @@ build tag `//go:build integration` for tests that invoke real nsjail.
 **Terminal sessions reuse the exact same sandbox.** nsjail has no PTY support
 (no pty/tty option) and the image has no `socat`/`expect`, but its `python3` has
 `pty`/`termios`. A session therefore runs a small stdlib-only **PTY relay
-helper** as the entry command, with the helper materialized in the session's
-private `/tmp` and bind-mounted read-only at `/run/sandboxd`. The helper
+helper** as the entry command, with the helper source passed to the interpreter
+**inline** (`python3 -c "<source>"`) so it never exists as a file inside the
+sandbox (see [DECISIONS.md](DECISIONS.md) #78). The helper
 allocates the PTY, runs the shell as a session leader, and relays a
 line-delimited JSON control protocol from its stdin; its stdout is the terminal
 byte stream. `pty.fork()` opens `/dev/ptmx` and needs devpts, so a **PTY
