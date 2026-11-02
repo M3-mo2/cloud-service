@@ -55,17 +55,41 @@ type NsjailRunner struct {
 // panicked) and surfaced via ProfileStatus so /readyz fails loudly.
 func NewNsjailRunner(cfg config.Config, tmplPath, tmpDir string) *NsjailRunner {
 	reg, err := profile.NewRegistry(configs.BuiltinProfiles(), cfg.Profiles.Dir)
-	return &NsjailRunner{
+	m := newMasker(cfg.Identity, tmpDir)
+	r := &NsjailRunner{
 		cfg:        cfg,
 		tmplPath:   tmplPath,
 		tmpDir:     tmpDir,
 		identity:   ResolveIdentity(cfg),
-		mask:       newMasker(cfg.Identity, tmpDir),
+		mask:       m,
 		profiles:   reg,
 		profileErr: err,
 		procs:      make(map[string]*os.Process),
 		cgroupDirs: make(map[string]string),
 	}
+	// Build every offered profile tree now, once. The trees are large and shared
+	// (per-profile, not per-workspace), so paying the cost at construction keeps
+	// the first run fast and readiness honest. A failure is retained (not fatal
+	// here) and reported by ProfileStatus / /readyz.
+	_ = r.WarmProfiles()
+	return r
+}
+
+// WarmProfiles materializes the DEFAULT profile's tree now, once, so the first
+// run is not slowed by a ~20 s materialization and /readyz reports the tree
+// state honestly. Other offered profiles materialize lazily on first use (they
+// share the same per-profile cache). A failure is returned; startup logs it, and
+// ProfileStatus plus /readyz then report the profiles not ready.
+func (r *NsjailRunner) WarmProfiles() error {
+	if r.profileErr != nil {
+		return r.profileErr
+	}
+	if dp, ok := r.profiles.Get(r.cfg.Profiles.Default); ok {
+		if _, err := r.mask.profileTree(dp); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Profiles returns the loaded profile registry (nil when it failed to load).
@@ -83,6 +107,13 @@ func (r *NsjailRunner) ProfileStatus() (ready bool, note string) {
 	}
 	if !r.profiles.Has(r.cfg.Profiles.Default) {
 		return false, fmt.Sprintf("default profile %q is not loaded", r.cfg.Profiles.Default)
+	}
+	// Readiness also requires the default profile's tree to be materialized, so
+	// a run cannot be slowed (or fail) on a tree that was never built.
+	if dp, ok := r.profiles.Get(r.cfg.Profiles.Default); ok {
+		if _, err := r.mask.profileTree(dp); err != nil {
+			return false, "profile materialization failed: " + err.Error()
+		}
 	}
 	return true, ""
 }
