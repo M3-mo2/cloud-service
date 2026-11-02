@@ -262,7 +262,12 @@ chk "readyz.identity_masking.ready" "True" "$(curl -s "$BASE/readyz" | jsonf "['
 # The provider-tool overlay must also report ready: it materializes the curated
 # /usr/local and /etc/ssl/certs trees before the service claims readiness.
 chk "readyz.provider_tools_hidden.ready" "True" "$(curl -s "$BASE/readyz" | jsonf "['provider_tools_hidden']['ready']")"
-chk "meta.provider_tools_hidden.mechanism" "curated" "$(curl -s "$BASE/v1/meta" -H "$A" | jsonf "['provider_tools_hidden']['mechanism'].split()[0]")"
+# The tool model is now a profile-materialized allowlist, not a denylist over
+# the host /usr. Assert the mechanism is described as such and the profile
+# registry is ready (the default profile exists).
+chk "meta.provider_tools_hidden.mechanism" "profile-materialized" "$(curl -s "$BASE/v1/meta" -H "$A" | jsonf "['provider_tools_hidden']['mechanism'].split()[0]")"
+chk "readyz.profiles.ready" "True" "$(curl -s "$BASE/readyz" | jsonf "['profiles']['ready']")"
+chk "meta.profiles.default" "python" "$(curl -s "$BASE/v1/meta" -H "$A" | jsonf "['profiles']['default']")"
 
 # --- 1) the filesystem view is closed --------------------------------------
 echo "=== 1) the 'already closed' paths are unreadable ==="
@@ -875,6 +880,55 @@ print("MEM", os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
   NODE_OFF=$(runcmd "$BASE2" "$WSO" '["node","-e","console.log(\"node-ok\")"]' | awk '{print $1}')
   chk "mask.runtime_node_no_regression" "$NODE_OFF" "$NODE_ON"
 fi
+
+# --- 11) workspace profiles: an explicit allowlist, proven by EXECUTION -----
+# The tool model is a NAMED PROFILE with an explicit allowlist, not a denylist
+# over the host /usr. A profile is a reviewable list; a workspace names the one
+# it wants and the record says which it got. Everything here is an execution
+# check inside a real workspace, never a file-existence check.
+echo "=== 11) workspace profiles: allowlist enforced by execution ==="
+# A python-profile workspace RUNS the language and its tools.
+WPY=$(curl -s -m 20 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"pyprof","profile":"python"}' | jsonf "['workspace']['id']")
+chk "profiles.python.record" "python" "$(curl -s -H "$A" "$BASE/v1/workspaces/$WPY" | jsonf "['workspace']['profile']")"
+chk "profiles.python.runs_python" "0 'py-ok'" "$(runcmd "$BASE" "$WPY" '["python","-c","print(\"py-ok\")"]')"
+chk "profiles.python.runs_python3" "0 'py3-ok'" "$(runcmd "$BASE" "$WPY" '["python3","-c","print(\"py3-ok\")"]')"
+# A stdlib import proves the whole /usr/lib/python3.12 tree is attached, not
+# just the binary: without it this fails with ModuleNotFoundError.
+chk "profiles.python.stdlib_import" "0 'stdlib-ok'" "$(runcmd "$BASE" "$WPY" '["python3","-c","import json,csv,sqlite3,ssl,ctypes,urllib,email,xml,asyncio,pdb,unittest,pydoc;print(\"stdlib-ok\")"]')"
+chk "profiles.python.pip" "0" "$(runcmd "$BASE" "$WPY" '["pip","--version"]' | awk '{print $1}')"
+# The profile is an allowlist: a tool NOT in it is genuinely absent (the exec
+# itself fails command-not-found, proven by the API error, not a missing file).
+absent() { # ws tool -> "absent" when the tool cannot be executed
+  local code
+  code=$(curl -s -m 30 -X POST "$BASE/v1/workspaces/$1/exec" -H "$A" -H "$J" \
+    -d "{\"cmd\":[\"$2\"],\"timeout_sec\":20}" | python3 -c 'import json,sys;d=json.load(sys.stdin);print("present" if d.get("exit_code") is not None else "absent")')
+  printf '%s' "$code"
+}
+for tool in gcc cc apt cmake gdb; do
+  chk "profiles.python.absent_$tool" "absent" "$(absent "$WPY" "$tool")"
+done
+# A tool that IS in the profile is present: the control for the absence check.
+chk "profiles.python.present_git" "present" "$(absent "$WPY" "git")"
+# The command set itself is an explicit allowlist, and the compiler chain is
+# not in it: `sh -c 'command -v gcc'` prints nothing (execution, not a path).
+chk "profiles.python.no_gcc_in_path" "0 ''" "$(runcmd "$BASE" "$WPY" '["sh","-c","command -v gcc || true"]')"
+# A minimal-profile workspace RUNS a shell and coreutils but LACKS every
+# language runtime: this is what proves the allowlist really excludes things.
+WMIN=$(curl -s -m 20 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"minprof","profile":"minimal"}' | jsonf "['workspace']['id']")
+chk "profiles.minimal.record" "minimal" "$(curl -s -H "$A" "$BASE/v1/workspaces/$WMIN" | jsonf "['workspace']['profile']")"
+chk "profiles.minimal.runs_sh" "0 'sh-ok'" "$(runcmd "$BASE" "$WMIN" '["sh","-c","echo sh-ok"]')"
+for tool in python3 python node git gcc curl; do
+  chk "profiles.minimal.absent_$tool" "absent" "$(absent "$WMIN" "$tool")"
+done
+# An unknown profile is rejected 422 unknown_profile, never silently defaulted.
+chk "profiles.unknown_422" "422" "$(curl -s -o /dev/null -w '%{http_code}' -m 20 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"bad","profile":"does-not-exist"}')"
+chk "profiles.unknown_code" "unknown_profile" "$(curl -s -m 20 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"bad2","profile":"does-not-exist"}' | jsonf "['error']['code']")"
+# A create WITHOUT a profile gets the default and the record says so.
+WDEF=$(curl -s -m 20 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"defprof"}' | jsonf "['workspace']['id']")
+chk "profiles.default_applied" "python" "$(curl -s -H "$A" "$BASE/v1/workspaces/$WDEF" | jsonf "['workspace']['profile']")"
+# GET /v1/meta lists the offered profiles with a name and description.
+chk "profiles.meta_lists_minimal" "yes" "$(curl -s -H "$A" "$BASE/v1/meta" | python3 -c 'import json,sys;p=json.load(sys.stdin)["profiles"]["profiles"];print("yes" if any(x["name"]=="minimal" for x in p) else "no")')"
+chk "profiles.meta_lists_python" "yes" "$(curl -s -H "$A" "$BASE/v1/meta" | python3 -c 'import json,sys;p=json.load(sys.stdin)["profiles"]["profiles"];print("yes" if any(x["name"]=="python" and x.get("description") for x in p) else "no")')"
 
 # --- 7) the host is untouched ----------------------------------------------
 echo "=== 7) the host topology is untouched ==="

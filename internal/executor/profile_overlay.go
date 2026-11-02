@@ -36,6 +36,13 @@ var baseLibraryDirs = []string{
 	"/usr/lib/x86_64-linux-gnu",
 	"/usr/lib64",
 	"/usr/lib/locale",
+	// /usr/lib/ssl holds the OpenSSL default trust paths (cert.pem and certs
+	// both point into /etc/ssl/certs). Python, curl and every TLS client resolve
+	// their default CA bundle through it; without it a workspace cannot verify
+	// any TLS certificate even though the curated /etc/ssl/certs is mounted
+	// (measured: `urllib.request.urlopen("https://pypi.org/...")` failed with
+	// "unable to get local issuer certificate" until /usr/lib/ssl was included).
+	"/usr/lib/ssl",
 }
 
 // profileOverlay is the materialized result for one profile.
