@@ -65,8 +65,11 @@ implemented, currently **v0.0.16** (#71–#73); the HTTP contract stays `/v1`
     _Rationale_: the resource model treats cgroup ceilings as active; making the requirement
     explicit and observable is safer than silently running without ceilings.
 19. **rlimit units**: nsjail's `rlimit_as` and `rlimit_fsize` are **megabytes** (verified against the
-    installed build), so the rendered config passes `memory_mb` / `disk_mb` directly.
+    installed build), so the rendered config passes MB values, never bytes.
     _Rationale_: passing bytes multiplied every ceiling by ~10^6, effectively disabling them.
+    **Corrected by ADR 82:** `rlimit_fsize` is `disk_mb`, but `rlimit_as` is **not** `memory_mb` — it
+    is `memory_mb + headroom` (floored at 2048 MB), because a managed runtime's virtual reservations
+    count against `RLIMIT_AS`. The physical ceiling is `cgroup_mem_max = memory_mb` (bytes).
 20. **User environment is allowlisted.** Only `PYTHONPATH`, `PYTHONUNBUFFERED`,
     `PYTHONDONTWRITEBYTECODE`, `PYTHONHASHSEED`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ` pass through.
     Loader-injection variables (`LD_*`, `DYLD_*`, `GLIBC_TUNABLES`) are rejected by name.

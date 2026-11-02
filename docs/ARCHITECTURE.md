@@ -477,9 +477,13 @@ fly (`configs/nsjail_python.cfg.tmpl`). The rendered sandbox has:
 | time | `time_limit` | Wall-clock kill | always |
 
 > **Units and availability (two corrected defects).** nsjail reads `rlimit_as`
-> and `rlimit_fsize` in **megabytes**, not bytes: the renderer passes
-> `memory_mb`/`disk_mb` directly (a bytes value made every ceiling ~10⁶× too
-> large). cgroup v2 ceilings require write access to the host cgroup hierarchy,
+> and `rlimit_fsize` in **megabytes**, not bytes: the renderer passes MB values
+> (a bytes value made every ceiling ~10⁶× too large). `rlimit_fsize` is the
+> disk limit; `rlimit_as` is **not** `memory_mb` but `memory_mb + headroom`
+> (floored at 2048 MB), because a managed runtime reserves a large *virtual*
+> address space it never commits and `RLIMIT_AS` counts reservations (ADR 82):
+> the physical ceiling is `cgroup_mem_max = memory_mb`. cgroup v2 ceilings
+> require write access to the host cgroup hierarchy,
 > i.e. the container must run with `--cgroupns=host`; without it nsjail aborts
 > before `execve` and **no** cgroup ceiling applies (see §5.4 and §10). The
 > process ceiling comes from `cgroup_pids_max`, because `RLIMIT_NPROC` does not
@@ -614,8 +618,11 @@ error. Getting to a green real-nsjail run required:
 - Remove invalid fields `chroot`, `chroot_base`, `disable_proc`, `proc_path`;
   use `mount_proc: false`.
 - `use_cgroupv2: true` is required for the unified cgroup hierarchy on modern
-  hosts; `cgroup_mem_max` is in **bytes**, but **`rlimit_as`/`rlimit_fsize` are
-  in megabytes** (a subtle unit mismatch that is now covered by a test).
+  hosts; `cgroup_mem_max` is in **bytes**, while **`rlimit_as`/`rlimit_fsize`
+  are in megabytes** (a subtle unit mismatch covered by a test). `rlimit_as` is
+  `memory_mb + headroom` (floor 2048 MB), not `memory_mb`, so a managed runtime
+  whose `PROT_NONE` reservations count against `RLIMIT_AS` can still start; the
+  cgroup is the physical ceiling (ADR 82).
 - cgroup v2 is only usable when the container is started with
   `--cgroupns=host`; otherwise nsjail aborts before `execve`.
 - `uidmap`/`gidmap` `inside_id`/`outside_id` must be quoted **strings**.
@@ -1094,7 +1101,7 @@ real-nsjail acceptance transcript:
 | network egress | `NET_BLOCKED: OSError` | net namespace isolates |
 | `/etc/shadow` | `FileNotFoundError` | not mounted |
 | `mount(2)`/`ptrace` | exit **159** (SIGSYS) | seccomp kills it |
-| memory ceiling (`RLIMIT_AS`) | `AS_LIMIT_MB 512`, 1 GiB alloc denied | rlimit unit fix holds |
+| memory ceiling (`cgroup_mem_max`) | 4 GiB touch killed (exit 137) | physical ceiling enforced |
 | fork bomb | `FORKED 191` then `BlockingIOError` | cgroup pids limit |
 | stop long run | status `killed`, no orphan | process-group kill |
 | launch failure (no `--cgroupns=host`) | 503 + nsjail diagnostic | failure is explicit |

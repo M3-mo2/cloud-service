@@ -65,7 +65,7 @@ product's job; this service authenticates only static per-principal API keys.
   statically-linked, musl, raw-`syscall(2)` or handle-scoped-`dlvsym(3)` binary
   bypasses it — are documented, not implied away. `GET /readyz` and
   `GET /v1/meta` report `identity_masking` and `provider_tools_hidden`
-  truthfully. See [docs/DECISIONS.md](docs/DECISIONS.md) #71–#80 and
+  truthfully. See [docs/DECISIONS.md](docs/DECISIONS.md) #71–#82 and
   [scripts/identity-check.sh](scripts/identity-check.sh).
 
 See [docs/API.md](docs/API.md) for the full endpoint reference.

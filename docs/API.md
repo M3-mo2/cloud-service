@@ -2116,7 +2116,7 @@ Per-workspace limits (`limits:` config; overridable at creation and via
 | Limit | Config key | Default | Server maximum (`max_limits:`) | Effect |
 |-------|------------|---------|-------------------------------|--------|
 | CPU cores | `limits.cpu_cores` | 1 | 8 | cgroup CPU throttling (`cgroup_cpu_ms_per_sec`) |
-| Memory | `limits.memory_mb` | 512 | 8192 | `RLIMIT_AS` and `cgroup_mem_max` (MB / bytes respectively) |
+| Memory | `limits.memory_mb` | 512 | 8192 | physical ceiling `cgroup_mem_max` (bytes); `rlimit_as` is `memory_mb + headroom` (virtual backstop, ADR 82) |
 | Disk | `limits.disk_mb` | 1024 | 51200 | file-API quota; `RLIMIT_FSIZE` per file |
 | Wall time | `limits.max_wall_time_sec` | 300 | 3600 | async run timeout (`--time_limit`) |
 | Runs / procs | `limits.max_runs` | 3 | 64 | cgroup pids max = `max_runs * 64`; also `RLIMIT_NPROC` |

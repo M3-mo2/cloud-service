@@ -40,7 +40,7 @@ reports `"cgroups":true`.
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/process-stop-check.sh` → `25 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/session-nsjail-check.sh` → `18 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh` → `27 passed / 0 failed / 0 skipped`
-> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `47 passed / 0 failed / 0 skipped`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `70 passed / 0 failed / 2 skipped`
 >
 > The unprivileged suites (`gofmt`, `go build`, `go vet`, `go test ./...`, the
 > handler-level assertions and the sandbox-config render tests) were re-run and
@@ -101,7 +101,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **319** (315 unit + 4 `integration`-tagged), including regression
+Test functions: **320** (316 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -278,7 +278,7 @@ ok   seccomp.mount                159
 ### 18. isolation: fork bomb limited by cgroup pids.max
 ok   cgroup.fork_limit            contains FORK_LIMITED
 ### 19. resource ceiling: memory limit enforced (F-1)
-ok   rlimit.memory                contains MEMORY_DENIED
+ok   rlimit.memory                memory_limited (exit 137)
 ### 20. stop long run kills process group
 ok   stop.run_status              killed
 ok   stop.no_survivors            0
@@ -320,7 +320,8 @@ passed=113 failed=0
 Every step asserts on content, not merely on the absence of a crash: a
 successful execution must print `hi` with exit code 0, the network probe must
 report `NET_BLOCKED`, the seccomp probe must exit `159`, the fork bomb must
-report `FORK_LIMITED`, and the memory probe must report `MEMORY_DENIED`.
+report `FORK_LIMITED`, and the memory probe must be stopped (exit `137` from the
+cgroup OOM killer, or `MEMORY_DENIED`).
 
 ### Resource-ceiling evidence
 
@@ -329,12 +330,20 @@ Raw introspection through the API with declared `memory_mb=512`,
 
 ```
 $ curl … -d '{"cmd":["python3","lim.py"]}' …/exec     # lim.py prints getrlimit
-AS_LIMIT_MB 512                                        # was 512 TiB before the unit fix
+AS_LIMIT_MB 2048                                       # memory_mb(512)+1024, floor 2048 (ADR 82)
+# the physical ceiling is cgroup_mem_max = memory_mb bytes = 536870912 (host-side;
+# /sys is not mounted inside the sandbox, by design)
 
 $ curl … -d '{"cmd":["python3","f.py"]}' …/exec       # f.py attempts 500 live forks
 FORK_LIMITED BlockingIOError
 FORKED 191                                             # stopped at the cgroup pids ceiling
 ```
+
+The earlier `AS_LIMIT_MB 512` line recorded the F-1 unit fix (a byte value had
+made it 512 TiB). It is now `memory_mb + 1024` because `rlimit_as = memory_mb`
+aborted node/V8 (ADR 82); `cgroup_mem_max = memory_mb` bytes is the physical
+ceiling. `acceptance.sh` #19 touches 4 GiB and asserts the process is stopped
+(`exit 137` or `MEMORY_DENIED`).
 
 ## 4. Security rejections
 
@@ -1355,9 +1364,12 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   PASS  mask.env_i_uname (0.0.0-sandbox)
   PASS  mask.env_i_getconf (1)
   PASS  mask.shim_not_writable (0)
-  PASS  mask.runtime_python3 (0 'py-ok')
-  PASS  mask.runtime_bash (0 'sh-ok')
-  PASS  mask.runtime_perl (0 'perl-ok')
+  PASS  runtime.python3 (0 'py-ok')
+  PASS  runtime.node (0 'node-ok')
+  PASS  runtime.node_arithmetic (0 '42')
+  PASS  runtime.bash (0 'sh-ok')
+  PASS  runtime.perl (0 'perl-ok')
+  PASS  runtime.git (0 'git-ok')
 === 8) the hosting platform's own tooling is hidden ===
   PASS  provider.zcp_absent (ABSENT)
   PASS  provider.zsc_absent (ABSENT)
@@ -1366,10 +1378,11 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   PASS  provider.no_vendor_certs (0)
   PASS  provider.audit_scanned (yes)
   PASS  provider.runtime_python3 (0 'py-ok')
+  PASS  provider.runtime_node (0 'node-ok')
   PASS  provider.runtime_bash (0 'sh-ok')
   PASS  provider.runtime_perl (0 'perl-ok')
   PASS  provider.runtime_git (0 'git-ok')
-  PASS  provider.runtime_node_no_regression (133)
+  PASS  provider.runtime_node_no_regression (0)
 === 9) the dlopen-scoped dlsym bypass is closed (syscall(2) is known) ===
   PASS  bypass.default_handle_masked (0.0.0-sandbox)
   PASS  bypass.named_handle_masked (0.0.0-sandbox)
@@ -1384,25 +1397,32 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   PASS  mask_off.release_leaks_host (7.1.8-zabbly+)
   PASS  mask_off.cpu_leaks_host (2)
   PASS  mask_off.mem_leaks_host (yes)
-  PASS  mask.runtime_node_no_regression (133)
+  PASS  mask.runtime_node_no_regression (0)
 === 7) the host topology is untouched ===
   PASS  topology.links_unchanged (same)
   PASS  topology.routes_unchanged (same)
   PASS  topology.no_new_veth_or_tap (0)
   PASS  topology.netns_empty (0)
 
-================ identity acceptance: 47 passed / 0 failed / 0 skipped ================
+================ identity acceptance: 70 passed / 0 failed / 2 skipped ================
 ```
 
-**Measured: `node` is constrained by `rlimit_as` independently of masking.**
-`node -e 'console.log(42)'` exits `133` with V8's `Fatal process out of memory:
-SegmentedTable::InitializeTable` **both** with masking on and with masking off,
-because nsjail renders `rlimit_as = memory_mb` (256 MB) and V8 reserves a large
-virtual address space at startup. The harness records that outcome and asserts
-the masked and unmasked results are **equal** (no regression from masking)
-rather than asserting a success that the image does not support; `python3`,
-`bash` and `perl` all produce their output under the mask. This is a
-pre-existing resource-model limitation, not a masking defect.
+**Measured: `node` starts and runs under the mask — the earlier failure was
+`rlimit_as`, not the shim (ADR 82).** A follow-up measured that
+`node -e 'console.log(42)'` died with V8's `Fatal process out of memory:
+SegmentedTable::InitializeTable` **with no shim loaded at all** (`ulimit -v
+262144`), with the previous syscall-only shim, and inside a real sandbox with
+masking **off** — the newly interposed filesystem symbols were not the cause.
+Node's virtual-address threshold is identical (1121 MB) with and without the
+shim. The engine now separates the physical ceiling (`cgroup_mem_max =
+memory_mb`) from the virtual backstop (`rlimit_as = memory_mb + 1024`, floored
+at 2048), because V8 reserves ~1.1 GiB of virtual address space (a 512 MiB
+`PROT_NONE` CodeRange `mmap` plus heap reservations) before `main`, and
+`RLIMIT_AS` counts reservations the process never commits. Measured after:
+`node -e 'console.log(42)'` → `42` at 256 MB and 512 MB, mask on and off;
+`python3`/`bash`/`perl`/`git` unaffected. `identity-check.sh` now asserts every
+runtime **succeeds** under the mask (a runtime regression can no longer pass as
+"equality of outcome").
 
 **The measured numbers (this session, target host).** The workspace was capped at
 `cpu_cores: 1, memory_mb: 256`; the host is `7.1.8-zabbly+` with 2 cores and
@@ -1572,9 +1592,9 @@ Python and Node standard libraries, so `hostmask` is a **name-only** token
 kept). Measured inside the curated tree:
 `ipaddress.ip_network("10.0.0.0/8").hostmask` → `0.255.255.255`.
 
-The runtime still works with the curated trees: `python3`, `bash`, `perl`, `git`
-all run (`node` is constrained by `rlimit_as`, unchanged); `python3 -m pip
---version`, `import ssl, json, urllib, ipaddress` and `git --version` all
+The runtime still works with the curated trees: `python3`, `node`, `bash`,
+`perl` and `git` all run (node after the `rlimit_as` fix, ADR 82); `python3 -m
+pip --version`, `import ssl, json, urllib, ipaddress` and `git --version` all
 succeed. Curating `~2.5 GB` of host trees costs **~10 s once** per service start
 (filesystem reflinks; measured) and almost no disk.
 
@@ -1585,15 +1605,21 @@ The shim interposes the filesystem entry points and answers `ENOENT` for
 real 1-CPU/256-MB workspace**, for every configured path across every method:
 
 ```
-# With the shim loaded (the tenant's situation), each matrix reports HIDDEN:
+# With the shim loaded (the tenant's situation), the EXISTENCE matrix reports
+# HIDDEN (the shim answers ENOENT):
 #   os.path.exists / os.path.isfile / open() / os.listdir          HIDDEN
 #   ls -la / cat / stat / test -e / test -f / test -r              HIDDEN
 #   find <parent> -maxdepth 1 -name <leaf>                         (no hit)
-#   readlink <path>                                                HIDDEN (ENOENT)
-#   readlink -f <path>                                             echoes the literal input
-# 48/48 method·path checks HIDDEN; 0 VISIBLE.
+# The CANONICALIZATION matrix never echoes (the shim answers EACCES, so
+# coreutils aborts; readlink(1) itself is HIDDEN via EACCES):
+#   readlink <path>                                                HIDDEN (rc!=0)
+#   readlink -f/-e <path> / realpath / realpath -e <path>          NOT echoed (rc!=0)
+#   os.path.realpath(<path>)                                       literal echo (documented residual)
+# 48/48 existence method·path checks HIDDEN; 0 VISIBLE.
 #   invisible.no_hidden_path_visible            0
-#   invisible.readlink_f_echo_only              4    (4 of 4 echo, never stat the leaf)
+#   invisible.canonicalization_no_echo          0    (0 of 16 canonicalizer checks echo)
+#   invisible.canonicalization_probe_ran        yes
+#   invisible.py_realpath_residual_literal      4    (4 of 4 echo only their own argument)
 #   invisible.loader_env_i_still_masked         MASKED   (env -i uname -r = 0.0.0-sandbox)
 #   invisible.loader_env_u_still_masked         MASKED   (env -u LSM_SYS_* uname -r = 0.0.0-sandbox)
 #   invisible.raw_syscall_known_limit           REACHED  (newfstatat(262) still reaches it)
@@ -1604,9 +1630,9 @@ real 1-CPU/256-MB workspace**, for every configured path across every method:
 **The loader scope is the correctness core, and it holds.** The dynamic loader
 reads `/etc/ld.so.preload` *before* any preload object is mapped, so the hiding
 never intersects the loader; only a process that already has the shim answers
-`ENOENT`. Measured in the same workspace: `cat`/`ls`/`stat`/`test`/`find`/
-`os.path.exists`/`os.listdir` all report `/etc/ld.so.preload` missing, while
-`env -i /usr/bin/uname -r` and `env -u LSM_SYS_REL -u LSM_SYS_VER uname -r`
+`ENOENT`/`EACCES`. Measured in the same workspace: `cat`/`ls`/`stat`/`test`/
+`find`/`os.path.exists`/`os.listdir` all report `/etc/ld.so.preload` missing,
+while `env -i /usr/bin/uname -r` and `env -u LSM_SYS_REL -u LSM_SYS_VER uname -r`
 still return the masked `0.0.0-sandbox`. There is no trade-off.
 
 **Strings are no longer self-announcing.** `strings -a` over the shipped shim

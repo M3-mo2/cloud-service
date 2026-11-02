@@ -284,6 +284,31 @@ if grep -qF 'bypass.named_handle_masked' scripts/identity-check.sh; then
 else
   fail "identity-harness.bypass-assertions" "scripts/identity-check.sh has no dlsym-bypass assertions"
 fi
+# The runtime group (node/python3/bash/perl/git succeed under the mask) and the
+# canonicalization-no-echo group are direct guards for the two regressions fixed
+# after the hiding pass; they must stay or the regression can return silently.
+if grep -qF 'runtime.node' scripts/identity-check.sh; then
+  ok "identity-harness.runtime-group"
+else
+  fail "identity-harness.runtime-group" "scripts/identity-check.sh has no runtime group (node/python3/bash/perl)"
+fi
+if grep -qF 'invisible.canonicalization_no_echo' scripts/identity-check.sh; then
+  ok "identity-harness.canonicalization-group"
+else
+  fail "identity-harness.canonicalization-group" "scripts/identity-check.sh has no readlink/realpath no-echo assertions"
+fi
+# ADR 81 (canonicalization EACCES) and ADR 82 (rlimit_as != memory_mb) must be
+# recorded in DECISIONS.md, and the address-space model in code+docs+harness.
+if grep -qF 'ADR 81' docs/DECISIONS.md && grep -qF 'ADR 82' docs/DECISIONS.md; then
+  ok "identity-adrs.81-82"
+else
+  fail "identity-adrs.81-82" "docs/DECISIONS.md is missing ADR 81 (canonicalization) or ADR 82 (rlimit_as)"
+fi
+if grep -qF 'addressSpaceMB' internal/executor/nsjail.go && grep -qF 'readlinkat' internal/executor/hostmask/hostmask.c; then
+  ok "identity-fix.code"
+else
+  fail "identity-fix.code" "the rlimit_as headroom (addressSpaceMB) or the readlinkat interposer is missing"
+fi
 
 # The identity harness must be wired into the Makefile (the entry point an
 # operator uses) and be in .PHONY.
