@@ -71,12 +71,19 @@ const (
 
 // Workspace is a named, owned container of files and runs.
 type Workspace struct {
-	ID             string    `json:"id"`
-	OwnerID        string    `json:"owner_id"`
-	Name           string    `json:"name"`
-	CreatedAt      time.Time `json:"created_at"`
-	Status         string    `json:"status"`
-	Limits         Limits    `json:"limits"`
+	ID        string    `json:"id"`
+	OwnerID   string    `json:"owner_id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+	Status    string    `json:"status"`
+	Limits    Limits    `json:"limits"`
+	// Profile is the named, explicit-allowlist tool profile the workspace was
+	// created with (e.g. "python", "minimal"). It is chosen at creation and is
+	// immutable: the profile decides which tools exist in the workspace, so
+	// changing it mid-life would invalidate anything already installed or
+	// running. A record persisted before profiles existed has an empty value
+	// and is read as the server's configured default profile.
+	Profile        string    `json:"profile"`
 	LastActivityAt time.Time `json:"last_activity_at"`
 }
 

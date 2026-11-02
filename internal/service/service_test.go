@@ -30,7 +30,7 @@ func newTestService(t *testing.T) (*Service, *executor.FakeRunner) {
 
 func TestCreateWorkspaceLimits(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, err := svc.CreateWorkspace("user_a", "w", nil)
+	ws, err := svc.CreateWorkspace("user_a", "w", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestCreateWorkspaceLimits(t *testing.T) {
 		t.Fatalf("limits = %+v", ws.Limits)
 	}
 	over := &model.Limits{CPUCores: 4, MemoryMB: 128, AllowNet: true}
-	ws2, err := svc.CreateWorkspace("user_a", "w2", over)
+	ws2, err := svc.CreateWorkspace("user_a", "w2", "", over)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestCreateWorkspaceLimits(t *testing.T) {
 
 func TestOwnershipEnforced(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("owner", "w", nil)
+	ws, _ := svc.CreateWorkspace("owner", "w", "", nil)
 	if _, err := svc.GetOwnedWorkspace(ws.ID, "other"); err != model.ErrForbidden {
 		t.Fatalf("err = %v", err)
 	}
@@ -67,7 +67,7 @@ func TestOwnershipEnforced(t *testing.T) {
 
 func TestExecUsesConfiguredTimeout(t *testing.T) {
 	svc, fake := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	out, err := svc.Exec(ws, ExecSpec{Cmd: []string{"true"}, Timeout: 5})
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestExecUsesConfiguredTimeout(t *testing.T) {
 
 func TestExecHardCap(t *testing.T) {
 	svc, fake := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	_, _ = svc.Exec(ws, ExecSpec{Cmd: []string{"true"}, Timeout: 99999})
 	if fake.LastRequest().Timeout != execHardCapSec*time.Second {
 		t.Fatalf("timeout = %v", fake.LastRequest().Timeout)
@@ -92,7 +92,7 @@ func TestExecHardCap(t *testing.T) {
 func TestStartRunPrunesOldRuns(t *testing.T) {
 	svc, fake := newTestService(t)
 	fake.Stdout = ""
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	for i := 0; i < storage.Retention+3; i++ {
 		run, err := svc.StartRun(ws, StartRunSpec{Kind: model.RunKindCommand, Argv: []string{"x"}})
 		if err != nil {
@@ -114,7 +114,7 @@ func TestStartRunPrunesOldRuns(t *testing.T) {
 
 func TestWriteFileQuota(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", &model.Limits{DiskMB: 1})
+	ws, _ := svc.CreateWorkspace("u", "w", "", &model.Limits{DiskMB: 1})
 	// Write ~2MB to exceed a 1MB quota.
 	big := strings.Repeat("x", 2*1024*1024)
 	err := svc.WriteFile(ws, "/big", []byte(big), "text")
@@ -125,7 +125,7 @@ func TestWriteFileQuota(t *testing.T) {
 
 func TestFileLifecycle(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.Mkdir(ws, "/dir"); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestFileLifecycle(t *testing.T) {
 
 func TestStartRunFileRejectsUnsafePath(t *testing.T) {
 	svc, fake := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	_, err := svc.StartRun(ws, StartRunSpec{Kind: model.RunKindFile, File: "../../etc/passwd"})
 	if err == nil {
 		t.Fatal("expected unsafe path rejection")
@@ -168,7 +168,7 @@ func TestStartRunFileRejectsUnsafePath(t *testing.T) {
 func TestRecoverRuns(t *testing.T) {
 	svc, fake := newTestService(t)
 	fake.Delay = 50 * time.Millisecond
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	run, err := svc.StartRun(ws, StartRunSpec{Kind: model.RunKindCommand, Argv: []string{"x"}})
 	if err != nil {
 		t.Fatal(err)
@@ -199,7 +199,7 @@ func TestRecoverRuns(t *testing.T) {
 
 func TestListFilesPageBoundary(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.Mkdir(ws, "/d"); err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestListFilesPageBoundary(t *testing.T) {
 
 func TestReadFileRangeHonestHashAndCap(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.WriteFile(ws, "/f.txt", []byte("0123456789"), "text"); err != nil {
 		t.Fatal(err)
 	}
@@ -263,7 +263,7 @@ func TestReadFileRangeHonestHashAndCap(t *testing.T) {
 
 func TestWriteFileOverDirectory(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.Mkdir(ws, "/d"); err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +274,7 @@ func TestWriteFileOverDirectory(t *testing.T) {
 
 func TestStatFileAndOpenFile(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.WriteFile(ws, "/f.txt", []byte("hello"), "text"); err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +301,7 @@ func TestStatFileAndOpenFile(t *testing.T) {
 
 func TestReadFileLinesService(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.WriteFile(ws, "/f.txt", []byte("one\ntwo\nthree\n"), "text"); err != nil {
 		t.Fatal(err)
 	}

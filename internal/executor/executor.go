@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"sandboxd/internal/model"
+	"sandboxd/internal/profile"
 )
 
 // ErrNsjailUnavailable is returned when the nsjail binary cannot be found.
@@ -150,10 +151,16 @@ type Runner interface {
 	// enabled but not ready.
 	MaskStatus() (enabled bool, ready bool, reason string)
 	// OverlayStatus reports the provider-tool overlay truthfully: enabled is
-	// the configured switch, ready whether the curated /usr/local (and, when
-	// available, /etc/ssl/certs) trees are materialized, and note explains the
-	// state.
+	// the configured switch, ready whether the curated trees and the profile
+	// registry are materialized, and note explains the state.
 	OverlayStatus() (enabled bool, ready bool, note string)
+	// Profiles returns the loaded workspace-profile registry, or nil when it
+	// failed to load. The service uses it to validate a create request's
+	// profile name and to list the offered profiles in GET /v1/meta.
+	Profiles() *profile.Registry
+	// ProfileStatus reports whether the profile registry loaded and the
+	// configured default profile exists; note explains a failure.
+	ProfileStatus() (ready bool, note string)
 	// Run executes a request to completion.
 	Run(req Request) (Result, error)
 	// Start launches a long-lived interactive process (e.g. a PTY session) and

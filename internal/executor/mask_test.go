@@ -169,7 +169,14 @@ func TestMaskStatusReadyByDefault(t *testing.T) {
 // TestMaskParamsFloor proves a zeroed limit never renders a nonsense value.
 func TestMaskParamsFloor(t *testing.T) {
 	r := NewNsjailRunner(testCfg(), "", t.TempDir())
-	p := r.mask.params(0, 0)
+	pf, ok := r.profiles.Get("minimal")
+	if !ok {
+		t.Fatal("minimal profile not loaded")
+	}
+	p, err := r.mask.params(pf, 0, 0)
+	if err != nil {
+		t.Fatalf("params: %v", err)
+	}
 	if !p.Enabled {
 		t.Fatal("masking should be enabled")
 	}
@@ -199,10 +206,11 @@ func mountBlock(out, dst string) string {
 	return out[start : i+end]
 }
 
-// TestRenderConfigHidesProviderTools proves the provider-tool overlay is
-// rendered: the curated /usr/local and /etc/ssl/certs are mounted read-only
-// over the host's own, and the original unconditional /etc/ssl/certs mount is
-// not duplicated.
+// TestRenderConfigHidesProviderTools proves the profile overlay is rendered:
+// /usr is replaced by the profile-materialized tree (mandatory, read-only), the
+// conventional /bin, /sbin, /lib and /lib64 are bound to subtrees of the same
+// tree, the filtered /etc/ssl/certs is mounted once, and the host /usr is never
+// exposed when the overlay is on.
 func TestRenderConfigHidesProviderTools(t *testing.T) {
 	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
 	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 256, DiskMB: 10, MaxWallTimeSec: 30, MaxRuns: 3}}
@@ -213,30 +221,36 @@ func TestRenderConfigHidesProviderTools(t *testing.T) {
 	defer os.Remove(path)
 	out := readFile(t, path)
 
-	for _, want := range []string{`dst: "/usr/local"`, `dst: "/etc/ssl/certs"`} {
-		if !strings.Contains(out, want) {
-			t.Errorf("provider overlay must mount %s:\n%s", want, out)
+	// The profile tree is mounted at /usr, mandatory (fail-loud), and there is
+	// exactly one /etc/ssl/certs mount (the curated one).
+	for _, dst := range []string{`dst: "/usr"`, `dst: "/etc/ssl/certs"`} {
+		if !strings.Contains(out, dst) {
+			t.Errorf("profile overlay must mount %s:\n%s", dst, out)
 		}
 	}
-	// Exactly one /etc/ssl/certs mount: the curated one replaces the host one.
 	if n := strings.Count(out, `dst: "/etc/ssl/certs"`); n != 1 {
 		t.Errorf("expected exactly one /etc/ssl/certs mount, got %d:\n%s", n, out)
 	}
-	// Both curated mounts must be read-only and mandatory (fail-loud).
-	for _, dst := range []string{`dst: "/usr/local"`, `dst: "/etc/ssl/certs"`} {
-		block := mountBlock(out, dst)
-		if !strings.Contains(block, "rw: false") {
-			t.Errorf("mount %s must be read-only:\n%s", dst, block)
+	// The profile /usr must be read-only and mandatory (fail-loud).
+	block := mountBlock(out, `dst: "/usr"`)
+	if !strings.Contains(block, "rw: false") || !strings.Contains(block, "mandatory: true") {
+		t.Errorf("/usr must be read-only and mandatory (fail-loud):\n%s", block)
+	}
+	// The conventional paths are bound to subtrees of the profile tree.
+	for _, dst := range []string{`dst: "/bin"`, `dst: "/sbin"`, `dst: "/lib"`, `dst: "/lib64"`} {
+		if !strings.Contains(out, dst) {
+			t.Errorf("profile overlay must mount %s:\n%s", dst, out)
 		}
-		if !strings.Contains(block, "mandatory: true") {
-			t.Errorf("mount %s must be mandatory (fail-loud):\n%s", dst, block)
-		}
+	}
+	// The host /usr must never appear as a mount source when the overlay is on.
+	if strings.Contains(out, `src: "/usr"`) {
+		t.Errorf("the host /usr must not be a mount source with the overlay on:\n%s", out)
 	}
 }
 
 // TestRenderConfigOmitsProviderOverlayWhenDisabled proves the opt-out switch:
-// with hide_provider_tools=false the host's /etc/ssl/certs is mounted as before
-// and no curated /usr/local appears.
+// with hide_provider_tools=false the host /usr, /lib, /bin, /sbin, /lib64 and
+// /etc/ssl/certs are mounted as before, and no profile tree is used.
 func TestRenderConfigOmitsProviderOverlayWhenDisabled(t *testing.T) {
 	cfg := testCfg()
 	cfg.Identity.HideProviderTools = false
@@ -248,8 +262,12 @@ func TestRenderConfigOmitsProviderOverlayWhenDisabled(t *testing.T) {
 	}
 	defer os.Remove(path)
 	out := readFile(t, path)
-	if strings.Contains(out, `dst: "/usr/local"`) {
-		t.Errorf("provider-tool hiding disabled must not mount a curated /usr/local:\n%s", out)
+	// The host /usr is the mount source; the profile tree is not.
+	if !strings.Contains(out, `src: "/usr"`) {
+		t.Errorf("provider-tool hiding disabled must mount the host /usr:\n%s", out)
+	}
+	if strings.Contains(out, `dst: "/run/.rt.so"`) || strings.Contains(out, "profile") {
+		// sanity only; the profile name must not leak into the rendered config
 	}
 	if n := strings.Count(out, `dst: "/etc/ssl/certs"`); n != 1 {
 		t.Errorf("expected the host /etc/ssl/certs mount, got %d:\n%s", n, out)

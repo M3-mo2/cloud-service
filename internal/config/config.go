@@ -22,7 +22,27 @@ type Config struct {
 	Network   NetworkConfig  `koanf:"network"`
 	Tunnels   TunnelsConfig  `koanf:"tunnels"`
 	Identity  IdentityConfig `koanf:"identity"`
+	Profiles  ProfilesConfig `koanf:"profiles"`
 	Keys      []KeyConfig    `koanf:"keys"`
+}
+
+// ProfilesConfig controls the named, explicit-allowlist workspace profiles.
+//
+// A profile is a reviewable list of the tools (and the data/library trees those
+// tools need) a workspace gets. Creating a workspace names the profile it
+// wants; the default profile is used when it names none. The profiles
+// themselves live in data files (configs/profiles/*.yaml, embedded in the
+// binary) plus an optional operator directory, so adding a language means
+// adding a file, never editing the engine. See internal/profile and
+// docs/DECISIONS.md.
+type ProfilesConfig struct {
+	// Dir is an optional operator directory of additional/override profile YAML
+	// files. Each file's stem must equal its `name`; a file overlays a
+	// same-named built-in or adds a new profile. Empty uses only the built-ins.
+	Dir string `koanf:"dir"`
+	// Default is the profile a workspace gets when its create request names
+	// none. It must name a loaded profile. Default "python".
+	Default string `koanf:"default"`
 }
 
 // Default host-identity mask values. The kernel strings are deliberately
@@ -72,41 +92,23 @@ type IdentityConfig struct {
 	KernelRelease string `koanf:"kernel_release"`
 	// KernelVersion is the uname.version value a workspace is told.
 	KernelVersion string `koanf:"kernel_version"`
-	// HideProviderTools hides the hosting platform's own tooling and vendor
-	// material from a workspace. The sandbox mounts /usr so a workload has a
-	// normal toolchain, but /usr/local also carries the platform's control
-	// binaries (zcp, zsc, yq), the vendor CA sources and the Go toolchain, and
-	// their embedded vendor strings name the provider. When this is on (the
-	// default) /usr/local is overlain with a curated directory that contains
-	// only what a workspace may use, and the system TLS trust store is overlain
-	// with one filtered of the provider's certificates. Default true; the
-	// legitimate toolchain (python3, node, bash, perl, git) lives in /usr/bin
-	// and is unaffected.
+	// HideProviderTools selects the workspace PROFILE mechanism: when true (the
+	// default) a workspace's /usr is replaced by a profile-materialized tree
+	// that contains ONLY the tools the profile names (an explicit allowlist),
+	// plus the engine-provided base, the shared libraries and the loaders. When
+	// false the workspace sees the host /usr unchanged (a diagnostic state that
+	// deliberately exposes the platform's tooling).
+	//
+	// The engine/platform name+content filter still applies on top of a
+	// profile: a profile entry whose name or content names the engine or the
+	// platform is refused (fail loud), never silently shipped.
 	HideProviderTools bool `koanf:"hide_provider_tools"`
-	// ToolsDir is an optional operator-provided directory mounted read-only at
-	// /usr/local inside a workspace when HideProviderTools is on. It should
-	// contain ONLY the tools a workspace may legitimately use (anything the
-	// image needs to expose outside /usr/bin). Empty (the default) mounts an
-	// empty curated directory, which is the safe choice: the workspace keeps
-	// the whole of /usr/bin and sees no host /usr/local material.
-	ToolsDir string `koanf:"tools_dir"`
-	// ToolsBinDir is the host directory curated into the workspace's /usr/bin.
-	// Empty (the default) uses /usr/bin. It is overridable so a unit test (or an
-	// unusual image) can point at a small fixture instead of the real host tree.
-	ToolsBinDir string `koanf:"tools_bin_dir"`
-	// ToolsSbinDir is the host directory curated into the workspace's /usr/sbin
-	// and /sbin. Empty (the default) uses /usr/sbin.
-	ToolsSbinDir string `koanf:"tools_sbin_dir"`
-	// ToolsDocDir is the host directory curated into the workspace's
-	// /usr/share/doc. Empty (the default) uses /usr/share/doc.
-	ToolsDocDir string `koanf:"tools_doc_dir"`
-	// ToolsManDir is the host directory curated into the workspace's
-	// /usr/share/man. Empty (the default) uses /usr/share/man.
-	ToolsManDir string `koanf:"tools_man_dir"`
-	// ToolsLibDir is the host directory curated into the workspace's /usr/lib
-	// and /lib (the runtime libraries, plus the operator's own tooling under
-	// /usr/lib/{code-server,node_modules}). Empty (the default) uses /usr/lib.
-	ToolsLibDir string `koanf:"tools_lib_dir"`
+	// ToolsRoot is the host filesystem root the curated tool trees are read
+	// from. Empty (the normal case) reads the real host (/usr/bin, /usr/lib,
+	// ...). It is overridable so a unit test can point materialization at a
+	// small fixture tree instead of the real host, exactly as the previous
+	// tools_*_dir overrides did.
+	ToolsRoot string `koanf:"tools_root"`
 }
 
 // NetworkConfig controls the per-workspace egress fabric. Egress is delivered by
@@ -465,6 +467,10 @@ func Default() Config {
 			KernelRelease:     DefaultMaskKernelRelease,
 			KernelVersion:     DefaultMaskKernelVersion,
 		},
+		Profiles: ProfilesConfig{
+			Dir:     "",
+			Default: "python",
+		},
 		Keys: []KeyConfig{},
 	}
 }
@@ -639,6 +645,9 @@ func (c *Config) applyDefaults() {
 	if c.Identity.KernelVersion == "" {
 		c.Identity.KernelVersion = d.Identity.KernelVersion
 	}
+	if c.Profiles.Default == "" {
+		c.Profiles.Default = d.Profiles.Default
+	}
 }
 
 func rawDefaults() []byte {
@@ -710,8 +719,11 @@ tunnels:
 identity:
   enabled: true
   hide_provider_tools: true
-  tools_dir: ""
+  tools_root: ""
   kernel_release: "0.0.0-sandbox"
   kernel_version: "#1 SMP"
+profiles:
+  dir: ""
+  default: "python"
 `)
 }

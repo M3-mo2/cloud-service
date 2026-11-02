@@ -145,6 +145,10 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	// so an operator sees a deploy that would expose the platform's tooling
 	// rather than a silent one.
 	overlayEnabled, overlayReady, overlayNote := s.svc.Runner().OverlayStatus()
+	// The profile registry is reported truthfully too: when it failed to load
+	// (or the configured default profile is missing) the service cannot give a
+	// workspace the allowlist it was promised, so readiness is not claimed.
+	profileReady, profileNote := s.svc.Runner().ProfileStatus()
 	status := http.StatusOK
 	if !dataOK || !nsjailOK || !cgroupsOK {
 		status = http.StatusServiceUnavailable
@@ -159,6 +163,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusServiceUnavailable
 	}
 	if overlayEnabled && !overlayReady {
+		status = http.StatusServiceUnavailable
+	}
+	if !profileReady {
 		status = http.StatusServiceUnavailable
 	}
 	body := map[string]any{
@@ -183,6 +190,10 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 			"enabled": overlayEnabled,
 			"ready":   overlayReady,
 		},
+		"profiles": map[string]any{
+			"ready":   profileReady,
+			"default": s.cfg.Profiles.Default,
+		},
 	}
 	if netReason != "" {
 		body["network"].(map[string]any)["reason"] = netReason
@@ -195,6 +206,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	}
 	if overlayNote != "" {
 		body["provider_tools_hidden"].(map[string]any)["reason"] = overlayNote
+	}
+	if profileNote != "" {
+		body["profiles"].(map[string]any)["reason"] = profileNote
 	}
 	writeJSON(w, status, body)
 }
@@ -240,16 +254,30 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	overlayCap := map[string]any{
 		"enabled":   overlayEnabled,
 		"ready":     overlayReady,
-		"mechanism": "curated read-only overlays for /usr/{bin,sbin,lib,local}, /lib, /usr/share/{doc,man} and /etc/{passwd,group,ssl/certs}",
-		"limits":    "drops engine/platform-named entries and the provider account; it keeps generic third-party tooling and cannot change the provider the egress address is registered to",
+		"mechanism": "profile-materialized read-only /usr (also bound at /bin, /sbin, /lib, /lib64), plus filtered /etc/{passwd,group,ssl/certs}",
+		"limits":    "a workspace sees only the tools its profile names (an explicit allowlist) plus engine base commands, shared libraries and loaders; a profile entry naming the engine/platform is refused (fail loud), and it cannot change the provider the egress address is registered to",
 	}
 	if overlayNote != "" {
 		overlayCap["reason"] = overlayNote
+	}
+	// The workspace profiles a client can choose from. Each entry lists the
+	// commands and attached data/library paths, so a client can pick knowingly.
+	profileDefault, profiles := s.svc.ProfileCatalogue()
+	profileCap := map[string]any{
+		"default":  profileDefault,
+		"profiles": profiles,
+	}
+	if pr, note := s.svc.Runner().ProfileStatus(); !pr {
+		profileCap["ready"] = false
+		profileCap["reason"] = note
+	} else {
+		profileCap["ready"] = true
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":     model.Version,
 		"api_version": model.APIVersion,
 		"runtimes":    []string{"python3"},
+		"profiles":    profileCap,
 		"limits_defaults": map[string]any{
 			"cpu_cores":            l.CPUCores,
 			"memory_mb":            l.MemoryMB,

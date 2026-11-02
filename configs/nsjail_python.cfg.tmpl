@@ -29,28 +29,31 @@ use_cgroupv2: true
 # Do not mount /proc: it leaks host process information.
 mount_proc: false
 
-# Mount the Python runtime and system libraries read-only, then the workspace
-# writable at /workspace.
+# The toolchain. With a workspace profile (the default) the ENTIRE /usr is a
+# profile-materialized tree that contains ONLY the commands the profile names
+# (an explicit allowlist) plus the engine base, the shared libraries and the
+# loaders. Un-allowlisted host material (/usr/include, /usr/libexec,
+# /usr/share/perl, apt, the gcc chain, the platform's /usr/local tooling) simply
+# does not exist inside the workspace, so it cannot leak through an un-overlaid
+# directory. /bin, /sbin, /lib and /lib64 are bound to subtrees of the same
+# curated tree, so a tenant sees one consistent allowlisted toolchain at every
+# conventional path. mandatory:true is the fail-loud contract: if the curated
+# tree cannot be mounted the run aborts rather than expose the host /usr.
+#
+# With provider-tool hiding OFF (a diagnostic state) the host /usr is mounted
+# unchanged.
 mount {
-  src: "/usr"
-  dst: "/usr"
+  src: "{{ if .OverlayEnabled }}{{ .UsrRoot }}{{ else }}/usr{{ end }}"
+  dst: "{{ .UsrJail }}"
   is_bind: true
   rw: false
+  {{- if .OverlayEnabled }} mandatory: true {{- end }}
 }
 
 {{- if .OverlayEnabled }}
 
-# Curated tool directories: the host /usr is mounted so a workload has a normal
-# toolchain, but it also carries the ENGINE's own runner (nsjail), its sandbox
-# helpers (slirp4netns, unshare, nsenter, setpriv, runcon, chroot) and any
-# engine/platform-named file. The curated /usr/bin and /usr/sbin replace the
-# host's with copies that drop exactly those entries and keep every other tool,
-# so a workspace keeps its toolchain with no engine name reachable. The engine
-# provides no tool named `nsjail` legibly, so no legitimate workload needs one.
-# mandatory:true is the fail-loud contract: if a curated tree cannot be mounted
-# the run aborts rather than exposing the host directory.
 mount {
-  src: "{{ .BinDir }}"
+  src: "{{ .UsrRoot }}/bin"
   dst: "{{ .BinJail }}"
   is_bind: true
   rw: false
@@ -58,62 +61,45 @@ mount {
 }
 
 mount {
-  src: "{{ .SbinDir }}"
+  src: "{{ .UsrRoot }}/sbin"
   dst: "{{ .SbinJail }}"
   is_bind: true
   rw: false
   mandatory: true
 }
 
-# /usr/lib is curated whole: it carries the runtime libraries a workload uses,
-# the host's own tooling (/usr/lib/code-server, /usr/lib/node_modules) and the
-# provider-named systemd units (/usr/lib/systemd/system/zerops-*.service). One
-# curated tree, mounted at /usr/lib and (after the /lib bind below) at /lib,
-# closes all of it. mandatory:true is the fail-loud contract.
 mount {
-  src: "{{ .LibDir }}"
+  src: "{{ .UsrRoot }}/lib"
   dst: "{{ .LibJail }}"
   is_bind: true
   rw: false
   mandatory: true
 }
 
-# /usr/share/doc and /usr/share/man carry a `slirp4netns` page each; the curated
-# copies drop it and any provider/engine-named entry, keeping the rest.
 mount {
-  src: "{{ .DocDir }}"
-  dst: "{{ .DocJail }}"
+  src: "{{ .UsrRoot }}/lib64"
+  dst: "{{ .Lib64Jail }}"
   is_bind: true
   rw: false
   mandatory: true
 }
 
+# Profile-attached non-/usr paths (e.g. /etc/ssh/ssh_config, an openssl config).
+# Each is a tiny read-only mandatory bind; mandatory:true is fail-loud because a
+# missing one would leave the tool half-working.
+{{- range .ExtraMounts }}
 mount {
-  src: "{{ .ManDir }}"
-  dst: "{{ .ManJail }}"
+  src: "{{ .Host }}"
+  dst: "{{ .Jail }}"
   is_bind: true
   rw: false
   mandatory: true
 }
+{{- end }}
 
-# Provider-identity overlays: the workspace sees a curated /usr/local instead of
-# the host's, and a curated /etc/ssl/certs. The host's /usr/local carries the
-# platform's own control binaries (zcp, zsc, yq), the vendor CA sources and the
-# vendor-named Go toolchain; all of those name the provider in their embedded
-# strings. The host's TLS trust store names the provider in its certificate
-# subjects. The curated trees keep the legitimate toolchain and working TLS
-# (python3, node, bash, perl, git all live in /usr/bin, unaffected) with no
-# platform material. mandatory:true is the fail-loud contract: if a curated tree
-# cannot be mounted the run aborts rather than exposing the host directory. The
-# /etc/ssl/certs overlay is omitted when the host trust store could not be read;
-# the workspace then has no /etc/ssl/certs at all (a closed outcome).
-mount {
-  src: "{{ .ToolsDir }}"
-  dst: "/usr/local"
-  is_bind: true
-  rw: false
-  mandatory: true
-}
+# The curated /etc/ssl/certs trust store, filtered of provider certificates.
+# Omitted when the host trust store could not be read; the workspace then has no
+# /etc/ssl/certs at all (a closed outcome).
 {{- if .CertsDir }}
 mount {
   src: "{{ .CertsDir }}"
@@ -123,14 +109,11 @@ mount {
   mandatory: true
 }
 {{- end }}
-{{- end }}
+{{- else }}
 
-# The sandbox's /lib is its own directory (the host's /lib -> usr/lib symlink is
-# not reproduced), so the curated /usr/lib would NOT cover it. Point the /lib
-# bind at the same curated tree so the tenant sees one consistent, engine-free
-# library tree at both paths.
+# Provider-tool hiding OFF: mount the host libraries and toolchain unchanged.
 mount {
-  src: "{{ if .OverlayEnabled }}{{ .LibDir }}{{ else }}/lib{{ end }}"
+  src: "/lib"
   dst: "/lib"
   is_bind: true
   rw: false
@@ -146,32 +129,21 @@ mount {
 }
 
 mount {
-  src: "{{ if .OverlayEnabled }}{{ .BinDir }}{{ else }}/bin{{ end }}"
+  src: "/bin"
   dst: "/bin"
   is_bind: true
   rw: false
+  mandatory: false
 }
 
 mount {
-  src: "{{ if .OverlayEnabled }}{{ .SbinDir }}{{ else }}/sbin{{ end }}"
+  src: "/sbin"
   dst: "/sbin"
   is_bind: true
   rw: false
   mandatory: false
 }
 
-mount {
-  src: "/etc/alternatives"
-  dst: "/etc/alternatives"
-  is_bind: true
-  rw: false
-  mandatory: false
-}
-
-# The system TLS trust store. Mounted only when the provider overlay is off:
-# with the overlay on, the curated tree above replaces it (and this mount would
-# otherwise duplicate the destination).
-{{- if not .OverlayEnabled }}
 mount {
   src: "/etc/ssl/certs"
   dst: "/etc/ssl/certs"
@@ -180,6 +152,14 @@ mount {
   mandatory: false
 }
 {{- end }}
+
+mount {
+  src: "/etc/alternatives"
+  dst: "/etc/alternatives"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
 
 mount {
   src: "/etc/ld.so.cache"

@@ -1,0 +1,172 @@
+# python — the operator's Python workspace profile.
+#
+# A reviewable, explicit ALLOWLIST. A workspace created with this profile gets
+# exactly the commands below (plus the engine base) and the data/library trees
+# listed under `paths`. It does NOT get apt, add-apt-repository, the gcc/binutils
+# compiler chain, or any other host command that is not named here — even
+# though those exist on the host. That is the whole point of a profile.
+#
+# Every command was measured present on this host and is EXECUTED in a real
+# workspace by scripts/identity-check.sh (python -c, python3 -c, pip --version,
+# a stdlib import), never merely checked for existence.
+name: python
+description: "Python 3.12 with pip/venv, plus Node.js, Perl, git and common shell tools."
+languages:
+  - python
+  - node
+provides:
+  - python
+  - pip
+  - node
+  - git
+  - coreutils
+  - shell
+
+# commands are resolved on the host PATH and exposed under the same name. A
+# same-directory symlink (python3 -> python3.12) is copied as its real file; a
+# symlink elsewhere (npm -> /usr/lib/node_modules/npm/bin/npm-cli.js) is
+# reproduced as a symlink and its target tree is attached under `paths`.
+commands:
+  # --- shells and coreutils (sessions default to /bin/sh) ------------------
+  - sh
+  - bash
+  - ls
+  - cat
+  - cp
+  - mv
+  - rm
+  - mkdir
+  - rmdir
+  - ln
+  - chmod
+  - chown
+  - touch
+  - echo
+  - printf
+  - pwd
+  - head
+  - tail
+  - wc
+  - sort
+  - uniq
+  - tr
+  - cut
+  - tee
+  - seq
+  - comm
+  - cksum
+  - dd
+  - df
+  - du
+  - stat
+  - sync
+  - sleep
+  - true
+  - false
+  - test
+  - id
+  - groups
+  - whoami
+  - date
+  - readlink
+  - realpath
+  - mktemp
+  - dirname
+  - basename
+  - env
+  - printenv
+  - uname
+  - nproc
+  - getconf
+  - hostname
+  - md5sum
+  - sha256sum
+  - grep
+  - sed
+  - mawk
+  - find
+  - xargs
+  - diff
+  - file
+  - od
+  - xxd
+  - which
+  - tar
+  - gzip
+  - gunzip
+  - unzip
+  - less
+  - nano
+  - vim
+  - nohup
+  - install
+  - tree
+  - jq
+  - curl
+  - wget
+  - openssl
+  - ssh
+  - scp
+  # screen/tmux are included because the operator asked for them; see `notes`
+  # for where a PTY-based tool does and does not work.
+  - screen
+  - tmux
+  # --- python --------------------------------------------------------------
+  - python3
+  - pip
+  - pip3
+  - pip3.12
+  # --- node ----------------------------------------------------------------
+  - node
+  - npm
+  - npx
+  # --- perl and git --------------------------------------------------------
+  - perl
+  - git
+  - make
+
+# aliases create extra names as symlinks to a listed command. `python` is the
+# reason this schema exists: the host has only `python3`, but the operator's
+# users type `python app.py`.
+aliases:
+  python: python3
+  awk: mawk
+  vi: vim
+
+# paths attach the data/library trees a tool needs. A tool is not just its
+# binary: without /usr/lib/python3.12, `import json` fails; without
+# /usr/lib/node_modules/npm, npm's relative require() fails; without
+# /usr/lib/git-core, git's subcommands are missing; without the perl trees,
+# perl cannot load its modules.
+paths:
+  # python
+  - /usr/lib/python3.12
+  - /usr/lib/python3
+  - /usr/share/terminfo
+  # node / npm
+  - /usr/lib/node_modules/npm
+  # perl
+  - /usr/lib/x86_64-linux-gnu/perl
+  - /usr/lib/x86_64-linux-gnu/perl-base
+  - /usr/share/perl
+  - /usr/share/perl5
+  # git
+  - /usr/lib/git-core
+  - /usr/share/git-core
+  # vim runtime (syntax, ftplugins)
+  - /usr/share/vim
+  # ssh client config
+  - /etc/ssh/ssh_config
+  # openssl config
+  - /etc/ssl/openssl.cnf
+
+notes: |
+  `screen` and `tmux` work ONLY in a terminal SESSION, never in one-shot
+  exec/run: a session binds the host /dev/pts and /dev/ptmx, while an exec gets
+  only null/urandom/zero, so openpty() fails with ENOENT and any PTY tool fails
+  regardless of the profile. This is documented, not a silent failure.
+
+  `python` is provided as an alias of `python3` because only the `python3` name
+  exists on the host. The compiler chain (gcc, g++, cc), apt,
+  add-apt-repository, gdb, cmake and the other host tooling are deliberately NOT
+  in this profile.

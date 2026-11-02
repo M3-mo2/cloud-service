@@ -5,12 +5,18 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"sandboxd/configs"
+	"sandboxd/internal/profile"
 )
 
 // FakeRunner is an in-memory Runner for tests. It does not invoke nsjail.
 type FakeRunner struct {
 	AvailableFlag bool
 	CgroupsFlag   bool
+	// ProfileRegistry, when set, overrides the profile catalogue returned by
+	// Profiles(). When nil the embedded built-ins are used.
+	ProfileRegistry *profile.Registry
 	// MaskEnabledFlag / MaskReadyFlag / MaskReasonText configure MaskStatus.
 	// Enabled defaults false in the fake so readiness tests are unaffected
 	// unless they opt in.
@@ -150,6 +156,28 @@ func (f *FakeRunner) MaskStatus() (bool, bool, string) {
 // OverlayStatus reports the configured provider-tool overlay capability.
 func (f *FakeRunner) OverlayStatus() (bool, bool, string) {
 	return f.OverlayEnabledFlag, f.OverlayReadyFlag, f.OverlayNoteText
+}
+
+// Profiles returns the fake's profile registry. It defaults to the real
+// embedded built-ins (nil error) so profile-aware API tests exercise the same
+// catalogue production uses, unless a test overrides ProfileRegistry.
+func (f *FakeRunner) Profiles() *profile.Registry {
+	if f.ProfileRegistry != nil {
+		return f.ProfileRegistry
+	}
+	reg, err := profile.NewRegistry(configs.BuiltinProfiles(), "")
+	if err != nil {
+		return nil
+	}
+	return reg
+}
+
+// ProfileStatus reports whether the profile registry loaded.
+func (f *FakeRunner) ProfileStatus() (bool, string) {
+	if f.ProfileRegistry == nil && f.Profiles() == nil {
+		return false, "profile registry unavailable"
+	}
+	return true, ""
 }
 
 // LastRequest returns the most recent request.

@@ -1,0 +1,107 @@
+# minimal — a deliberately small workspace profile.
+#
+# This profile exists to PROVE the allowlist mechanism: a workspace created with
+# it can run a POSIX shell and the core file/text utilities, and nothing else.
+# Everything a tool needs (its shared libraries, the ELF loader, terminfo) is
+# added automatically by the engine as the mandatory base; the lists below are
+# the complete, reviewable set of TOOLS the workspace gets.
+#
+# What it does NOT provide (and a test asserts is absent): python3, node, perl,
+# git, gcc/cc, make, apt/add-apt-repository, curl, wget, ssh and every other
+# command not named below.
+name: minimal
+description: "POSIX shell, coreutils and the common text/file utilities only. No language runtime."
+languages: []
+# provides is informational (rendered in GET /v1/meta); the authoritative set is
+# `commands` + `aliases`.
+provides:
+  - sh
+  - bash
+  - coreutils
+  - findutils
+  - grep
+  - sed
+
+# commands: names resolved on the host PATH to their real binary and exposed at
+# the same name in the workspace's /usr/bin. Only these, plus `aliases`, are
+# placed in /usr/bin.
+commands:
+  - sh
+  - bash
+  - ls
+  - cat
+  - cp
+  - mv
+  - rm
+  - mkdir
+  - rmdir
+  - ln
+  - chmod
+  - chown
+  - touch
+  - echo
+  - printf
+  - pwd
+  - head
+  - tail
+  - wc
+  - sort
+  - uniq
+  - tr
+  - cut
+  - tee
+  - seq
+  - comm
+  - cksum
+  - dd
+  - df
+  - du
+  - stat
+  - sync
+  - sleep
+  - true
+  - false
+  - test
+  - id
+  - groups
+  - whoami
+  - date
+  - readlink
+  - realpath
+  - mktemp
+  - dirname
+  - basename
+  - env
+  - printenv
+  - uname
+  - nproc
+  - getconf
+  - hostname
+  - md5sum
+  - sha256sum
+  - grep
+  - sed
+  - mawk
+  - find
+  - xargs
+  - tar
+  - gzip
+  - gunzip
+  - which
+  - less
+  - nohup
+  - install
+
+# aliases: extra names created as symlinks inside /usr/bin, pointing at a
+# command that IS listed above (or supplied by the engine). They never pull in a
+# new host binary.
+aliases:
+  awk: mawk
+
+# paths: additional host paths (files, directories or whole trees) reproduced
+# under the SAME path in the workspace. The engine provides the shared-library
+# base, the ELF loader and terminfo automatically, so this list is usually empty.
+paths: []
+
+notes: |
+  shell-only profile. Use it when a workspace only needs to manipulate files.

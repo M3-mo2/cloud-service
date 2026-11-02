@@ -34,7 +34,7 @@ func apiStatus(err error) int { return model.AsError(err).Status }
 
 func TestStartRunFileInterpreterByExtension(t *testing.T) {
 	svc, fake := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	for _, tc := range []struct {
 		file    string
 		interp  string
@@ -66,7 +66,7 @@ func TestStartRunFileInterpreterByExtension(t *testing.T) {
 
 func TestStartRunFileUnsupportedExtensionRejected(t *testing.T) {
 	svc, fake := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.WriteFile(ws, "/x.txt", []byte("x"), "text"); err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestStartRunFileUnsupportedExtensionRejected(t *testing.T) {
 
 func TestStartRunExplicitInterpreterOverride(t *testing.T) {
 	svc, fake := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.WriteFile(ws, "/data.txt", []byte("print(1)\n"), "text"); err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestStartRunExplicitInterpreterOverride(t *testing.T) {
 
 func TestStartRunCwdValidation(t *testing.T) {
 	svc, fake := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.WriteFile(ws, "/f.py", []byte("print(1)\n"), "text"); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestStartRunCwdValidation(t *testing.T) {
 
 func TestStartRunArgvAndFileConflict(t *testing.T) {
 	svc, fake := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.WriteFile(ws, "/f.py", []byte("print(1)\n"), "text"); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestStartRunArgvAndFileConflict(t *testing.T) {
 
 func TestStartRunUnlimitedForbiddenByServerDefault(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.WriteFile(ws, "/f.py", []byte("print(1)\n"), "text"); err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestStartRunUnlimitedForbiddenByServerDefault(t *testing.T) {
 func TestStartRunUnlimitedForbiddenByWorkspace(t *testing.T) {
 	svc, _ := newTestServiceCfg(t, func(c *config.Config) { c.MaxLimits.AllowUnlimitedRuns = true })
 	// Workspace did not opt in (default false).
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.WriteFile(ws, "/f.py", []byte("print(1)\n"), "text"); err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestStartRunUnlimitedForbiddenByWorkspace(t *testing.T) {
 
 func TestStartRunUnlimitedAllowedRecordsHonestly(t *testing.T) {
 	svc, fake := newTestServiceCfg(t, func(c *config.Config) { c.MaxLimits.AllowUnlimitedRuns = true })
-	ws, err := svc.CreateWorkspace("u", "w", &model.Limits{AllowUnlimitedRuns: true})
+	ws, err := svc.CreateWorkspace("u", "w", "", &model.Limits{AllowUnlimitedRuns: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestStartRunUnlimitedAllowedRecordsHonestly(t *testing.T) {
 
 func TestCreateWorkspaceUnlimitedAboveServerMaxima(t *testing.T) {
 	svc, _ := newTestService(t) // server max false
-	_, err := svc.CreateWorkspace("u", "w", &model.Limits{AllowUnlimitedRuns: true})
+	_, err := svc.CreateWorkspace("u", "w", "", &model.Limits{AllowUnlimitedRuns: true})
 	if err == nil || apiStatus(err) != 422 {
 		t.Fatalf("err = %v, want 422", err)
 	}

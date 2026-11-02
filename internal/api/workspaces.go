@@ -47,7 +47,7 @@ func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeErrorWithCode(w, err)
 		return
 	}
-	ws, err := s.svc.CreateWorkspace(pid, req.Name, req.toLimits())
+	ws, err := s.svc.CreateWorkspace(pid, req.Name, req.Profile, req.toLimits())
 	if err != nil {
 		writeErrorWithCode(w, err)
 		return

@@ -74,8 +74,19 @@ func (s *Service) WorkspaceFs(w *model.Workspace) (*workspace.Fs, error) {
 	return fs, nil
 }
 
-// CreateWorkspace creates a workspace owned by principalID.
-func (s *Service) CreateWorkspace(principalID, name string, limits *model.Limits) (*model.Workspace, error) {
+// CreateWorkspace creates a workspace owned by principalID under the named
+// profile. An empty profile selects the server's configured default.
+//
+// The profile is validated against the loaded registry: an unknown name is
+// rejected with 422 unknown_profile (never silently replaced by the default,
+// which would give the caller a different toolchain than they asked for). The
+// resolved name is stamped on the record so GET /v1/workspaces/{id} says which
+// profile the workspace got, including when the default was applied.
+func (s *Service) CreateWorkspace(principalID, name, profileName string, limits *model.Limits) (*model.Workspace, error) {
+	profileName, err := s.resolveProfile(profileName)
+	if err != nil {
+		return nil, err
+	}
 	lim := s.defaultLimits()
 	if limits != nil {
 		lim = applyLimits(lim, *limits)
@@ -91,12 +102,67 @@ func (s *Service) CreateWorkspace(principalID, name string, limits *model.Limits
 		CreatedAt:      now,
 		Status:         model.WorkspaceActive,
 		Limits:         lim,
+		Profile:        profileName,
 		LastActivityAt: now,
 	}
 	if err := s.store.CreateWorkspace(w); err != nil {
 		return nil, err
 	}
 	return w, nil
+}
+
+// resolveProfile validates a requested profile name. Empty selects the
+// server default (cfg.Profiles.Default), which must itself exist. An unknown
+// name (including a default that is not loaded) is 422 unknown_profile.
+func (s *Service) resolveProfile(name string) (string, error) {
+	reg := s.runner.Profiles()
+	requested := name
+	if requested == "" {
+		requested = s.cfg.Profiles.Default
+	}
+	if reg == nil || !reg.Has(requested) {
+		return "", model.Wrap(422, model.CodeUnknownProfile,
+			"unknown profile "+requested,
+			map[string]string{"profile": requested, "field": "profile"})
+	}
+	return requested, nil
+}
+
+// ResolveProfileForRead returns the profile a stored workspace runs under:
+// its recorded profile, or the server default for a record that predates the
+// profile field. It never errors for an empty stored value.
+func (s *Service) ResolveProfileForRead(w *model.Workspace) string {
+	if w != nil && w.Profile != "" {
+		return w.Profile
+	}
+	return s.cfg.Profiles.Default
+}
+
+// ProfileCatalogue describes the offered profiles for GET /v1/meta.
+func (s *Service) ProfileCatalogue() (defaultName string, profiles []map[string]any) {
+	reg := s.runner.Profiles()
+	if reg == nil {
+		return s.cfg.Profiles.Default, nil
+	}
+	for _, p := range reg.All() {
+		profiles = append(profiles, map[string]any{
+			"name":        p.Name,
+			"description": p.Description,
+			"languages":   emptyIfNil(p.Languages),
+			"provides":    emptyIfNil(p.Provides),
+			"commands":    p.CommandNames(),
+			"paths":       emptyIfNil(p.Paths),
+			"notes":       p.Notes,
+		})
+	}
+	return s.cfg.Profiles.Default, profiles
+}
+
+func emptyIfNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 // checkMaxima rejects a limits value that exceeds any server-level maximum.
@@ -198,12 +264,27 @@ func (s *Service) GetOwnedWorkspace(id, principalID string) (*model.Workspace, e
 	if w.OwnerID != principalID {
 		return nil, model.ErrForbidden
 	}
+	// A record persisted before profiles existed has no profile; report the
+	// effective one (the server default), so every response says which profile
+	// the workspace actually runs under.
+	if w.Profile == "" {
+		w.Profile = s.cfg.Profiles.Default
+	}
 	return w, nil
 }
 
 // ListWorkspaces lists workspaces owned by principalID.
 func (s *Service) ListWorkspaces(principalID string) ([]*model.Workspace, error) {
-	return s.store.ListWorkspaces(principalID)
+	list, err := s.store.ListWorkspaces(principalID)
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range list {
+		if w.Profile == "" {
+			w.Profile = s.cfg.Profiles.Default
+		}
+	}
+	return list, nil
 }
 
 // DeleteWorkspace stops all runs and sessions and removes the workspace tree.

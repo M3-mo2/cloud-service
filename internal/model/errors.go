@@ -13,6 +13,12 @@ const (
 	CodeConflict        = "conflict"
 	CodeValidation      = "validation"
 	CodeUnprocessable   = "unprocessable"
+	// CodeUnknownProfile is returned (HTTP 422) when a workspace create names a
+	// profile that is not configured. It is distinct from a general
+	// validation/unprocessable error: the field parsed and the name is
+	// well-formed, but it is not one of the offered profiles. The message and
+	// details name the request's value so a client can correct it.
+	CodeUnknownProfile = "unknown_profile"
 	CodeNotDirectory    = "not_directory"
 	CodePayloadTooLarge = "payload_too_large"
 	CodeTimeout         = "timeout"

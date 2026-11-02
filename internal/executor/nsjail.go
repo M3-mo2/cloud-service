@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,8 @@ import (
 
 	"sandboxd/configs"
 	"sandboxd/internal/config"
+	"sandboxd/internal/model"
+	"sandboxd/internal/profile"
 )
 
 // NsjailRunner executes commands under nsjail.
@@ -27,6 +30,12 @@ type NsjailRunner struct {
 	tmpDir   string
 	identity Identity
 	mask     *masker
+
+	// profiles is the loaded profile registry. A load failure is stored so
+	// readiness reports it loudly (a workspace must never run against a
+	// half-loaded allowlist).
+	profiles   *profile.Registry
+	profileErr error
 
 	mu         sync.Mutex
 	procs      map[string]*os.Process // runID -> direct child (nsjail) process
@@ -40,16 +49,61 @@ type NsjailRunner struct {
 
 // NewNsjailRunner constructs a runner. tmplPath points at the nsjail config
 // template; tmpDir is where per-run configs are written.
+//
+// The profile registry is built here from the embedded built-in profiles plus
+// the operator directory in cfg.Profiles.Dir. A load failure is stored (not
+// panicked) and surfaced via ProfileStatus so /readyz fails loudly.
 func NewNsjailRunner(cfg config.Config, tmplPath, tmpDir string) *NsjailRunner {
+	reg, err := profile.NewRegistry(configs.BuiltinProfiles(), cfg.Profiles.Dir)
 	return &NsjailRunner{
 		cfg:        cfg,
 		tmplPath:   tmplPath,
 		tmpDir:     tmpDir,
 		identity:   ResolveIdentity(cfg),
 		mask:       newMasker(cfg.Identity, tmpDir),
+		profiles:   reg,
+		profileErr: err,
 		procs:      make(map[string]*os.Process),
 		cgroupDirs: make(map[string]string),
 	}
+}
+
+// Profiles returns the loaded profile registry (nil when it failed to load).
+func (r *NsjailRunner) Profiles() *profile.Registry { return r.profiles }
+
+// ProfileStatus reports the profile registry capability truthfully. ready is
+// false when the configured profiles could not be loaded or the configured
+// default profile is not present; note explains why.
+func (r *NsjailRunner) ProfileStatus() (ready bool, note string) {
+	if r.profileErr != nil {
+		return false, "profiles failed to load: " + r.profileErr.Error()
+	}
+	if r.profiles == nil {
+		return false, "no profile registry"
+	}
+	if !r.profiles.Has(r.cfg.Profiles.Default) {
+		return false, fmt.Sprintf("default profile %q is not loaded", r.cfg.Profiles.Default)
+	}
+	return true, ""
+}
+
+// profileFor resolves the profile a request runs under: the workspace's stored
+// profile, or the configured default when the record names none (an old record
+// or a create that omitted it). An unknown name is an error, never a silent
+// fallback to a different profile.
+func (r *NsjailRunner) profileFor(ws *model.Workspace) (*profile.Profile, error) {
+	name := r.cfg.Profiles.Default
+	if ws != nil && ws.Profile != "" {
+		name = ws.Profile
+	}
+	if r.profileErr != nil {
+		return nil, fmt.Errorf("profiles unavailable: %w", r.profileErr)
+	}
+	p, ok := r.profiles.Get(name)
+	if !ok {
+		return nil, fmt.Errorf("unknown profile %q", name)
+	}
+	return p, nil
 }
 
 // MaskStatus reports host-identity masking truthfully.
@@ -137,6 +191,40 @@ func (r *NsjailRunner) Available() bool {
 	return r.avail
 }
 
+// resolveProfileCommand resolves a request's argv[0]. A path (relative or
+// absolute) is passed through unchanged; the profile mount is what makes an
+// absent path fail. A bare command name must be in the workspace profile's
+// allowlist (when provider-tool hiding is on) or it is a clean
+// command-not-found, so a tool outside the profile fails without an nsjail
+// execve diagnostic.
+func (r *NsjailRunner) resolveProfileCommand(pf *profile.Profile, name string) (string, error) {
+	if name == "" {
+		return "", ErrCommandNotFound
+	}
+	if strings.ContainsRune(name, '/') {
+		if filepath.IsAbs(name) {
+			return name, nil
+		}
+		return filepath.Abs(name)
+	}
+	if _, overlayReady, _ := r.mask.OverlayStatus(); overlayReady {
+		tree, err := r.mask.profileTree(pf)
+		if err != nil {
+			return "", err
+		}
+		if !tree.Commands[name] {
+			return "", ErrCommandNotFound
+		}
+	}
+	return resolveCommand(name)
+}
+
+// sortExtraMounts orders the profile's extra mounts by jail path so the
+// rendered config is deterministic.
+func sortExtraMounts(e []extraMount) {
+	sort.Slice(e, func(i, j int) bool { return e[i].Jail < e[j].Jail })
+}
+
 func (r *NsjailRunner) resolveBinary() (string, error) {
 	if p, err := exec.LookPath(r.cfg.Sandbox.NsjailPath); err == nil {
 		return p, nil
@@ -159,10 +247,17 @@ func (r *NsjailRunner) Run(req Request) (Result, error) {
 
 	// nsjail's exec_bin.path is passed straight to execve and is never looked
 	// up on PATH, so resolve argv[0] to an absolute path first. The sandbox
-	// bind-mounts the host's /usr, /bin, /lib and /lib64 at identical paths, so
-	// a host-resolved absolute path is valid inside the jail.
+	// bind-mounts the profile tree at /usr (and /bin, /lib, ...), so a
+	// host-resolved absolute path is valid inside the jail. A bare command name
+	// is additionally checked against the workspace profile's allowlist, so a
+	// command outside the profile fails with a clean command-not-found rather
+	// than an nsjail execve error.
 	if len(req.Argv) > 0 {
-		resolved, rerr := resolveCommand(req.Argv[0])
+		pf, perr := r.profileFor(req.Workspace)
+		if perr != nil {
+			return Result{}, perr
+		}
+		resolved, rerr := r.resolveProfileCommand(pf, req.Argv[0])
 		if rerr != nil {
 			return Result{}, rerr
 		}
@@ -735,29 +830,33 @@ type tmplData struct {
 	MaskPreloadJail string
 	MaskEnv         []string
 
-	// Provider-tool overlays (see provider.go). When OverlayEnabled is true the
-	// curated /usr/bin, /usr/sbin, /usr/local and (when present) /etc/ssl/certs
-	// are bind-mounted read-only over the host's own, hiding the engine's own
-	// tooling, the platform's tooling and vendor-named certificates from a
-	// workspace.
+	// Profile / provider overlays (see profile_overlay.go and provider.go).
+	// When OverlayEnabled is true the profile-materialized /usr (also bound at
+	// /bin, /sbin, /lib and /lib64), the profile's attached non-/usr paths, the
+	// filtered /etc/passwd and /etc/group and (when present) /etc/ssl/certs are
+	// bind-mounted read-only over the host's own, so a workspace sees only its
+	// profile's allowlist with no platform or engine material.
 	OverlayEnabled bool
-	ToolsDir       string
+	UsrRoot        string
 	CertsDir       string
-	BinDir         string
-	SbinDir        string
-	LibDir         string
-	DocDir         string
-	ManDir         string
+	PasswdHost     string
+	GroupHost      string
+	UsrJail        string
 	BinJail        string
 	SbinJail       string
 	LibJail        string
-	LibAliasJail   string
-	DocJail        string
-	ManJail        string
-	PasswdHost     string
-	GroupHost      string
+	Lib64Jail      string
 	PasswdJail     string
 	GroupJail      string
+	// ExtraMounts are the profile's attached non-/usr paths: each entry is
+	// {jailPath, hostPath}. Rendered as read-only mandatory binds.
+	ExtraMounts []extraMount
+}
+
+// extraMount is one profile-attached non-/usr path to bind read-only.
+type extraMount struct {
+	Jail string
+	Host string
 }
 
 // Paths at which the package tiers are mounted inside the sandbox.
@@ -842,13 +941,29 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 	privateDir := req.PrivatePackagesDir
 	pkgPath := packageSearchPath(sharedPackagesMount, privatePackagesMount, req.SharedPackagesDir, req.PrivatePackagesDir)
 
+	// Resolve the workspace's profile (the stored name, or the default). An
+	// unknown profile is a hard error: a workspace must never silently run
+	// under a different allowlist than its record says.
+	pf, err := r.profileFor(req.Workspace)
+	if err != nil {
+		return "", err
+	}
+
 	// Host-identity masking: derive the per-workspace values from THIS
 	// workspace's limits (never the host's), and refuse the run when masking is
 	// enabled but not ready, so a sandbox that would leak is never launched.
-	mask := r.mask.params(lim.CPUCores, lim.MemoryMB)
+	mask, err := r.mask.params(pf, lim.CPUCores, lim.MemoryMB)
+	if err != nil {
+		return "", err
+	}
 	if r.mask.Enabled() && !mask.Enabled {
 		return "", fmt.Errorf("%w: %s", ErrMaskUnavailable, r.mask.Reason())
 	}
+	extra := make([]extraMount, 0, len(mask.ExtraMounts))
+	for jail, host := range mask.ExtraMounts {
+		extra = append(extra, extraMount{Jail: jail, Host: host})
+	}
+	sortExtraMounts(extra)
 
 	data := tmplData{
 		Argv:          req.Argv,
@@ -894,23 +1009,18 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		MaskEnv:         mask.envEntries(),
 
 		OverlayEnabled: mask.OverlayEnabled,
-		ToolsDir:       mask.ToolsDir,
+		UsrRoot:        mask.UsrRoot,
 		CertsDir:       mask.CertsDir,
-		BinDir:         mask.BinDir,
-		SbinDir:        mask.SbinDir,
-		LibDir:         mask.LibDir,
-		DocDir:         mask.DocDir,
-		ManDir:         mask.ManDir,
+		PasswdHost:     mask.PasswdHost,
+		GroupHost:      mask.GroupHost,
+		UsrJail:        mask.UsrJail,
 		BinJail:        mask.BinJail,
 		SbinJail:       mask.SbinJail,
 		LibJail:        mask.LibJail,
-		LibAliasJail:   mask.LibAliasJail,
-		DocJail:        mask.DocJail,
-		ManJail:        mask.ManJail,
-		PasswdHost:     mask.PasswdHost,
-		GroupHost:      mask.GroupHost,
+		Lib64Jail:      mask.Lib64Jail,
 		PasswdJail:     mask.PasswdJail,
 		GroupJail:      mask.GroupJail,
+		ExtraMounts:    extra,
 	}
 	if data.PidsMax <= 0 {
 		data.PidsMax = 64

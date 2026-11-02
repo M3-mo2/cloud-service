@@ -502,70 +502,31 @@ func filterCABundle(raw []byte) []byte {
 // entries and reproduce every other tool, so a workspace keeps its toolchain
 // with no engine name reachable. Their build failure is returned as an error,
 // because a missing curated tree would leave the host's own exposed.
-// providerOverlays groups the curated host-path sources materialized for a
-// sandbox's read-only overlays. Empty fields are simply not mounted.
+// providerOverlays groups the curated host-path sources materialized ONCE per
+// service and mounted into every sandbox (they do not depend on the profile):
+// the filtered /etc/ssl/certs trust store and the filtered /etc/passwd and
+// /etc/group. The per-profile curated /usr tree is materialized separately (see
+// internal/executor/profile_overlay.go). Empty fields are simply not mounted.
 type providerOverlays struct {
-	ToolsDir string // curated /usr/local
 	CertsDir string // curated /etc/ssl/certs (empty when unreadable)
-	BinDir   string // curated /usr/bin
-	SbinDir  string // curated /usr/sbin
-	LibDir   string // curated /usr/lib (also mounted at /lib)
-	DocDir   string // curated /usr/share/doc
-	ManDir   string // curated /usr/share/man
 	Passwd   string // filtered /etc/passwd
 	Group    string // filtered /etc/group
 }
 
+// materializeProviderOverlays builds the shared (profile-independent) overlays.
+//
+// The TLS trust store is materialized from the host's own minus the provider
+// certificates; a failure to read it only disables the overlay (a closed
+// outcome: the workspace then has no /etc/ssl/certs at all), so it is not an
+// error. The filtered account files are a hard requirement: mounting the host's
+// own /etc/passwd would leak the operator's account.
 func materializeProviderOverlays(dir string, cfg config.IdentityConfig) (providerOverlays, error) {
 	var o providerOverlays
-	toolsSrc := cfg.ToolsDir
-	if toolsSrc != "" {
-		if fi, serr := os.Stat(toolsSrc); serr == nil && fi.IsDir() {
-			o.ToolsDir = toolsSrc
-		} else {
-			return o, fmt.Errorf("identity.tools_dir %q is not a directory", toolsSrc)
-		}
-	} else {
-		o.ToolsDir = filepath.Join(dir, "usr-local")
-		if err := buildEmptyToolsDir(o.ToolsDir); err != nil {
-			return o, fmt.Errorf("build curated /usr/local: %w", err)
-		}
-	}
-	o.BinDir = filepath.Join(dir, "usr-bin")
-	if err := buildToolDir(srcOr(cfg.ToolsBinDir, "/usr/bin"), o.BinDir); err != nil {
-		return o, fmt.Errorf("build curated /usr/bin: %w", err)
-	}
-	o.SbinDir = filepath.Join(dir, "usr-sbin")
-	if err := buildToolDir(srcOr(cfg.ToolsSbinDir, "/usr/sbin"), o.SbinDir); err != nil {
-		return o, fmt.Errorf("build curated /usr/sbin: %w", err)
-	}
-	// /usr/lib is curated whole: it carries the runtime libraries a workload
-	// uses AND the host's own tooling (/usr/lib/code-server, /usr/lib/node_modules)
-	// plus the provider-named systemd units (/usr/lib/systemd/system/zerops-*).
-	// One curated tree, mounted at both /usr/lib and /lib, closes all of it.
-	o.LibDir = filepath.Join(dir, "usr-lib")
-	if err := buildToolDir(srcOr(cfg.ToolsLibDir, "/usr/lib"), o.LibDir); err != nil {
-		return o, fmt.Errorf("build curated /usr/lib: %w", err)
-	}
-	// /usr/share/doc and /usr/share/man carry a `slirp4netns` entry; both trees
-	// are curated with the same name/content rule as the tool dirs.
-	o.DocDir = filepath.Join(dir, "usr-share-doc")
-	if err := buildToolDir(srcOr(cfg.ToolsDocDir, "/usr/share/doc"), o.DocDir); err != nil {
-		return o, fmt.Errorf("build curated /usr/share/doc: %w", err)
-	}
-	o.ManDir = filepath.Join(dir, "usr-share-man")
-	if err := buildToolDir(srcOr(cfg.ToolsManDir, "/usr/share/man"), o.ManDir); err != nil {
-		return o, fmt.Errorf("build curated /usr/share/man: %w", err)
-	}
 	certsDir := filepath.Join(dir, "ssl-certs")
 	if cerr := buildCertsDir(certsDir, "/etc/ssl/certs"); cerr != nil {
 		certsDir = ""
 	}
 	o.CertsDir = certsDir
-	// The host account files carry the operator's own account (`zerops`),
-	// which names the platform to any `getent passwd`/`id`. Reproduce them with
-	// every provider/engine-named entry dropped. A failure here is a hard error
-	// like the tool trees: mounting the host's own file would leak the account.
 	o.Passwd = filepath.Join(dir, "passwd")
 	if err := buildFilteredPasswd("/etc/passwd", o.Passwd); err != nil {
 		return o, fmt.Errorf("build filtered /etc/passwd: %w", err)
@@ -575,12 +536,4 @@ func materializeProviderOverlays(dir string, cfg config.IdentityConfig) (provide
 		return o, fmt.Errorf("build filtered /etc/group: %w", err)
 	}
 	return o, nil
-}
-
-// srcOr returns override when non-empty, else the default host path.
-func srcOr(override, def string) string {
-	if override != "" {
-		return override
-	}
-	return def
 }

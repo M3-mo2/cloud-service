@@ -24,76 +24,57 @@ func testCfg() config.Config {
 	// Pin ids so rendered-config assertions are deterministic.
 	c.Sandbox.UID = 993
 	c.Sandbox.GID = 971
-	// Point the curated tool dirs at a small fixture so a unit test does not
-	// curate the real host /usr/bin on every render (the real tree is curated
-	// once per service start in production).
-	bin, sbin, lib, doc, man := toolFixtures()
-	c.Identity.ToolsBinDir = bin
-	c.Identity.ToolsSbinDir = sbin
-	c.Identity.ToolsLibDir = lib
-	c.Identity.ToolsDocDir = doc
-	c.Identity.ToolsManDir = man
+	// Point profile materialization at a small fixture root so a unit test does
+	// not copy the real host profile tree on every render (production reads the
+	// real host once per service).
+	c.Identity.ToolsRoot = toolFixtureRoot()
 	return c
 }
 
-// toolFixtures materializes tiny source directories once per test binary,
-// including engine-named entries that the curator must drop and benign entries
-// it must keep.
+// toolFixtureRoot materializes a tiny host-like filesystem root once per test
+// binary: a /usr/bin with the benign commands the profiles name (and the
+// engine-named + content-embedding entries the engine filter must drop), plus a
+// /usr/lib/x86_64-linux-gnu library dir.
 var (
 	toolFixOnce sync.Once
-	toolFixBin  string
-	toolFixSbin string
-	toolFixLib  string
-	toolFixDoc  string
-	toolFixMan  string
+	toolFixRoot string
 )
 
-func toolFixtures() (bin, sbin, lib, doc, man string) {
+func toolFixtureRoot() string {
 	toolFixOnce.Do(func() {
 		dir, err := os.MkdirTemp("", "toolfix-")
 		if err != nil {
 			panic(err)
 		}
-		toolFixBin = filepath.Join(dir, "bin")
-		toolFixSbin = filepath.Join(dir, "sbin")
-		toolFixLib = filepath.Join(dir, "lib")
-		toolFixDoc = filepath.Join(dir, "doc")
-		toolFixMan = filepath.Join(dir, "man")
-		for _, d := range []string{toolFixBin, toolFixSbin, toolFixLib, toolFixDoc, toolFixMan} {
+		toolFixRoot = dir
+		bin := filepath.Join(dir, "usr", "bin")
+		sbin := filepath.Join(dir, "usr", "sbin")
+		lib := filepath.Join(dir, "usr", "lib", "x86_64-linux-gnu")
+		for _, d := range []string{bin, sbin, lib} {
 			if err := os.MkdirAll(d, 0o755); err != nil {
 				panic(err)
 			}
 		}
-		// Benign entries: a plain file and a symlink.
-		writeFixture(toolFixBin, "python3", 0o755, "#!/bin/sh\necho py\n")
-		writeFixture(toolFixBin, "bash", 0o755, "#!/bin/sh\necho sh\n")
-		if err := os.Symlink("python3", filepath.Join(toolFixBin, "python")); err != nil {
+		// Benign commands the profiles name: a plain file and a same-dir
+		// symlink (python3 -> python3.12) that must materialize as real bytes.
+		writeFixture(bin, "python3.12", 0o755, "#!/bin/sh\necho py\n")
+		if err := os.Symlink("python3.12", filepath.Join(bin, "python3")); err != nil {
 			panic(err)
 		}
-		// Engine entries the curator must drop, by name.
+		writeFixture(bin, "bash", 0o755, "#!/bin/sh\necho sh\n")
+		writeFixture(bin, "sh", 0o755, "#!/bin/sh\necho sh\n")
+		writeFixture(bin, "ls", 0o755, "#!/bin/sh\necho ls\n")
+		writeFixture(bin, "true", 0o755, "#!/bin/sh\nexit 0\n")
+		writeFixture(bin, "sleep", 0o755, "#!/bin/sh\necho sleep\n")
+		// Engine entries the materializer must never place in the tree.
 		for _, n := range []string{"nsjail", "unshare", "nsenter", "setpriv", "runcon", "slirp4netns"} {
-			writeFixture(toolFixBin, n, 0o755, "#!/bin/sh\n: engine\n")
+			writeFixture(bin, n, 0o755, "#!/bin/sh\n: engine\n")
 		}
-		writeFixture(toolFixSbin, "chroot", 0o755, "#!/bin/sh\n: engine\n")
-		// An innocuously-named file that embeds an engine string: dropped.
-		writeFixture(toolFixBin, "innocent", 0o755, "binary with SANDBOXD_WORKSPACE inside")
-		writeFixture(toolFixSbin, "fine", 0o755, "#!/bin/sh\n: ok\n")
-		// A provider-named service tree under /usr/lib (dropped) plus a benign
-		// library file and a benign service (kept).
-		if err := os.MkdirAll(filepath.Join(toolFixLib, "systemd", "system"), 0o755); err != nil {
-			panic(err)
-		}
-		writeFixture(filepath.Join(toolFixLib, "systemd", "system"), "zerops-zembed.service", 0o644, "[Unit]\nDescription=x\n")
-		writeFixture(filepath.Join(toolFixLib, "systemd", "system"), "ssh.service", 0o644, "[Unit]\nDescription=ssh\n")
-		writeFixture(toolFixLib, "libkeep.so", 0o755, "ELF-ish\n")
-		// A provider-named doc dir (dropped) and a benign file (kept).
-		writeFixture(toolFixDoc, "notes", 0o644, "hello\n")
-		if err := os.MkdirAll(filepath.Join(toolFixDoc, "zerops-data"), 0o755); err != nil {
-			panic(err)
-		}
-		writeFixture(toolFixMan, "printf.1.gz", 0o644, "not-really-gzip\n")
+		writeFixture(sbin, "chroot", 0o755, "#!/bin/sh\n: engine\n")
+		// A benign shared library.
+		writeFixture(lib, "libc.so.6", 0o755, "ELF-ish\n")
 	})
-	return toolFixBin, toolFixSbin, toolFixLib, toolFixDoc, toolFixMan
+	return toolFixRoot
 }
 
 func writeFixture(dir, name string, mode os.FileMode, content string) {

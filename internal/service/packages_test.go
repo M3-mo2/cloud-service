@@ -67,7 +67,7 @@ func TestValidateRequirementRejectsHostile(t *testing.T) {
 
 func TestInstallPackagesRejectsHostileWithoutRunning(t *testing.T) {
 	svc, fake := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	for _, hostile := range []string{"pkg; rm -rf /", "-e", "--upgrade", "../../etc/passwd", ""} {
 		_, err := svc.InstallPackages(ws, []string{hostile})
 		if err == nil {
@@ -84,7 +84,7 @@ func TestInstallPackagesRejectsHostileWithoutRunning(t *testing.T) {
 
 func TestInstallPackagesEmptyRejected(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if _, err := svc.InstallPackages(ws, nil); err == nil {
 		t.Fatal("expected error for empty package list")
 	}
@@ -94,7 +94,7 @@ func TestInstallPackagesRunsPipTargetPrivate(t *testing.T) {
 	svc, fake := newTestService(t)
 	fake.AvailableFlag = true
 	fake.Stdout = "Successfully installed foo-1.0\n"
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 
 	res, err := svc.InstallPackages(ws, []string{"foo==1.0", "bar"})
 	if err != nil {
@@ -130,7 +130,7 @@ func TestInstallPackagesRunsPipTargetPrivate(t *testing.T) {
 
 func TestInstallPackagesSuspendedRefused(t *testing.T) {
 	svc, fake := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	ws.Status = model.WorkspaceSuspended
 	if _, err := svc.InstallPackages(ws, []string{"foo"}); err == nil {
 		t.Fatal("expected suspended refusal")
@@ -144,7 +144,7 @@ func TestPackageTierSharedDegradesWhenDirMissing(t *testing.T) {
 	svc, _ := newTestService(t)
 	svc.cfg.Packages.SharedEnabled = true
 	svc.cfg.Packages.SharedDir = filepath.Join(t.TempDir(), "does-not-exist")
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 
 	tier := svc.PackageTierFor(ws)
 	if !tier.SharedEnabled {
@@ -171,7 +171,7 @@ func TestPackageTierSharedAvailableWhenDirPresent(t *testing.T) {
 	svc, _ := newTestService(t)
 	svc.cfg.Packages.SharedEnabled = true
 	svc.cfg.Packages.SharedDir = shared
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 
 	tier := svc.PackageTierFor(ws)
 	if !tier.SharedAvailable || tier.SharedPath != SharedPackagesMount {
@@ -190,7 +190,7 @@ func TestPackageTierSharedDisabled(t *testing.T) {
 	svc, _ := newTestService(t)
 	svc.cfg.Packages.SharedEnabled = false
 	svc.cfg.Packages.SharedDir = t.TempDir()
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if tier := svc.PackageTierFor(ws); tier.SharedAvailable {
 		t.Fatalf("disabled shared tier must be unavailable: %+v", tier)
 	}
@@ -217,7 +217,7 @@ func writeDistInfo(t *testing.T, dir, name, version string) {
 
 func TestListPrivatePackages(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	dir := svc.Store().WorkspacePackagesDir(ws.ID)
 	writeDistInfo(t, dir, "Requests", "2.31.0")
 	writeDistInfo(t, dir, "Flask", "3.0.0")
@@ -247,8 +247,8 @@ func TestListPrivatePackages(t *testing.T) {
 
 func TestPrivateTierIsolatedBetweenWorkspaces(t *testing.T) {
 	svc, _ := newTestService(t)
-	wsA, _ := svc.CreateWorkspace("u", "a", nil)
-	wsB, _ := svc.CreateWorkspace("u", "b", nil)
+	wsA, _ := svc.CreateWorkspace("u", "a", "", nil)
+	wsB, _ := svc.CreateWorkspace("u", "b", "", nil)
 
 	dirA := svc.Store().WorkspacePackagesDir(wsA.ID)
 	dirB := svc.Store().WorkspacePackagesDir(wsB.ID)
@@ -280,7 +280,7 @@ func TestPrivateTierIsolatedBetweenWorkspaces(t *testing.T) {
 
 func TestRemovePackage(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	dir := svc.Store().WorkspacePackagesDir(ws.ID)
 	writeDistInfo(t, dir, "foo", "1.0.0")
 	// A top-level module recorded in RECORD.
@@ -309,7 +309,7 @@ func TestRemovePackage(t *testing.T) {
 
 func TestRemovePackageNormalizedName(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	dir := svc.Store().WorkspacePackagesDir(ws.ID)
 	writeDistInfo(t, dir, "My_Package", "1.0.0")
 	if err := svc.RemovePackage(ws, "my-package"); err != nil {
@@ -319,7 +319,7 @@ func TestRemovePackageNormalizedName(t *testing.T) {
 
 func TestRemovePackageEmptyRejected(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	if err := svc.RemovePackage(ws, "  "); err == nil {
 		t.Fatal("empty name must be rejected")
 	}
@@ -327,7 +327,7 @@ func TestRemovePackageEmptyRejected(t *testing.T) {
 
 func TestRemoveAllPackages(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	dir := svc.Store().WorkspacePackagesDir(ws.ID)
 	writeDistInfo(t, dir, "foo", "1.0.0")
 	writeDistInfo(t, dir, "bar", "2.0.0")
@@ -349,7 +349,7 @@ func TestRemoveAllPackages(t *testing.T) {
 
 func TestRemovePackageSuspendedRefused(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	writeDistInfo(t, svc.Store().WorkspacePackagesDir(ws.ID), "foo", "1.0.0")
 	ws.Status = model.WorkspaceSuspended
 	if err := svc.RemovePackage(ws, "foo"); err == nil {
@@ -359,7 +359,7 @@ func TestRemovePackageSuspendedRefused(t *testing.T) {
 
 func TestListPrivatePackagesSuspendedRefused(t *testing.T) {
 	svc, _ := newTestService(t)
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 	ws.Status = model.WorkspaceSuspended
 	if _, _, err := svc.ListPrivatePackages(ws); err == nil {
 		t.Fatal("expected suspended refusal")
@@ -371,7 +371,7 @@ func TestExecWiresPackageDirs(t *testing.T) {
 	svc, fake := newTestService(t)
 	svc.cfg.Packages.SharedEnabled = true
 	svc.cfg.Packages.SharedDir = shared
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 
 	if _, err := svc.Exec(ws, ExecSpec{Cmd: []string{"python3", "-c", "1"}, Timeout: 5}); err != nil {
 		t.Fatal(err)
@@ -390,7 +390,7 @@ func TestStartRunWiresPackageDirs(t *testing.T) {
 	svc, fake := newTestService(t)
 	svc.cfg.Packages.SharedEnabled = true
 	svc.cfg.Packages.SharedDir = shared
-	ws, _ := svc.CreateWorkspace("u", "w", nil)
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
 
 	if _, err := svc.StartRun(ws, StartRunSpec{Kind: model.RunKindCommand, Argv: []string{"python3", "-c", "1"}}); err != nil {
 		t.Fatal(err)

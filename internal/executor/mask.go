@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"sandboxd/internal/config"
+	"sandboxd/internal/profile"
 )
 
 // This file wires host-identity masking into the sandbox. The compiled shim
@@ -43,16 +44,18 @@ import (
 const (
 	maskShimJailPath    = "/run/.rt.so"
 	maskPreloadJailPath = "/etc/ld.so.preload"
-	toolsJailPath       = "/usr/local"
-	binJailPath         = "/usr/bin"
-	sbinJailPath        = "/usr/sbin"
-	libJailPath         = "/usr/lib"
-	libAliasJailPath    = "/lib"
-	certsJailPath       = "/etc/ssl/certs"
-	passwdJailPath      = "/etc/passwd"
-	groupJailPath       = "/etc/group"
-	docJailPath         = "/usr/share/doc"
-	manJailPath         = "/usr/share/man"
+	// The profile-materialized tree is mounted at these jail paths. /usr comes
+	// from the curated profile tree; /bin, /sbin, /lib and /lib64 are bound to
+	// subtrees of it so a tenant sees one consistent, allowlisted toolchain at
+	// every conventional path.
+	usrJailPath      = "/usr"
+	binJailPath      = "/bin"
+	sbinJailPath     = "/sbin"
+	libJailPath      = "/lib"
+	lib64JailPath    = "/lib64"
+	certsJailPath    = "/etc/ssl/certs"
+	passwdJailPath   = "/etc/passwd"
+	groupJailPath    = "/etc/group"
 )
 
 // maskEnvKeys are the environment variables the shim reads. They carry the
@@ -80,15 +83,53 @@ type masker struct {
 	ready  bool
 	reason string
 
-	// Provider-overlay state, materialized by the same prepare() pass.
+	// Provider-overlay state (shared, profile-independent), materialized by
+	// the same prepare() pass.
 	overlayReady bool
 	overlayNote  string
 	overlays     providerOverlays
+
+	// profileSourceRoot is the filesystem root per-profile trees are read from
+	// (empty or "/" means the real host; a fixture path is used by unit tests).
+	profileSourceRoot string
+	// profiles maps a profile name to its materialized tree. A profile's tree
+	// does not depend on the workspace, so it is materialized once per service
+	// and shared read-only by every workspace that names it (see ADR 83).
+	profiles   map[string]profileOverlay
+	profilesMu sync.Mutex
 }
 
 // newMasker constructs a masker rooted at dir (the service tmp dir).
 func newMasker(cfg config.IdentityConfig, dir string) *masker {
-	return &masker{cfg: cfg, dir: filepath.Join(dir, "identity-mask")}
+	return &masker{
+		cfg:               cfg,
+		dir:               filepath.Join(dir, "identity-mask"),
+		profileSourceRoot: cfg.ToolsRoot,
+		profiles:          map[string]profileOverlay{},
+	}
+}
+
+// profileTree materializes a profile's curated tree once and returns it. The
+// tree is shared read-only by every workspace that names the profile, so two
+// workspaces on `python` do not duplicate the whole stdlib (materialization
+// cost is per PROFILE, not per workspace; see ADR 83). A failure to
+// materialize is returned, never cached as success.
+func (m *masker) profileTree(p *profile.Profile) (profileOverlay, error) {
+	m.profilesMu.Lock()
+	defer m.profilesMu.Unlock()
+	if o, ok := m.profiles[p.Name]; ok {
+		return o, nil
+	}
+	dir := filepath.Join(m.dir, "profiles", p.Name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return profileOverlay{}, err
+	}
+	o, err := materializeProfile(dir, m.profileSourceRoot, p)
+	if err != nil {
+		return profileOverlay{}, err
+	}
+	m.profiles[p.Name] = o
+	return o, nil
 }
 
 // Enabled reports whether masking is turned on by configuration.
@@ -216,39 +257,12 @@ func (m *masker) OverlayStatus() (enabled, ready bool, note string) {
 	return m.cfg.HideProviderTools, m.overlayReady, m.overlayNote
 }
 
-// ToolsDir returns the host path of the curated /usr/local overlay (empty when
-// not materialized).
-func (m *masker) ToolsDir() string {
-	m.prepare()
-	return m.overlays.ToolsDir
-}
-
 // CertsDir returns the host path of the curated /etc/ssl/certs overlay (empty
 // when not materialized).
 func (m *masker) CertsDir() string {
 	m.prepare()
 	return m.overlays.CertsDir
 }
-
-// BinDir returns the host path of the curated /usr/bin overlay (empty when not
-// materialized).
-func (m *masker) BinDir() string {
-	m.prepare()
-	return m.overlays.BinDir
-}
-
-// SbinDir returns the host path of the curated /usr/sbin overlay (empty when
-// not materialized).
-func (m *masker) SbinDir() string {
-	m.prepare()
-	return m.overlays.SbinDir
-}
-
-// LibDir / DocDir / ManDir return the host paths of the curated
-// /usr/lib, /usr/share/doc and /usr/share/man overlays.
-func (m *masker) LibDir() string { m.prepare(); return m.overlays.LibDir }
-func (m *masker) DocDir() string { m.prepare(); return m.overlays.DocDir }
-func (m *masker) ManDir() string { m.prepare(); return m.overlays.ManDir }
 
 // PasswdHost / GroupHost return the host paths of the filtered /etc/passwd and
 // /etc/group overlays (empty when not materialized).
@@ -274,69 +288,71 @@ type maskParams struct {
 	ShimJail    string
 	PreloadJail string
 
-	// Provider/engine overlays. OverlayEnabled mounts the curated /usr/local,
-	// /usr/bin, /usr/sbin, filtered /etc/passwd and /etc/group and (when
-	// present) /etc/ssl/certs over the host's own, so a workspace sees no
-	// platform or engine material. The *Dir/*Host fields are host paths, empty
-	// when the overlay is unavailable or the switch is off.
+	// Profile / provider overlays. OverlayEnabled mounts the profile-
+	// materialized /usr (also bound at /bin, /sbin, /lib, /lib64), the
+	// profile's attached non-/usr paths, the filtered /etc/passwd and /etc/group
+	// and (when present) /etc/ssl/certs over the host's own, so a workspace sees
+	// no platform or engine material. The host paths are empty when the overlay
+	// is unavailable or the switch is off.
 	OverlayEnabled bool
-	ToolsDir       string
+	UsrRoot        string
 	CertsDir       string
-	BinDir         string
-	SbinDir        string
-	LibDir         string
-	DocDir         string
-	ManDir         string
 	PasswdHost     string
 	GroupHost      string
-	ToolsJail      string
-	CertsJail      string
-	BinJail        string
-	SbinJail       string
-	LibJail        string
-	LibAliasJail   string
-	DocJail        string
-	ManJail        string
-	PasswdJail     string
-	GroupJail      string
+	// ExtraMounts maps a jail path to a host path for the profile's non-/usr
+	// paths (e.g. /etc/ssh/ssh_config).
+	ExtraMounts map[string]string
+	UsrJail     string
+	CertsJail   string
+	BinJail     string
+	SbinJail    string
+	LibJail     string
+	Lib64Jail   string
+	PasswdJail  string
+	GroupJail   string
+	// Commands is the profile's allowlist, used by profile-aware command
+	// resolution. Nil when the overlay is off.
+	Commands map[string]bool
 }
 
-// params builds the per-request masking parameters for a workspace's limits.
-// When masking is off (or not ready) Enabled is false and no mounts/env are
-// rendered.
-func (m *masker) params(cpus float64, memMB int) maskParams {
+// params builds the per-request masking parameters for a workspace's limits
+// and profile. When masking is off (or not ready) Enabled is false and no
+// mounts/env are rendered. When provider-tool hiding is on but the profile tree
+// cannot be materialized, params returns an error so the run is refused (a
+// missing curated tree must never expose the host's /usr).
+func (m *masker) params(pf *profile.Profile, cpus float64, memMB int) (maskParams, error) {
 	p := maskParams{
 		KernelRelease: m.cfg.KernelRelease,
 		KernelVersion: m.cfg.KernelVersion,
 		ShimJail:      maskShimJailPath,
 		PreloadJail:   maskPreloadJailPath,
-		ToolsJail:     toolsJailPath,
+		UsrJail:       usrJailPath,
 		CertsJail:     certsJailPath,
 		BinJail:       binJailPath,
 		SbinJail:      sbinJailPath,
 		LibJail:       libJailPath,
-		LibAliasJail:  libAliasJailPath,
-		DocJail:       docJailPath,
-		ManJail:       manJailPath,
+		Lib64Jail:     lib64JailPath,
 		PasswdJail:    passwdJailPath,
 		GroupJail:     groupJailPath,
+		ExtraMounts:   map[string]string{},
 	}
-	// Provider-tool overlays are independent of the syscall mask: they apply
-	// whenever hiding is enabled and the trees materialized.
+	// The profile overlays are independent of the syscall mask: they apply
+	// whenever hiding is enabled and the tree materialized.
 	if _, overlayReady, _ := m.OverlayStatus(); overlayReady {
+		tree, err := m.profileTree(pf)
+		if err != nil {
+			return p, fmt.Errorf("materialize profile %q: %w", pf.Name, err)
+		}
 		p.OverlayEnabled = true
-		p.ToolsDir = m.ToolsDir()
+		p.UsrRoot = tree.UsrRoot
+		p.Commands = tree.Commands
+		p.ExtraMounts = tree.ExtraMounts
 		p.CertsDir = m.CertsDir()
-		p.BinDir = m.BinDir()
-		p.SbinDir = m.SbinDir()
-		p.LibDir = m.LibDir()
-		p.DocDir = m.DocDir()
-		p.ManDir = m.ManDir()
 		p.PasswdHost = m.PasswdHost()
 		p.GroupHost = m.GroupHost()
 	}
 	if !m.Ready() {
-		return p
+		return p, nil
 	}
 	p.Enabled = true
 	// A workspace is always given at least one cpu and one MB, so a zeroed
@@ -357,7 +373,7 @@ func (m *masker) params(cpus float64, memMB int) maskParams {
 	}
 	p.ShimHost = m.shimHostPath()
 	p.PreloadHost = m.preloadHostPath()
-	return p
+	return p, nil
 }
 
 // envEntries renders the masking environment variables as `KEY=VALUE` pairs.

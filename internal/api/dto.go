@@ -14,9 +14,12 @@ var validate = validator.New(validator.WithRequiredStructEnabled())
 
 // workspaceJSON is the API representation of a workspace.
 type workspaceJSON struct {
-	ID             string     `json:"id"`
-	OwnerID        string     `json:"owner_id"`
-	Name           string     `json:"name"`
+	ID      string `json:"id"`
+	OwnerID string `json:"owner_id"`
+	Name    string `json:"name"`
+	// Profile is the named tool profile the workspace was created with. It is
+	// immutable: it decides which tools exist in the workspace.
+	Profile        string     `json:"profile"`
 	CreatedAt      string     `json:"created_at"`
 	Status         string     `json:"status"`
 	Limits         limitsJSON `json:"limits"`
@@ -39,6 +42,7 @@ func toWorkspaceJSON(w *model.Workspace) workspaceJSON {
 		ID:        w.ID,
 		OwnerID:   w.OwnerID,
 		Name:      w.Name,
+		Profile:   w.Profile,
 		CreatedAt: w.CreatedAt.UTC().Format("2006-01-02T15:04:05Z07:00"),
 		Status:    w.Status,
 		Limits:    toLimitsJSON(w.Limits),
@@ -72,8 +76,13 @@ func formatTime(t time.Time) string {
 
 // createWorkspaceRequest is the POST /v1/workspaces body.
 type createWorkspaceRequest struct {
-	Name   string      `json:"name" validate:"required,min=1,max=128"`
-	Limits *limitsJSON `json:"limits"`
+	Name string `json:"name" validate:"required,min=1,max=128"`
+	// Profile names the tool profile the workspace should get (e.g. "python",
+	// "minimal"). It is a TOP-LEVEL field, not under limits: a profile selects
+	// the toolchain, which is orthogonal to resource limits. Omit it to use the
+	// server's configured default. An unknown name is 422 unknown_profile.
+	Profile string      `json:"profile"`
+	Limits  *limitsJSON `json:"limits"`
 }
 
 func (r *createWorkspaceRequest) toLimits() *model.Limits {
