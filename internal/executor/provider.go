@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
+
+	"sandboxd/internal/config"
 )
 
 // This file implements the "provider identity" part of host masking: hiding the
@@ -43,12 +45,21 @@ import (
 var providerStrings = []string{"zerops", "vshosting", "zabbly"}
 
 // engineStrings are substrings that identify the sandbox engine or its masking
-// mechanism. They must not appear anywhere in a curated tool directory: the
-// engine's own runner (`nsjail`), the masking shim (`hostmask`, `sandboxd`) and
-// the engine-named environment would otherwise be visible to a tenant. They are
-// distinct from providerStrings (the platform's names) and are matched
+// mechanism. They must not appear in the NAME of anything the tenant can reach,
+// and the distinctive ones must not appear in its CONTENT. They are distinct
+// from providerStrings (the platform's names) and are matched
 // case-insensitively.
-var engineStrings = []string{"sandboxd", "hostmask", "nsjail", "SANDBOXD"}
+//
+// `hostmask` is deliberately only a NAME token, not a content token: it is a
+// standard networking term (the inverse of a netmask, used by Python's
+// `ipaddress` module and node's `netmask` package), so dropping files that
+// merely CONTAIN the word would break the Python/Node standard libraries. A
+// file NAMED `hostmask` is still dropped. See docs/DECISIONS.md.
+var engineStrings = []string{"sandboxd", "hostmask", "nsjail", "slirp4netns"}
+
+// engineContentStrings are the engine substrings searched for in a file's
+// CONTENT. `hostmask` is excluded on purpose (see engineStrings).
+var engineContentStrings = []string{"sandboxd", "nsjail", "slirp4netns"}
 
 // engineToolNames are the executables a workspace must never see. They either
 // name the engine (`nsjail`, `slirp4netns`) or grant the ability to manipulate
@@ -94,10 +105,10 @@ func containsDeniedString(s string) bool {
 	return containsProviderString(s) || containsEngineString(s)
 }
 
-// containsDeniedBytes reports whether b contains a provider or engine name. It
-// lower-cases the input once and searches for each token, so a binary that
-// embeds a vendor or engine string anywhere is caught (a `strings`-style audit,
-// not a presence check).
+// containsDeniedBytes reports whether b contains a provider name or a
+// content-distinctive engine name. It lower-cases the input once and searches
+// for each token, so a binary that embeds a vendor or engine string anywhere is
+// caught (a `strings`-style audit, not a presence check).
 func containsDeniedBytes(b []byte) bool {
 	low := strings.ToLower(string(b))
 	for _, p := range providerStrings {
@@ -105,7 +116,7 @@ func containsDeniedBytes(b []byte) bool {
 			return true
 		}
 	}
-	for _, e := range engineStrings {
+	for _, e := range engineContentStrings {
 		if strings.Contains(low, strings.ToLower(e)) {
 			return true
 		}
@@ -118,22 +129,23 @@ func containsDeniedBytes(b []byte) bool {
 // not define a command, and is skipped so curating a directory stays fast.
 const maxToolContentScan = 64 << 20
 
-// buildToolDir materializes a curated copy of a host tool directory (e.g.
-// /usr/bin) under dst. An entry is omitted when:
+// buildToolDir materializes a curated copy of a host directory (e.g. /usr/bin)
+// under dst, recursing into subdirectories. An entry is omitted when:
 //
 //   - its NAME is an engineToolName or names the provider/engine (so `nsjail`,
-//     `slirp4netns`, `runcon`, `setpriv`, `unshare`, `nsenter`, `chroot` and any
-//     engine/platform-named file are gone);
+//     `slirp4netns`, `runcon`, `setpriv`, `unshare`, `nsenter`, `chroot`, and
+//     any provider/engine-named file or directory are gone);
 //   - it is a regular file whose CONTENT contains a provider or engine string
-//     (so a binary embedding `zerops`, `hostmask`, `sandboxd`, … cannot slip
-//     through under a bland name);
-//   - it is a symlink whose target does not resolve (a dangling link whose
-//     name would be the only surviving trace).
+//     (so a binary or document embedding `zerops`, `hostmask`, `sandboxd`, …
+//     cannot slip through under a bland name);
+//   - it is a symlink whose target does not resolve, or whose target's base
+//     name is denied (a dangling or engine-pointing link).
 //
-// Every other entry is reproduced so a workspace keeps its full legitimate
-// toolchain. The copy is a reflink/clone of the host file where the filesystem
-// supports it (measured on the target host) and a byte copy otherwise, so this
-// stays cheap and the tenant can never write the source.
+// Every other entry is reproduced so a workspace keeps its legitimate
+// toolchain, man pages and docs. The copy is a reflink/clone of the host file
+// where the filesystem supports it (measured on the target host) and a byte
+// copy otherwise, so this stays cheap and the tenant can never write the
+// source.
 func buildToolDir(src, dst string) error {
 	if err := os.RemoveAll(dst); err != nil {
 		return err
@@ -141,6 +153,10 @@ func buildToolDir(src, dst string) error {
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return err
 	}
+	return buildToolTree(src, dst)
+}
+
+func buildToolTree(src, dst string) error {
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		return err
@@ -176,6 +192,13 @@ func buildToolDir(src, dst string) error {
 			if err := os.Symlink(target, dp); err != nil {
 				return err
 			}
+		case fi.IsDir():
+			if err := os.MkdirAll(dp, 0o755); err != nil {
+				return err
+			}
+			if err := buildToolTree(sp, dp); err != nil {
+				return err
+			}
 		case fi.Mode().IsRegular():
 			if fi.Size() <= maxToolContentScan {
 				if b, rerr := os.ReadFile(sp); rerr == nil && containsDeniedBytes(b) {
@@ -186,7 +209,7 @@ func buildToolDir(src, dst string) error {
 				return err
 			}
 		default:
-			// Directories and special files are not tool entries; skip.
+			// Special files (sockets, devices) are not tool entries; skip.
 			continue
 		}
 	}
@@ -259,9 +282,41 @@ func buildFilteredPasswd(src, dst string) error {
 }
 
 // buildFilteredGroup writes a copy of /etc/group with provider/engine-named
-// groups removed, using the same rule as buildFilteredPasswd.
+// groups removed, using the same rule as buildFilteredPasswd. A surviving
+// group's MEMBER LIST is also filtered: the host `sudo`/`www-data` groups list
+// the operator's own `zerops` account as a member, which names the platform
+// just as loudly as a group name.
 func buildFilteredGroup(src, dst string) error {
-	return buildFilteredAccountFile(src, dst, containsDeniedString)
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	var out []byte
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line == "" {
+			out = append(out, '\n')
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 3 {
+			continue
+		}
+		if containsDeniedString(fields[0]) {
+			continue
+		}
+		if len(fields) >= 4 && fields[3] != "" {
+			var kept []string
+			for _, m := range strings.Split(fields[3], ",") {
+				if m != "" && !containsDeniedString(m) {
+					kept = append(kept, m)
+				}
+			}
+			fields[3] = strings.Join(kept, ",")
+		}
+		out = append(out, strings.Join(fields, ":")...)
+		out = append(out, '\n')
+	}
+	return os.WriteFile(dst, out, 0o644)
 }
 
 // buildFilteredAccountFile copies a colon-separated account file, dropping a
@@ -454,12 +509,16 @@ type providerOverlays struct {
 	CertsDir string // curated /etc/ssl/certs (empty when unreadable)
 	BinDir   string // curated /usr/bin
 	SbinDir  string // curated /usr/sbin
+	LibDir   string // curated /usr/lib (also mounted at /lib)
+	DocDir   string // curated /usr/share/doc
+	ManDir   string // curated /usr/share/man
 	Passwd   string // filtered /etc/passwd
 	Group    string // filtered /etc/group
 }
 
-func materializeProviderOverlays(dir, toolsSrc, binSrc, sbinSrc string) (providerOverlays, error) {
+func materializeProviderOverlays(dir string, cfg config.IdentityConfig) (providerOverlays, error) {
 	var o providerOverlays
+	toolsSrc := cfg.ToolsDir
 	if toolsSrc != "" {
 		if fi, serr := os.Stat(toolsSrc); serr == nil && fi.IsDir() {
 			o.ToolsDir = toolsSrc
@@ -472,19 +531,31 @@ func materializeProviderOverlays(dir, toolsSrc, binSrc, sbinSrc string) (provide
 			return o, fmt.Errorf("build curated /usr/local: %w", err)
 		}
 	}
-	if binSrc == "" {
-		binSrc = "/usr/bin"
-	}
-	if sbinSrc == "" {
-		sbinSrc = "/usr/sbin"
-	}
 	o.BinDir = filepath.Join(dir, "usr-bin")
-	if err := buildToolDir(binSrc, o.BinDir); err != nil {
+	if err := buildToolDir(srcOr(cfg.ToolsBinDir, "/usr/bin"), o.BinDir); err != nil {
 		return o, fmt.Errorf("build curated /usr/bin: %w", err)
 	}
 	o.SbinDir = filepath.Join(dir, "usr-sbin")
-	if err := buildToolDir(sbinSrc, o.SbinDir); err != nil {
+	if err := buildToolDir(srcOr(cfg.ToolsSbinDir, "/usr/sbin"), o.SbinDir); err != nil {
 		return o, fmt.Errorf("build curated /usr/sbin: %w", err)
+	}
+	// /usr/lib is curated whole: it carries the runtime libraries a workload
+	// uses AND the host's own tooling (/usr/lib/code-server, /usr/lib/node_modules)
+	// plus the provider-named systemd units (/usr/lib/systemd/system/zerops-*).
+	// One curated tree, mounted at both /usr/lib and /lib, closes all of it.
+	o.LibDir = filepath.Join(dir, "usr-lib")
+	if err := buildToolDir(srcOr(cfg.ToolsLibDir, "/usr/lib"), o.LibDir); err != nil {
+		return o, fmt.Errorf("build curated /usr/lib: %w", err)
+	}
+	// /usr/share/doc and /usr/share/man carry a `slirp4netns` entry; both trees
+	// are curated with the same name/content rule as the tool dirs.
+	o.DocDir = filepath.Join(dir, "usr-share-doc")
+	if err := buildToolDir(srcOr(cfg.ToolsDocDir, "/usr/share/doc"), o.DocDir); err != nil {
+		return o, fmt.Errorf("build curated /usr/share/doc: %w", err)
+	}
+	o.ManDir = filepath.Join(dir, "usr-share-man")
+	if err := buildToolDir(srcOr(cfg.ToolsManDir, "/usr/share/man"), o.ManDir); err != nil {
+		return o, fmt.Errorf("build curated /usr/share/man: %w", err)
 	}
 	certsDir := filepath.Join(dir, "ssl-certs")
 	if cerr := buildCertsDir(certsDir, "/etc/ssl/certs"); cerr != nil {
@@ -504,4 +575,12 @@ func materializeProviderOverlays(dir, toolsSrc, binSrc, sbinSrc string) (provide
 		return o, fmt.Errorf("build filtered /etc/group: %w", err)
 	}
 	return o, nil
+}
+
+// srcOr returns override when non-empty, else the default host path.
+func srcOr(override, def string) string {
+	if override != "" {
+		return override
+	}
+	return def
 }

@@ -706,8 +706,15 @@ type tmplData struct {
 	CertsDir       string
 	BinDir         string
 	SbinDir        string
+	LibDir         string
+	DocDir         string
+	ManDir         string
 	BinJail        string
 	SbinJail       string
+	LibJail        string
+	LibAliasJail   string
+	DocJail        string
+	ManJail        string
 	PasswdHost     string
 	GroupHost      string
 	PasswdJail     string
@@ -852,8 +859,15 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		CertsDir:       mask.CertsDir,
 		BinDir:         mask.BinDir,
 		SbinDir:        mask.SbinDir,
+		LibDir:         mask.LibDir,
+		DocDir:         mask.DocDir,
+		ManDir:         mask.ManDir,
 		BinJail:        mask.BinJail,
 		SbinJail:       mask.SbinJail,
+		LibJail:        mask.LibJail,
+		LibAliasJail:   mask.LibAliasJail,
+		DocJail:        mask.DocJail,
+		ManJail:        mask.ManJail,
 		PasswdHost:     mask.PasswdHost,
 		GroupHost:      mask.GroupHost,
 		PasswdJail:     mask.PasswdJail,

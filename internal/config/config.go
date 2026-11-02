@@ -97,6 +97,16 @@ type IdentityConfig struct {
 	// ToolsSbinDir is the host directory curated into the workspace's /usr/sbin
 	// and /sbin. Empty (the default) uses /usr/sbin.
 	ToolsSbinDir string `koanf:"tools_sbin_dir"`
+	// ToolsDocDir is the host directory curated into the workspace's
+	// /usr/share/doc. Empty (the default) uses /usr/share/doc.
+	ToolsDocDir string `koanf:"tools_doc_dir"`
+	// ToolsManDir is the host directory curated into the workspace's
+	// /usr/share/man. Empty (the default) uses /usr/share/man.
+	ToolsManDir string `koanf:"tools_man_dir"`
+	// ToolsLibDir is the host directory curated into the workspace's /usr/lib
+	// and /lib (the runtime libraries, plus the operator's own tooling under
+	// /usr/lib/{code-server,node_modules}). Empty (the default) uses /usr/lib.
+	ToolsLibDir string `koanf:"tools_lib_dir"`
 }
 
 // NetworkConfig controls the per-workspace egress fabric. Egress is delivered by

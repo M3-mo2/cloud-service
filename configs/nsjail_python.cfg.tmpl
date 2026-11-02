@@ -65,6 +65,37 @@ mount {
   mandatory: true
 }
 
+# /usr/lib is curated whole: it carries the runtime libraries a workload uses,
+# the host's own tooling (/usr/lib/code-server, /usr/lib/node_modules) and the
+# provider-named systemd units (/usr/lib/systemd/system/zerops-*.service). One
+# curated tree, mounted at /usr/lib and (after the /lib bind below) at /lib,
+# closes all of it. mandatory:true is the fail-loud contract.
+mount {
+  src: "{{ .LibDir }}"
+  dst: "{{ .LibJail }}"
+  is_bind: true
+  rw: false
+  mandatory: true
+}
+
+# /usr/share/doc and /usr/share/man carry a `slirp4netns` page each; the curated
+# copies drop it and any provider/engine-named entry, keeping the rest.
+mount {
+  src: "{{ .DocDir }}"
+  dst: "{{ .DocJail }}"
+  is_bind: true
+  rw: false
+  mandatory: true
+}
+
+mount {
+  src: "{{ .ManDir }}"
+  dst: "{{ .ManJail }}"
+  is_bind: true
+  rw: false
+  mandatory: true
+}
+
 # Provider-identity overlays: the workspace sees a curated /usr/local instead of
 # the host's, and a curated /etc/ssl/certs. The host's /usr/local carries the
 # platform's own control binaries (zcp, zsc, yq), the vendor CA sources and the
@@ -94,8 +125,12 @@ mount {
 {{- end }}
 {{- end }}
 
+# The sandbox's /lib is its own directory (the host's /lib -> usr/lib symlink is
+# not reproduced), so the curated /usr/lib would NOT cover it. Point the /lib
+# bind at the same curated tree so the tenant sees one consistent, engine-free
+# library tree at both paths.
 mount {
-  src: "/lib"
+  src: "{{ if .OverlayEnabled }}{{ .LibDir }}{{ else }}/lib{{ end }}"
   dst: "/lib"
   is_bind: true
   rw: false

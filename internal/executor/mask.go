@@ -38,9 +38,13 @@ const (
 	toolsJailPath       = "/usr/local"
 	binJailPath         = "/usr/bin"
 	sbinJailPath        = "/usr/sbin"
+	libJailPath         = "/usr/lib"
+	libAliasJailPath    = "/lib"
 	certsJailPath       = "/etc/ssl/certs"
 	passwdJailPath      = "/etc/passwd"
 	groupJailPath       = "/etc/group"
+	docJailPath         = "/usr/share/doc"
+	manJailPath         = "/usr/share/man"
 )
 
 // maskEnvKeys are the environment variables the shim reads. They carry the
@@ -146,7 +150,7 @@ func (m *masker) prepareProviderOverlays() {
 		m.overlayNote = "create provider-overlay dir: " + err.Error()
 		return
 	}
-	overlays, err := materializeProviderOverlays(m.dir, m.cfg.ToolsDir, m.cfg.ToolsBinDir, m.cfg.ToolsSbinDir)
+	overlays, err := materializeProviderOverlays(m.dir, m.cfg)
 	// The curated /usr/local is the hard part: without it the mount would
 	// expose the host directory, so its failure makes the overlay not ready.
 	if err != nil {
@@ -232,6 +236,12 @@ func (m *masker) SbinDir() string {
 	return m.overlays.SbinDir
 }
 
+// LibDir / DocDir / ManDir return the host paths of the curated
+// /usr/lib, /usr/share/doc and /usr/share/man overlays.
+func (m *masker) LibDir() string { m.prepare(); return m.overlays.LibDir }
+func (m *masker) DocDir() string { m.prepare(); return m.overlays.DocDir }
+func (m *masker) ManDir() string { m.prepare(); return m.overlays.ManDir }
+
 // PasswdHost / GroupHost return the host paths of the filtered /etc/passwd and
 // /etc/group overlays (empty when not materialized).
 func (m *masker) PasswdHost() string {
@@ -266,12 +276,19 @@ type maskParams struct {
 	CertsDir       string
 	BinDir         string
 	SbinDir        string
+	LibDir         string
+	DocDir         string
+	ManDir         string
 	PasswdHost     string
 	GroupHost      string
 	ToolsJail      string
 	CertsJail      string
 	BinJail        string
 	SbinJail       string
+	LibJail        string
+	LibAliasJail   string
+	DocJail        string
+	ManJail        string
 	PasswdJail     string
 	GroupJail      string
 }
@@ -289,6 +306,10 @@ func (m *masker) params(cpus float64, memMB int) maskParams {
 		CertsJail:     certsJailPath,
 		BinJail:       binJailPath,
 		SbinJail:      sbinJailPath,
+		LibJail:       libJailPath,
+		LibAliasJail:  libAliasJailPath,
+		DocJail:       docJailPath,
+		ManJail:       manJailPath,
 		PasswdJail:    passwdJailPath,
 		GroupJail:     groupJailPath,
 	}
@@ -300,6 +321,9 @@ func (m *masker) params(cpus float64, memMB int) maskParams {
 		p.CertsDir = m.CertsDir()
 		p.BinDir = m.BinDir()
 		p.SbinDir = m.SbinDir()
+		p.LibDir = m.LibDir()
+		p.DocDir = m.DocDir()
+		p.ManDir = m.ManDir()
 		p.PasswdHost = m.PasswdHost()
 		p.GroupHost = m.GroupHost()
 	}
