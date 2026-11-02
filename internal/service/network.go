@@ -27,6 +27,7 @@ type Network interface {
 	HasWorkspace(wsID string) bool
 	NetnsPathFor(wsID string) string
 	WriteResolverConf(alloc *network.Allocation) (string, error)
+	WriteHostsConf(alloc *network.Allocation) (string, error)
 	ReapOrphans(live map[string]bool) int
 	Stop()
 
@@ -101,6 +102,9 @@ func (s *Service) ApplyNetwork(w *model.Workspace, req executor.Request) (execut
 		req.NetnsPath = s.net.NetnsPathFor(w.ID)
 		if rc, err := s.net.WriteResolverConf(alloc); err == nil {
 			req.ResolverConf = rc
+		}
+		if hc, err := s.net.WriteHostsConf(alloc); err == nil {
+			req.HostsConf = hc
 		}
 		return req, nil
 	}

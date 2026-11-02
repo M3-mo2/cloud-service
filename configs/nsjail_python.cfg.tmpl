@@ -121,13 +121,19 @@ mount {
 }
 {{- end }}
 
+# A generic, per-workspace /etc/hosts. The HOST's own /etc/hosts is deliberately
+# NOT mounted: it names the operator's server FQDN (e.g. node-id-1.runtime.zcp.
+# zerops) and its LAN address, which identify the machine and its internal DNS.
+# The generated file resolves only localhost.
+{{- if .HostsConf }}
 mount {
-  src: "/etc/hosts"
+  src: "{{ .HostsConf }}"
   dst: "/etc/hosts"
   is_bind: true
   rw: false
   mandatory: false
 }
+{{- end }}
 {{- end }}
 
 mount {

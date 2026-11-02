@@ -94,6 +94,10 @@ func (f *fakeNetwork) WriteResolverConf(alloc *network.Allocation) (string, erro
 	return "/data/tmp/egress-resolv-" + alloc.WorkspaceID + ".conf", nil
 }
 
+func (f *fakeNetwork) WriteHostsConf(alloc *network.Allocation) (string, error) {
+	return "/data/tmp/egress-hosts-" + alloc.WorkspaceID, nil
+}
+
 func (f *fakeNetwork) ReapOrphans(live map[string]bool) int { return 0 }
 
 func (f *fakeNetwork) Stop() {}

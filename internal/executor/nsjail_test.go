@@ -529,6 +529,7 @@ func TestRenderConfigMountsResolverWhenNetAllowed(t *testing.T) {
 		Argv:          []string{"/bin/true"},
 		NetnsPath:     "/run/netns/sbxdws-abc",
 		ResolverConf:  "/data/tmp/egress-resolv-abc.conf",
+		HostsConf:     "/data/tmp/egress-hosts-abc",
 	}, "/tmp/rt")
 	if err != nil {
 		t.Fatal(err)
@@ -536,13 +537,17 @@ func TestRenderConfigMountsResolverWhenNetAllowed(t *testing.T) {
 	defer os.Remove(path)
 	out := readFile(t, path)
 
-	// /etc/hosts is still mounted.
-	hostsMount := `src: "/etc/hosts"
+	// A GENERIC /etc/hosts is mounted (never the host's own, which names the
+	// operator's server FQDN and LAN address).
+	hostsMount := `src: "/data/tmp/egress-hosts-abc"
   dst: "/etc/hosts"
   is_bind: true
   rw: false`
 	if !strings.Contains(out, hostsMount) {
-		t.Errorf("allow_net must bind-mount /etc/hosts read-only:\n%s", out)
+		t.Errorf("allow_net must bind-mount the generated generic /etc/hosts read-only:\n%s", out)
+	}
+	if strings.Contains(out, `src: "/etc/hosts"`) {
+		t.Errorf("the host's own /etc/hosts must never be mounted into a workspace:\n%s", out)
 	}
 	// The generated egress resolver is mounted at /etc/resolv.conf.
 	if !strings.Contains(out, `src: "/data/tmp/egress-resolv-abc.conf"`) {

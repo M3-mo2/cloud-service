@@ -107,6 +107,11 @@ type Request struct {
 	// public resolvers, never the host's: the workspace reaches them through
 	// the chained slirp4netns egress. Empty renders no resolver mount.
 	ResolverConf string
+	// HostsConf, when set, is a host path bind-mounted read-only at /etc/hosts.
+	// It carries only generic localhost entries: the host's own /etc/hosts
+	// names the operator's server FQDN and LAN address and must never reach a
+	// workspace. Empty renders no hosts mount.
+	HostsConf string
 
 	// ProcessKind / ProcessSource tag the sandbox with the identity of the work
 	// it belongs to ("run"/"session"/"exec" and the run/session id). The tag is

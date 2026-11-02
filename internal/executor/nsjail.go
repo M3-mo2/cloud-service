@@ -650,6 +650,7 @@ type tmplData struct {
 	// (clone_newnet:false). It is never a host-network share.
 	JoinNetns     bool
 	ResolverConf  string
+	HostsConf     string
 	User          string
 	Group         string
 	SandboxUID    int
@@ -809,6 +810,7 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		DisableNet:    !lim.AllowNet,
 		JoinNetns:     req.NetnsPath != "",
 		ResolverConf:  req.ResolverConf,
+		HostsConf:     req.HostsConf,
 		User:          r.cfg.Sandbox.User,
 		Group:         r.cfg.Sandbox.Group,
 		SandboxUID:    r.identity.SandboxUID,

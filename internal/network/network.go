@@ -539,6 +539,36 @@ func (m *Manager) ResolverConfPath() string {
 	return filepath.Join(m.cfg.ResolverDir, "egress-resolv")
 }
 
+// HostsConfPath returns the path of the generated per-workspace /etc/hosts, or
+// "" when egress is disabled or no resolver directory is configured.
+func (m *Manager) HostsConfPath() string {
+	if !m.cfg.Network.Enabled || m.cfg.ResolverDir == "" {
+		return ""
+	}
+	return filepath.Join(m.cfg.ResolverDir, "egress-hosts")
+}
+
+// WriteHostsConf writes a per-workspace /etc/hosts containing only generic
+// localhost entries, and returns its path. The host's own /etc/hosts is
+// deliberately NEVER mounted into a workspace: it carries the operator's server
+// FQDN (e.g. node-id-1.runtime.zcp.zerops) and its LAN address, which identify
+// the machine and its internal DNS. A workspace gets a names file that resolves
+// nothing but localhost.
+func (m *Manager) WriteHostsConf(alloc *Allocation) (string, error) {
+	if m.HostsConfPath() == "" {
+		return "", fmt.Errorf("egress hosts not configured")
+	}
+	if err := os.MkdirAll(m.cfg.ResolverDir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(m.cfg.ResolverDir, "egress-hosts-"+shortID(alloc.WorkspaceID))
+	content := "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 // WriteResolverConf writes a per-workspace /etc/resolv.conf naming the
 // configured PUBLIC resolvers, and returns its path. The host's own resolver is
 // deliberately never published to a workspace: the relay blackholes the
