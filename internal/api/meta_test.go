@@ -78,7 +78,7 @@ func TestMeta(t *testing.T) {
 		t.Fatalf("code = %d", rec.Code)
 	}
 	body := decode[map[string]any](t, rec)
-	if body["version"] != "0.0.17" || body["api_version"] != "v1" {
+	if body["version"] != "0.0.18" || body["api_version"] != "v1" {
 		t.Fatalf("body = %v", body)
 	}
 	runtimes, ok := body["runtimes"].([]any)

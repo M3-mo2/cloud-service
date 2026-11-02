@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: sandboxd API
-  version: 0.0.17
+  version: 0.0.18
   description: |
     Secure per-principal code execution backend. All `/v1` endpoints require a
     static bearer API key. All timestamps are RFC3339 UTC.
@@ -1183,6 +1183,8 @@ components:
         - session_ended
         - tunnels_disabled
         - too_many_tunnels
+        - unknown_profile
+        - session_needs_interpreter
         - validation
         - unprocessable
         - not_directory
@@ -1249,7 +1251,7 @@ components:
       type: object
       required: [version, api_version, runtimes, limits_defaults]
       properties:
-        version: { type: string, examples: ["0.0.17"] }
+        version: { type: string, examples: ["0.0.18"] }
         api_version: { type: string, examples: [v1] }
         runtimes:
           type: array
@@ -1330,11 +1332,15 @@ components:
           description: "Workspace opt-in for quick Cloudflare tunnels. A true value is rejected with 422 unless tunnels.enabled is also true; a tunnel additionally requires allow_net."
     Workspace:
       type: object
-      required: [id, owner_id, name, created_at, status, limits]
+      required: [id, owner_id, name, profile, created_at, status, limits]
       properties:
         id: { type: string, examples: ["ws_01H..."] }
         owner_id: { type: string }
         name: { type: string }
+        profile:
+          type: string
+          description: "The named, explicit-allowlist tool profile the workspace was created with. Immutable: it decides which tools exist in the workspace."
+          examples: ["python"]
         created_at: { type: string, format: date-time }
         status: { type: string, enum: [active, suspended, deleted] }
         limits: { $ref: "#/components/schemas/Limits" }
@@ -1344,6 +1350,10 @@ components:
       required: [name]
       properties:
         name: { type: string, minLength: 1, maxLength: 128 }
+        profile:
+          type: string
+          description: "Tool profile name from GET /v1/meta's profiles list. Omit to use the server default. An unknown name is 422 unknown_profile."
+          examples: ["python"]
         limits: { $ref: "#/components/schemas/Limits" }
     PatchLimits:
       type: object

@@ -1415,11 +1415,106 @@ under the mask, so a runtime regression can never pass silently again.
 to `memory_mb`; the cgroup does. This is the correct model: `memory_mb` is a
 committed-memory budget, and a virtual reservation is not committed memory.
 
+## v0.0.18 — workspace profiles: an explicit allowlist replaces the denylist
+
+### ADR 83 — named profiles with an explicit allowlist; entry sets; per-profile materialization
+
+**Problem.** Every workspace got a **denylist** over the host's whole tool
+trees: the engine copied almost all of `/usr/bin` (measured 982 entries at the
+time; 973 on this host) and `/usr/sbin` (194; 193 here) and then removed only the
+entries whose name or content named the engine/platform. A tenant therefore got
+`apt`, `add-apt-repository`, the full `gcc`/`binutils` compiler chain, and the
+operator's own tooling whether they wanted them or not. There was no way to give
+a workspace a *smaller*, reviewable set of tools, and no way to add a language
+without editing the engine's filter.
+
+**Decision — an explicit, data-driven allowlist.** A workspace's toolchain is a
+**named profile**: a YAML file (`configs/profiles/*.yaml`, embedded in the
+binary, overridable via `profiles.dir`) that lists the tools the workspace gets.
+Creating a workspace names the profile it wants (`POST /v1/workspaces
+{"name":"x","profile":"python"}`), the record echoes the resolved profile
+(including the server default when none is named), and `GET /v1/meta` lists the
+offered profiles. An unknown name is `422 unknown_profile`, never a silent
+fallback. The profile is **immutable** — it decides which tools exist, so
+changing it would invalidate anything already installed or running.
+
+**Entry sets, not just command names.** A tool is not just its binary. The
+schema has three entry sets:
+
+- `commands` — bare names resolved on the host PATH and placed in the
+  workspace's `/usr/bin`. A same-directory symlink target (`python3` →
+  `python3.12`) is materialized as its real bytes so the name works standalone.
+- `aliases` — extra names created as symlinks to a *listed* command (never a new
+  host binary). This is how the operator's `python` is provided, since the host
+  has only `python3`.
+- `paths` — absolute files, directories or whole trees reproduced at the same
+  path, because a tool needs its data/library trees: `/usr/lib/python3.12` (the
+  whole stdlib — without it `import json` fails), `/usr/lib/node_modules/npm`,
+  `/usr/lib/git-core`, `/usr/lib/x86_64-linux-gnu/perl-base`, `/usr/share/perl`,
+  `/etc/ssh/ssh_config`. The engine additionally always provides the shared
+  libraries, the ELF loader and `/usr/lib/ssl` (the OpenSSL trust paths: without
+  it a TLS client cannot verify a certificate even with `/etc/ssl/certs`
+  mounted — measured, `urlopen("https://pypi.org/…")` failed with "unable to get
+  local issuer certificate").
+
+Every tool is verified by **executing it inside a real workspace**
+(`scripts/identity-check.sh` §11), never by checking that a file exists.
+
+**Denylist filter kept on top; fail loud.** The engine's existing engine/platform
+name+content filter still applies to each profile entry. A profile entry whose
+name or content names the engine or platform is **refused** (the profile fails
+to load / the materialization returns an error), rather than silently shipped.
+
+**Per-profile, not per-workspace, materialization.** A profile's tree does not
+depend on the workspace, so it is materialized **once per service per profile**
+and shared read-only by every workspace that names it; two `python` workspaces do
+not duplicate the whole stdlib. This follows the existing pattern (the curated
+overlays were already materialized once per service start, and the two package
+tiers are shared/private). The trade-off: a profile's tree is fixed for the
+service's lifetime, so changing a profile file requires a restart (acceptable:
+profiles ship in the image, and a change is an operator action).
+
+**What the profile can and cannot promise.**
+
+- It **can** guarantee that a tool it does not name is *absent*: the whole
+  `/usr` is the profile tree, so un-allowlisted material (`apt`, the compiler
+  chain, `/usr/include`, `/usr/libexec`, the platform's `/usr/local`) is not
+  mounted at all, not merely filtered. `runcon`/`setpriv`/`unshare`/`nsenter`/
+  `chroot` are absent unless a profile names them (none do).
+- It **cannot** promise that a named tool is safe, nor hide the egress provider:
+  a named tool runs with the sandbox's identity and seccomp policy, and an
+  `allow_net` workspace still presents the platform's shared NAT address (ADR
+  76). A profile is an allowlist of *tools*, not a new security boundary.
+- A **session** needs a profile that provides `python3` (the PTY relay is a
+  Python program): a session on `minimal` is refused `422
+  session_needs_interpreter`, an honest, actionable limitation rather than a
+  mysterious nsjail error.
+- `screen`/`tmux` work **only in a session** (which binds `/dev/pts` and
+  `/dev/ptmx`), never in one-shot `exec`/`run` (which get only
+  `null`/`urandom`/`zero`, so `openpty()` fails with `ENOENT`) — documented in
+  the `python` profile rather than shipping a tool that mysteriously fails.
+
+**Shipped profiles.** `python` (the operator's: Python 3.12, pip/venv, Node.js,
+Perl, git and common shell tools, plus the `python` alias) and `minimal` (POSIX
+shell + coreutils only, no language runtime). The `minimal` profile exists so
+`scripts/identity-check.sh` can prove the allowlist really excludes things:
+under it, `python3`/`python`/`node`/`git`/`gcc`/`curl` are absent by execution.
+
+**Measured (this session, real nsjail).** `python` workspace: `python -c` →
+`py-ok`, `python3 -c 'import json,csv,sqlite3,ssl,ctypes,urllib,…'` → `stdlib-ok`,
+`pip --version` → `pip 24.0`, `node -e 'console.log(6*7)'` → `42`, `git --version`
+→ `git version 2.43.0`, `perl -e` → `perl-ok`, `awk` → `awk-ok`; `gcc`/`apt` →
+`422` command-not-found. `minimal` workspace: `sh`/`bash`/coreutils run;
+`python3`/`node`/`git`/`gcc`/`curl` all fail command-not-found. A session works on
+`python` (`IS_TTY`, `/dev/pts/N`, `stty size` → `24 80`). See
+[VERIFICATION.md](VERIFICATION.md).
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.
 - **Error codes**: `unauthorized`, `forbidden`, `not_found`, `conflict`, `workspace_suspended`,
-  `too_many_sessions`, `session_ended`, `tunnels_disabled`, `too_many_tunnels`, `validation`,
+  `too_many_sessions`, `session_ended`, `tunnels_disabled`, `too_many_tunnels`,
+  `unknown_profile`, `session_needs_interpreter`, `validation`,
   `unprocessable`, `not_directory`, `payload_too_large`, `timeout`, `tunnel_url_unavailable`,
   `unavailable`, `internal`. _Rationale_: fixed vocabulary mapped 1:1 from HTTP status.
 - **CWD default**: `/` normalizes to the workspace root `/workspace` inside the sandbox.

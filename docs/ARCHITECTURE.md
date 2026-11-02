@@ -5,7 +5,7 @@
 > sandbox. Diagrams are [Mermaid](https://mermaid.js.org/); they render on
 > GitHub/GitLab and in most Markdown viewers.
 
-- Version: **0.0.17** (pre-alpha)
+- Version: **0.0.18** (pre-alpha)
 - Language: Go 1.23+
 - Isolation: [`nsjail`](https://github.com/google/nsjail) (Linux namespaces,
   cgroups v2, seccomp, rlimits)
@@ -71,7 +71,7 @@ services** that call it on a user's behalf — not the users themselves.
 
 See [DECISIONS.md](DECISIONS.md) #54 for the decision and its consequences.
 
-### What it deliberately is *not* (v0.0.17)
+### What it deliberately is *not* (v0.0.18)
 
 Pre-alpha scope. It is a single-node, static-key service. Not yet: a hardened
 public-internet multi-tenant platform, a distributed scheduler, or a
@@ -760,32 +760,46 @@ by the mount namespace on every path. The *visibility* of the mechanism is close
 [VERIFICATION.md §10](VERIFICATION.md) for the measured numbers, and
 [`scripts/identity-check.sh`](../scripts/identity-check.sh) for the assertions.
 
-### 5.8 Provider identity: the platform's own tooling and the egress address
+### 5.8 Provider identity: workspace profiles and the egress address
 
-The `/usr` bind mount that gives a workspace its toolchain also carries
-`/usr/local`, where the hosting platform keeps its own control binaries
-(`zcp`, `zsc`, `yq`), its vendor CA sources and a vendor-named Go toolchain —
-all of which name the provider in embedded strings. When
-`identity.hide_provider_tools` is on (default), the sandbox overlays
-`/usr/local` with a curated directory (empty by default; operator-providable via
-`identity.tools_dir`) and `/etc/ssl/certs` with a copy of the host trust store
-filtered of provider-named certificates. Both are read-only `mandatory:true`
-binds: a curated tree that cannot be mounted aborts the run rather than expose
-the host directory. The legitimate toolchain lives in `/usr/bin` and is
-unaffected.
+A workspace's toolchain is chosen by a **named profile**: an explicit,
+reviewable **allowlist** of tools and the data/library trees they need. When
+`identity.hide_provider_tools` is on (default), the sandbox replaces the host
+`/usr` with a tree **materialized from the workspace's profile** — only the
+commands the profile names, plus the engine base commands, the shared libraries,
+the ELF loader and `/usr/lib/ssl` — and `/bin`, `/sbin`, `/lib`, `/lib64` are
+bound to subtrees of the same tree so every conventional path is consistent.
+The host's `/etc/ssl/certs` is replaced with a copy filtered of provider-named
+certificates. The profile and cert binds are read-only `mandatory:true`: a tree
+that cannot be mounted aborts the run rather than expose the host directory.
+
+This is the opposite of the earlier denylist (which copied nearly all of
+`/usr/bin` and `/usr/sbin` and removed only the engine/platform names): the
+compiler chain, `apt`, `/usr/include`, `/usr/libexec` and the platform's
+`/usr/local` tooling are absent because the profile never named them, not
+because a filter stripped them. The engine's engine/platform name+content filter
+still applies on top of a profile, and a profile entry naming the engine or
+platform is refused (fail loud). A profile is data (`configs/profiles/*.yaml`,
+embedded, overridable via `profiles.dir`): adding a language is adding a file.
+See [DECISIONS.md](DECISIONS.md) #83.
 
 ```mermaid
 flowchart LR
-    subgraph HOST["Host"]
-      L1["/usr/local\n(zcp, zsc, yq, go, vendor CAs)"]
-      L2["/etc/ssl/certs\n(provider CA subjects)"]
+    subgraph HOST["Host /usr"]
+      L1["bin: all tools"]
+      L2["lib: all trees + loaders"]
+      L3["/usr/local: zcp, zsc, yq, go, vendor CAs"]
     end
-    subgraph CUR["Curated overlay (service tmp dir, read-only bind)"]
-      C1["/usr/local\n(empty, or identity.tools_dir)"]
-      C2["/etc/ssl/certs\n(provider certs dropped; DER-matched)"]
+    subgraph PROF["Profile tree (materialized once per profile, read-only bind)"]
+      C1["bin: profile allowlist only\n(+ base cmds; engine filter)"]
+      C2["lib: shared libs + loader + /usr/lib/ssl\n+ profile-attached trees\n(python3.12, git-core, perl, ...)"]
     end
-    L1 -.->|masked by| C1
-    L2 -.->|masked by| C2
+    subgraph CERT["/etc/ssl/certs (filtered, read-only)"]
+      C3["provider certs dropped (DER-matched)"]
+    end
+    HOST -->|materialize profile| PROF
+    L3 -.->|not in any profile| X["absent"]
+    L1 -.->|stay in host, never mounted| X
 ```
 
 The **egress address** is a separate, structural fact: an `allow_net` workspace
@@ -1115,11 +1129,11 @@ set `NSJAIL=/usr/local/bin/nsjail` and it will verify the binary is real.
 
 Deferred to v0.1 (documented, not bugs):
 
-- **SSE log streaming** — v0.0.17 polls logs with `offset`/`limit`.
+- **SSE log streaming** — v0.0.18 polls logs with `offset`/`limit`.
 - **Multi-node storage / sharding** — storage is a local filesystem.
 - **Dynamic/DB authentication** — keys are static in config (bearer auth itself
   is exercised by `TestAuth*`).
-- **Per-UID-per-workspace isolation** — v0.0.17 uses a shared `sandbox` UID/GID
+- **Per-UID-per-workspace isolation** — v0.0.18 uses a shared `sandbox` UID/GID
   with per-run user namespaces + cgroups.
 - **Kernel-enforced per-run disk quota** — disk is accounted on the file API
   path and rechecked with `du`; the sandbox process is bounded by `rlimit_fsize`

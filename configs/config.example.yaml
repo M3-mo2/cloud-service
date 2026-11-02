@@ -191,32 +191,22 @@ tunnels:
 identity:
   # Opt-out switch (default true). Set false only to measure what leaks.
   enabled: true
-  # Hide the hosting platform's own tooling, the engine's own binaries and the
-  # provider account (default true). The sandbox mounts the host's /usr, /lib,
-  # /etc/passwd and /etc/group for a normal toolchain, but those also carry the
-  # engine's runner (nsjail) and sandbox helpers (slirp4netns, unshare, nsenter,
-  # setpriv, runcon, chroot), the platform's control binaries (zcp, zsc, yq) and
-  # vendor CA sources under /usr/local, the host tooling under
-  # /usr/lib/{code-server,node_modules}, the provider-named systemd units
-  # (zerops-*.service), the provider account in /etc/{passwd,group}, and a
-  # vendor-named TLS trust store. With this on, every one of those trees is
-  # replaced inside the workspace with a curated, read-only copy that drops the
-  # engine/platform entries and keeps the rest. python3, node, bash, perl and git
-  # are unaffected.
+  # Select the workspace-PROFILE tool model (default true). With it on, a
+  # workspace's whole /usr is replaced by a tree materialized from the
+  # workspace's profile: ONLY the commands the profile names (an explicit
+  # allowlist) plus engine base commands, the shared libraries, the ELF loader
+  # and /usr/lib/ssl. Un-allowlisted host material (apt, the gcc/binutils chain,
+  # /usr/include, /usr/libexec, the platform's /usr/local tooling) simply does
+  # not exist inside the workspace. The engine's engine/platform name+content
+  # filter still applies on top: a profile entry whose name or content names the
+  # engine or platform is refused (fail loud), never silently shipped. Set
+  # false only to see the host /usr unchanged (a diagnostic state that
+  # deliberately exposes the platform's tooling).
   hide_provider_tools: true
-  # Optional curated directory mounted read-only at /usr/local in place of the
-  # host's. It should contain ONLY tools a workspace may use. Empty (the
-  # default) mounts an empty curated directory: the workspace keeps all of
-  # /usr/bin and sees no host /usr/local material.
-  tools_dir: ""
-  # The host directories curated into the workspace's /usr/bin, /usr/sbin,
-  # /usr/lib (also mounted at /lib), /usr/share/doc and /usr/share/man. Empty
-  # uses the host defaults; they exist so an image can point at a smaller tree.
-  tools_bin_dir: ""
-  tools_sbin_dir: ""
-  tools_lib_dir: ""
-  tools_doc_dir: ""
-  tools_man_dir: ""
+  # Host filesystem root the curated trees are read from. Empty (the normal
+  # case) reads the real host. It exists so a test can point materialization at
+  # a small fixture tree.
+  tools_root: ""
   # The kernel strings a workspace is told. They must never be a real kernel and
   # must not name the engine (a tenant reads them back).
   kernel_release: "0.0.0-sandbox"
@@ -224,6 +214,22 @@ identity:
   # Optional override of the compiled shim path; empty uses the copy embedded in
   # the binary (written to the service tmp dir and bind-mounted read-only).
   shim_path: ""
+
+# Named workspace profiles: an explicit, reviewable allowlist of the tools (and
+# the data/library trees those tools need) a workspace gets. A workspace names
+# the profile it wants at creation; the default is used when it names none.
+#
+# The profiles themselves are data files (configs/profiles/*.yaml, embedded in
+# the binary). Built in: `python` (Python 3.12 + pip/venv + Node + Perl + git +
+# common tools) and `minimal` (POSIX shell + coreutils only). Adding a language
+# means adding a file, never editing the engine.
+profiles:
+  # Optional directory of additional/override profile YAML files. Each file's
+  # stem must equal its `name`; a file overlays a same-named built-in or adds a
+  # new profile. Empty uses only the built-ins.
+  dir: ""
+  # Profile a workspace gets when its create request names none. Must be loaded.
+  default: "python"
 
 # Static API keys. Each entry maps a key to a principal_id.
 # Multiple keys may share a principal_id.

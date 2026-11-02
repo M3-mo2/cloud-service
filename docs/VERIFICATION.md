@@ -1,6 +1,6 @@
 # Verification
 
-Results for sandboxd v0.0.17 against the acceptance criteria in the spec.
+Results for sandboxd v0.0.18 against the acceptance criteria in the spec.
 
 Environment:
 
@@ -40,7 +40,9 @@ reports `"cgroups":true`.
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/process-stop-check.sh` → `25 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/session-nsjail-check.sh` → `18 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh` → `27 passed / 0 failed / 0 skipped`
-> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `70 passed / 0 failed / 2 skipped`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `97 passed / 0 failed / 2 skipped`
+> - `BASE=http://127.0.0.1:8099 KEY=… OTHER_KEY=… DATA_DIR=… NSJAIL=/usr/local/bin/nsjail sudo -n bash scripts/acceptance.sh` → `113 passed / 0 failed`
+> - `bash scripts/docs-consistency.sh` → `160 passed / 0 failed`
 >
 > The unprivileged suites (`gofmt`, `go build`, `go vet`, `go test ./...`, the
 > handler-level assertions and the sandbox-config render tests) were re-run and
@@ -101,7 +103,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **320** (316 unit + 4 `integration`-tagged), including regression
+Test functions: **336** (332 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -177,7 +179,7 @@ ok   readyz.nsjail                True
 ### 1. healthz
 ok   healthz.status               ok
 ### 2. meta
-ok   meta.version                 0.0.17
+ok   meta.version                 0.0.18
 ### 3. create workspace
 workspace id: ws_01M6BNEZGVE2AFRADVKB01FFC2
 ### 4. mkdir /src
@@ -1688,9 +1690,81 @@ the documented permanent limit (asserted as the real value).
 skips are the Stage 2 zero-artifact mechanisms above (each with its measurement
 as the reason); the seven new `PASS`es are the visibility group 10c.
 
+## 9j. Workspace profiles: an explicit allowlist (this revision)
+
+This revision replaces the denylist tool model with **named profiles** carrying
+an explicit allowlist, and extends `scripts/identity-check.sh` with group §11
+(execution checks inside a real workspace). Every number below is from a real
+run against real nsjail; **identity-check.sh this revision: `97 passed / 0
+failed / 2 skipped`** (was 70; the new group is `27` assertions, all using
+execution, not file-existence). The two skips are the unchanged Stage-2
+zero-artifact mechanisms.
+
+A `python`-profile workspace, by execution:
+
+```
+python -c 'print("py-ok")'                                            -> 0 'py-ok'
+python3 -c 'import json,csv,sqlite3,ssl,ctypes,urllib,email,\
+xml,asyncio,pdb,unittest,pydoc;print("stdlib-ok")'                    -> 0 'stdlib-ok'
+pip --version                                                         -> 0  pip 24.0
+node -e 'console.log(6*7)'                                            -> 0 '42'
+git --version                                                         -> 0  git version 2.43.0
+perl -e 'print "perl-ok\n"'                                           -> 0 'perl-ok'
+awk 'BEGIN{print "awk-ok"}'                                           -> 0 'awk-ok'
+```
+
+and a tool the profile does **not** name is genuinely absent (execution fails
+`422 unprocessable` command-not-found, asserted for `gcc`, `cc`, `apt`, `cmake`,
+`gdb`):
+
+```
+gcc --version        -> 422 command not found
+apt --version        -> 422 command not found
+sh -c 'command -v gcc'  -> (empty)
+```
+
+A `minimal`-profile workspace runs a shell and coreutils but **lacks every
+language runtime** — the proof the allowlist excludes:
+
+```
+sh -c 'echo sh-ok'   -> 0 'sh-ok'
+python3 / python / node / git / gcc / curl  -> 422 command not found (each)
+```
+
+The API surface, by execution:
+
+```
+POST /v1/workspaces {"name":"x","profile":"python"}  -> 201, record profile "python"
+POST /v1/workspaces {"name":"x"}                     -> 201, record profile "python" (default applied)
+POST /v1/workspaces {"name":"x","profile":"nope"}    -> 422 unknown_profile (details.profile="nope")
+GET  /v1/meta .profiles.default                      -> "python"
+GET  /v1/meta .profiles.profiles[*].name             -> [minimal, python]
+readyz .profiles.ready                               -> true
+meta   .provider_tools_hidden.mechanism[0]           -> profile-materialized
+```
+
+A terminal **session** works on `python` (a real PTY: `/dev/pts/N`, `IS_TTY`,
+`stty size` → `24 80`); on `minimal` it is refused with the actionable `422
+session_needs_interpreter` (the PTY relay is a Python program).
+
+Two real bugs were found by **executing** rather than by inspecting files, and
+both are fixed:
+
+- the curated tree omitted `/usr/lib/ssl`, so `urlopen("https://pypi.org/…")`
+  failed with `CERTIFICATE_VERIFY_FAILED: unable to get local issuer
+  certificate` even though `/etc/ssl/certs` was mounted. `tunnel-check.sh` went
+  from `26/1` to `27/0` once `/usr/lib/ssl` was added to the base library set.
+- a profile alias (`python` → `python3`) has no host executable, so command
+  resolution now returns the jail path `/usr/bin/<name>` for a profile command.
+
+The other gates are unchanged and green against the new default profile:
+`acceptance.sh 113/0`, `process-stop-check.sh 25/0`, `session-nsjail-check.sh
+18/0`, `tunnel-check.sh 27/0`, `docs-consistency.sh 160/0` (was 158; +2 for the
+two new error codes), `336` test functions.
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **80** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **83** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -1717,7 +1791,11 @@ being made INVISIBLE to the tenant (the shim hides `/etc/ld.so.preload`, itself
 and the legacy dirs, with the glibc-versioned filesystem interposers, while the
 loader still reads the preload list — correcting ADR 72's "unavoidable"
 classification), and **#80** settles the shipped nsjail (3.4) versus the
-unreleased `master` with `--seccomp_unotify`.
+unreleased `master` with `--seccomp_unotify`. **#81**/**#82** cover the
+canonicalization family answering `EACCES` and the `rlimit_as`-vs-`memory_mb`
+finding, and **#83** replaces the denylist tool model with named workspace
+profiles (an explicit allowlist), the entry-set decision (binaries vs trees), the
+per-profile materialization choice, and what a profile can and cannot promise.
 
 ## 11. OpenAPI
 
@@ -1764,7 +1842,7 @@ passed=<N> failed=0
 - Multi-node storage is deferred; storage is local filesystem JSON.
 - DB-backed/dynamic authentication is deferred; keys are static in the config
   (bearer auth itself is exercised by `TestAuth*`).
-- Per-UID-per-workspace isolation is deferred to v0.1 (v0.0.17 uses a shared
+- Per-UID-per-workspace isolation is deferred to v0.1 (v0.0.18 uses a shared
   `sandbox` UID/GID with per-run user namespaces and cgroups).
 - `rlimit_fsize` bounds a single file, and `disk_mb` is enforced on the file API
   path and via a `du` recheck on workspace load; it is not enforced by the

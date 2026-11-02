@@ -7,9 +7,9 @@ product's job; this service authenticates only static per-principal API keys.
 `sandboxd` lets clients create isolated workspaces, upload files, and run code inside
 [nsjail](https://github.com/google/nsjail) with CPU/memory/disk limits and no network by default.
 
-> Status: **v0.0.17** (pre-alpha). The service version string (`model.Version`)
+> Status: **v0.0.18** (pre-alpha). The service version string (`model.Version`)
 > tracks the highest feature group resolved in [docs/DECISIONS.md](docs/DECISIONS.md),
-> which now runs to v0.0.17; it is independent of the `/v1` API contract version.
+> which now runs to v0.0.18; it is independent of the `/v1` API contract version.
 > SSE log streaming and multi-node storage are deferred to v0.1.
 
 ## Features
@@ -57,16 +57,19 @@ product's job; this service authenticates only static per-principal API keys.
   is **invisible**: the shim answers `ENOENT` for `/etc/ld.so.preload`, its own
   in-jail path and the legacy engine directories, so nothing named, nothing
   browsable, nothing readable — while the loader still reads the preload list and
-  the mask keeps working. The platform's own
-  tooling is hidden too (`identity.hide_provider_tools`): `/usr/local` and
-  `/etc/ssl/certs` are replaced with curated trees, so `zcp`/`zsc`/`yq`, the
-  vendor strings and the provider-named certificates are not visible, while
-  `python3`/`node`/`bash`/`perl`/`git` still work. The honest limits — a
+  the mask keeps working. A workspace's **toolchain is a named profile** (an
+  explicit, reviewable allowlist): the host `/usr` is replaced with a tree that
+  holds only the tools the profile names, so `apt`, the compiler chain and the
+  platform's own `/usr/local` tooling are simply absent, while the profile's own
+  tools (`python3`/`node`/`bash`/`perl`/`git` in the `python` profile) work. A
+  tool that is not in the profile is **absent by execution**, and `/etc/ssl/certs`
+  is filtered of provider-named certificates. The honest limits — a
   statically-linked, musl, raw-`syscall(2)` or handle-scoped-`dlvsym(3)` binary
-  bypasses it — are documented, not implied away. `GET /readyz` and
-  `GET /v1/meta` report `identity_masking` and `provider_tools_hidden`
-  truthfully. See [docs/DECISIONS.md](docs/DECISIONS.md) #71–#82 and
-  [scripts/identity-check.sh](scripts/identity-check.sh).
+  bypasses the mask; a profile is an allowlist of tools, not a new security
+  boundary — are documented, not implied away. `GET /readyz` and
+  `GET /v1/meta` report `identity_masking`, `provider_tools_hidden` and the
+  offered `profiles` truthfully. See [docs/DECISIONS.md](docs/DECISIONS.md)
+  #71–#83 and [scripts/identity-check.sh](scripts/identity-check.sh).
 
 See [docs/API.md](docs/API.md) for the full endpoint reference.
 
@@ -135,11 +138,17 @@ service from source needs a C compiler for the shim; a plain `go build ./...`
 uses the committed `internal/executor/hostmask.so`.
 
 Hiding the platform's own tooling is also on by default
-(`identity.hide_provider_tools: true`): a curated read-only `/usr/local` (empty,
-or `identity.tools_dir`) and a provider-filtered `/etc/ssl/certs` replace the
-host's, so the operator's CLI (`zcp`, `zsc`, `yq`) and vendor material are not
-visible inside a workspace. The egress address still names the provider (it is
-the platform-shared NAT) — that is structural and documented in
+(`identity.hide_provider_tools: true`): the host `/usr` is replaced with a tree
+**materialized from the workspace's named profile** (an explicit allowlist) and
+`/etc/ssl/certs` is replaced with a provider-filtered copy. A workspace gets
+exactly the tools its profile names — for the `python` profile, Python 3.12 with
+pip/venv, Node.js, Perl, git and common shell tools, and even a `python` alias of
+`python3`; for `minimal`, a POSIX shell and coreutils and nothing else. The
+operator's CLI (`zcp`, `zsc`, `yq`), the compiler chain and vendor material are
+not visible inside a workspace because the profile never names them. A profile is
+data (`configs/profiles/*.yaml`): adding a language is adding a file, not editing
+the engine. The egress address still names the provider (it is the
+platform-shared NAT) — that is structural and documented in
 [docs/DECISIONS.md](docs/DECISIONS.md) #76; an optional, default-off
 `network.egress_proxy` is the only lever and changes the operator's reputation
 profile.

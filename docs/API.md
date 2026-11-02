@@ -1,7 +1,7 @@
 # API guide
 
 Human-friendly, self-sufficient reference for the sandboxd HTTP/JSON API
-(v0.0.17). The machine-readable contract is
+(v0.0.18). The machine-readable contract is
 [api/openapi.yaml](../api/openapi.yaml); where the two disagree, **this document
 follows the implemented behaviour** and the disagreement is recorded in
 [Known discrepancies](#known-discrepancies) at the end.
@@ -83,6 +83,8 @@ additional code the router emits:
 | `conflict` | 409 | Operation conflicts with current state | Purging run history (or deleting one run) while a run is still queued/running. |
 | `tunnels_disabled` | 422 | Quick tunnels forbidden | `POST .../tunnels` when `tunnels.enabled` is false (`details.config:"tunnels.enabled"`), the workspace has not opted in (`limits.allow_tunnels`), or the workspace has no egress (`limits.allow_net`), which cloudflared needs. |
 | `too_many_tunnels` | 422 | Per-workspace tunnel cap reached | `POST .../tunnels` when `tunnels.max_per_workspace` active tunnels already exist. |
+| `unknown_profile` | 422 | A workspace create named a profile that is not offered | `POST /v1/workspaces` with `profile` set to a name not in `GET /v1/meta`'s `profiles` list. The name is preserved in `details.profile`; it is never silently replaced by the default. |
+| `session_needs_interpreter` | 422 | A terminal session was requested for a profile without Python | `POST .../sessions` on a workspace whose profile does not provide `python3` (e.g. `minimal`). The PTY relay that backs a session is a Python program, so a shell-only profile cannot host one. |
 | `workspace_suspended` | 409 | Work refused because the workspace is suspended | `POST .../exec`, `POST .../runs`, `POST .../sessions` or a session sub-resource on a `suspended` workspace. |
 | `too_many_sessions` | 409 | Per-workspace concurrent-session cap reached | `POST .../sessions` when `sessions.max_per_workspace` is already in use. |
 | `session_ended` | 409 | Operation on a terminal session | `input`/`signal`/`resize` (or `output` after `DELETE`) on a session that has ended; the workspace check wins while suspended. |
@@ -193,7 +195,7 @@ default per-workspace limits.
 
   ```json
   {
-    "version": "0.0.17",
+    "version": "0.0.18",
     "api_version": "v1",
     "runtimes": ["python3"],
     "interpreters": ["bash", "node", "perl", "python3"],
@@ -222,8 +224,20 @@ default per-workspace limits.
     },
     "provider_tools_hidden": {
       "enabled": true, "ready": true,
-      "mechanism": "curated read-only /usr/local and /etc/ssl/certs overlays",
-      "limits": "hides the host's own /usr/local and vendor-named certificates; it cannot change the provider the egress address is registered to"
+      "mechanism": "profile-materialized read-only /usr (also bound at /bin, /sbin, /lib, /lib64), plus filtered /etc/{passwd,group,ssl/certs}",
+      "limits": "a workspace sees only the tools its profile names (an explicit allowlist) plus engine base commands, shared libraries and loaders; a profile entry naming the engine/platform is refused (fail loud), and it cannot change the provider the egress address is registered to"
+    },
+    "profiles": {
+      "ready": true,
+      "default": "python",
+      "profiles": [
+        {"name":"minimal","description":"POSIX shell, coreutils and the common text/file utilities only. No language runtime.",
+         "languages":[],"provides":["sh","bash","coreutils","findutils","grep","sed"],
+         "commands":["bash","cat",", ..."],"paths":[],"notes":"shell-only profile. ..."},
+        {"name":"python","description":"Python 3.12 with pip/venv, plus Node.js, Perl, git and common shell tools.",
+         "languages":["python","node"],"provides":["python","pip","node","git","coreutils","shell"],
+         "commands":["bash","cat",", ..."],"paths":["/usr/lib/python3.12",", ..."],"notes":"..."}
+      ]
     }
   }
   ```
@@ -246,10 +260,20 @@ default per-workspace limits.
   cover (a statically-linked, musl, raw-`syscall(2)` or handle-scoped-`dlvsym(3)`
   binary bypasses it). `provider_tools_hidden` reports the provider-tool overlay
   (`identity.hide_provider_tools`, default true): `enabled` is the switch,
-  `ready` whether the curated `/usr/local` and `/etc/ssl/certs` trees were
-  materialized, and `limits` states that it hides the platform's own tooling and
-  vendor-named certificates but cannot change the provider the egress address is
-  registered to (see [DECISIONS.md](DECISIONS.md) ADR 74/76).
+  `ready` whether the profile trees and `/etc/ssl/certs` were materialized, and
+  `limits` states that a workspace sees only its profile's allowlist (an entry
+  naming the engine/platform is refused, fail loud) but that it cannot change the
+  provider the egress address is registered to (see
+  [DECISIONS.md](DECISIONS.md) ADR 74/76/83).
+  `profiles` reports the tool profiles a client can choose from: `default` is the
+  profile a workspace gets when its create omits one, `ready` is whether the
+  registry loaded and the default exists (`reason` explains a `ready:false`), and
+  `profiles` lists each offered profile with `name`, `description`, `languages`,
+  `provides`, the full `commands` allowlist, the attached data/library `paths`,
+  and free-form `notes`. A profile is data (a YAML file under `configs/profiles/`
+  embedded in the binary, overridable via `profiles.dir`): adding a language means
+  adding a file, never editing the engine. See
+  [Workspace profiles](#workspace-profiles).
 
 ```sh
 KEY=dev-key-please-rotate
@@ -265,7 +289,14 @@ Create a workspace owned by the authenticated principal.
   | Field | Go type | JSON | Required | Validation | Default when omitted |
   |-------|---------|------|----------|------------|----------------------|
   | `name` | `string` | `name` | yes | `required,min=1,max=128` | — (400 if missing/empty/>128) |
+  | `profile` | `string` | `profile` | no | must name a profile from `GET /v1/meta`'s `profiles` list | server `profiles.default` (`python`) |
   | `limits` | `*limitsJSON` | `limits` | no | none | server `limits` defaults |
+
+  `profile` is a **top-level field**, not under `limits`: the profile selects the
+  workspace's toolchain, which is orthogonal to its resource limits. An unknown
+  name is **`422 unknown_profile`** (it is never silently replaced by the
+  default). The resolved name — including the default when `profile` is omitted
+  — is stored on the record and returned by every workspace endpoint.
 
   `limits` fields (all optional; a value of 0/absent falls back to the server
   default; only positive numeric values take effect):
@@ -286,20 +317,24 @@ Create a workspace owned by the authenticated principal.
 
   ```json
   {"workspace":{"id":"ws_01J...","owner_id":"user_dev","name":"demo",
+    "profile":"python",
     "created_at":"2026-01-02T15:04:05Z","status":"active",
     "limits":{"cpu_cores":1,"memory_mb":256,"disk_mb":1024,
               "max_wall_time_sec":300,"max_runs":3,"allow_net":false}}}
   ```
 - **Errors:** 400 `validation` (bad JSON / failed tag), 401 `unauthorized`,
   413 `payload_too_large` (body > `json_body_mb`), 422 `unprocessable` (a limit
-  above the server maximum).
+  above the server maximum), 422 `unknown_profile` (`profile` not in the
+  catalogue; `details.profile` carries the requested name).
 - **Semantics:** `allow_net` is always taken from the request when a `limits`
   object is present (so `{"limits":{}}` sets `allow_net` to `false`), and only
   from the server default when `limits` is omitted entirely. Numeric limits are
   bounded by the server-level maxima (`max_limits:` in config; defaults
   `cpu_cores` 8, `memory_mb` 8192, `disk_mb` 51200, `max_wall_time_sec` 3600,
   `max_runs` 64); a request above a maximum is `422 unprocessable`. Limits can
-  be changed later with `PATCH`.
+  be changed later with `PATCH`. The **profile is immutable**: it decides which
+  tools exist in the workspace, so it is fixed at creation and `PATCH` never
+  changes it (a profile change is a new workspace).
 
 ```sh
 curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
@@ -1856,6 +1891,64 @@ curl -s -H "Authorization: Bearer $KEY" \
   "localhost:8080/v1/workspaces/$WS/runs/$RUN/logs?stream=stdout&offset=0&limit=65536"
 ```
 
+## Workspace profiles
+
+A workspace's toolchain is chosen by a **named profile**: an explicit,
+reviewable **allowlist** of the tools (and the data/library trees those tools
+need) the workspace is given. A workspace names the profile it wants at creation
+(`POST /v1/workspaces {"name":"x","profile":"python"}`), the stored record says
+which it got, and `GET /v1/meta` lists the offered profiles so a client can
+choose.
+
+This replaces the previous model, in which every workspace received a copy of
+almost the whole host `/usr/bin` and `/usr/sbin` with only the engine/platform
+names removed (a denylist). A profile is data, not a code path: adding a
+language means adding a file under `configs/profiles/` (or a directory an
+operator points `profiles.dir` at), never editing the engine.
+
+- **A tool is not just its binary.** A profile has entry sets: `commands` names
+  binaries, and `paths` names files, directories and whole trees a tool needs.
+  The `python` profile attaches `/usr/lib/python3.12` (the whole stdlib — without
+  it `import json` fails), `/usr/lib/node_modules/npm`, `/usr/lib/git-core`,
+  the perl trees and more. The engine also always provides the shared libraries,
+  the ELF loader and `/usr/lib/ssl` (TLS trust paths), so a dynamically-linked
+  TLS client works.
+- **Absence is enforced.** A tool not in the profile is **absent**: executing it
+  inside a real workspace fails command-not-found (`422 unprocessable`). The
+  engine's existing engine/platform name+content filter still applies on top of
+  a profile; a profile entry naming the engine or platform is refused (fail
+  loud), never silently shipped.
+- **The default** is the server's `profiles.default` (`python`). A create that
+  omits `profile` gets it, and the record reports the resolved name. An existing
+  record with no stored profile (predating profiles) reads as the default.
+- **Immutability.** A workspace's profile is fixed at creation and is **not**
+  patchable: it decides which tools exist, so changing it would invalidate
+  anything already installed or running. A different toolchain is a new
+  workspace.
+- **Terminal sessions need Python.** The PTY relay that backs a session is a
+  Python program, so `POST .../sessions` on a profile without `python3` (e.g.
+  `minimal`) is refused `422 session_needs_interpreter`.
+- **Where `screen`/`tmux` work.** A PTY-based tool works only in a terminal
+  **session** (which binds `/dev/pts` and `/dev/ptmx`), never in one-shot
+  `exec`/`run` (which get only `null`/`urandom`/`zero`), where `openpty()` fails
+  with `ENOENT` regardless of the profile. The `python` profile documents this
+  rather than shipping a tool that mysteriously fails.
+
+The built-in profiles are `python` (Python 3.12, pip/venv, Node.js, Perl, git and
+common shell tools; it also provides a `python` alias of `python3`, which the
+host lacks) and `minimal` (POSIX shell + coreutils only, no language runtime —
+used by the test suite to prove the allowlist excludes things).
+
+```sh
+# list the profiles and the default
+curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/meta | \
+  python3 -c 'import json,sys;d=json.load(sys.stdin)["profiles"];print("default",d["default"]);[print(" -",p["name"],len(p["commands"]),"commands") for p in d["profiles"]]'
+
+# create under a named profile
+curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"demo","profile":"python"}' localhost:8080/v1/workspaces
+```
+
 ## File execution and interpreters
 
 A `kind:file` run no longer assumes Python. The interpreter is chosen by the
@@ -2160,7 +2253,7 @@ out-of-band changes cannot drift the quota.
   empty (no egress). With `allow_net:true` it is connected to the public internet
   through chained slirp4netns over UNIX sockets — the host network namespace is
   never shared, and the host LAN is blackholed. There is no host allowlist in
-  v0.0.17 (see [Quick tunnels and egress](#quick-tunnels-and-egress)).
+  v0.0.18 (see [Quick tunnels and egress](#quick-tunnels-and-egress)).
 - **Syscalls:** a default-allow seccomp policy KILLs a denylist of dangerous
   syscalls (`mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`,
   module loading, …). `cgroup v2` ceilings require the container to run with
@@ -2190,7 +2283,7 @@ curl -s $BASE/readyz
 # {"cgroups":true,"data_dir":true,"nsjail":true,"status":"ready"}
 
 curl -s -H "$AUTH" $BASE/v1/meta
-# {"version":"0.0.17","api_version":"v1", ... }
+# {"version":"0.0.18","api_version":"v1", ... }
 
 WS=$(curl -s -H "$AUTH" -H "$JSON" \
   -d '{"name":"demo","limits":{"memory_mb":256}}' \

@@ -1,4 +1,4 @@
-# sandboxd specification (v0.0.17)
+# sandboxd specification (v0.0.18)
 
 This document is the canonical specification for the sandboxd service. It is a
 faithful copy of the project brief, retained in-repo so implementation and
@@ -15,9 +15,9 @@ belong to the separate frontend product, §2.6.)
 
 - Language: Go 1.22 (the brief targeted 1.22; `go.mod` requires Go 1.23 because
   the mandated koanf YAML parser declares a `go 1.23` floor — see
-  [DECISIONS.md](DECISIONS.md)). The service version string is `0.0.17`
+  [DECISIONS.md](DECISIONS.md)). The service version string is `0.0.18`
   (`model.Version`): it is the highest feature group resolved in DECISIONS.md
-  (which runs to v0.0.17), not the `/v1` API contract version. The two move
+  (which runs to v0.0.18), not the `/v1` API contract version. The two move
   independently — the API prefix changes only on a breaking contract change.
 - OS: Ubuntu Noble (24.04), x86_64.
 - Router: `github.com/go-chi/chi/v5`.
@@ -30,12 +30,12 @@ belong to the separate frontend product, §2.6.)
 - Lint: `golangci-lint` if available; otherwise `go vet ./...` must pass.
 - Sandbox: `nsjail` (may or may not be installed on the host — the service must
   detect and report via `/readyz`, never crash).
-- No external DB. Storage is filesystem JSON under `./data/` in v0.0.17.
+- No external DB. Storage is filesystem JSON under `./data/` in v0.0.18.
 - The service version string (`model.Version`) tracks the highest feature group
-  resolved in [DECISIONS.md](DECISIONS.md) (currently v0.0.17), **not** the `/v1`
+  resolved in [DECISIONS.md](DECISIONS.md) (currently v0.0.18), **not** the `/v1`
   API contract version: the API prefix changes only on a breaking contract
   change, so the two are deliberately decoupled. The decision log's own
-  per-group labels (v0.0.6 … v0.0.17) are the version history this number
+  per-group labels (v0.0.6 … v0.0.18) are the version history this number
   follows.
 - Everything must build with `go build ./...` and pass `go test ./...`.
 - Generate OpenAPI 3.1 spec at `api/openapi.yaml` — it is the source of truth
@@ -54,7 +54,7 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 
 - `GET /healthz` → 200 `{"status":"ok"}`
 - `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str}}`
-- `GET /v1/meta` → `{"version":"0.0.17","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
+- `GET /v1/meta` → `{"version":"0.0.18","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
 - `GET /metrics` → Prometheus text
 
 #### What a workspace can and cannot observe
@@ -80,11 +80,12 @@ It **cannot**:
   (`gnu_get_libc_version`/`confstr` are trimmed to the upstream number);
 - learn the operator's server FQDN or LAN address: the workspace's `/etc/hosts`
   is a generated file holding only generic localhost entries, never the host's;
-- see the platform's own tooling or vendor material: `/usr/local` and
-  `/etc/ssl/certs` are replaced with curated trees that contain no operator
-  binary (`zcp`/`zsc`/`yq`), no vendor string and no provider-named certificate,
-  while the legitimate toolchain (`python3`, `node`, `bash`, `perl`, `git`) still
-  works;
+- see any tool its **profile** does not name: a workspace's whole `/usr` is
+  replaced with a tree holding only the tools its named profile allows (an
+  explicit allowlist) plus the engine base, shared libraries and loaders, so the
+  platform's tooling (`zcp`/`zsc`/`yq`), the compiler chain, `apt` and every
+  other unlisted command are simply absent. `/etc/ssl/certs` is replaced with a
+  copy that holds no provider-named certificate while normal TLS keeps working;
 - step behind the masking shim through a handle-scoped `dlsym`: a
   `dlopen("libc.so.6")` + `dlsym` lookup is answered by the shim, so
   `ctypes.CDLL("libc.so.6").uname` returns the masked value.
@@ -559,7 +560,7 @@ What is **still not implemented** (the honest non-goal):
 
 Stated precisely: **stop-everything for a workspace exists natively now;
 supervision (desired-state restart/autostart) remains a documented non-goal for
-this version** (v0.0.17). Where such a capability would belong if built — an
+this version** (v0.0.18). Where such a capability would belong if built — an
 engine-level supervisor versus the frontend restarting runs — is recorded in
 [DECISIONS.md](DECISIONS.md) #61. **It is deliberately not implemented in this
 version.**
@@ -608,15 +609,23 @@ config template `configs/nsjail_python.cfg.tmpl` must include:
   before any shim is mapped) still reads it and `env -i` stays masked. The mounts
   are `mandatory:true`: a mask that cannot be applied aborts the run rather than
   leaking. See [DECISIONS.md](DECISIONS.md) #71–#73, #79.
-- zero-signal curation (`identity.hide_provider_tools`, default on): the host's
-  `/usr/{bin,sbin,lib,local}`, `/lib`, `/usr/share/{doc,man}` and
-  `/etc/{passwd,group,ssl/certs}` are each replaced inside the workspace with a
-  curated, read-only copy that drops every entry naming the engine (`nsjail`,
-  `slirp4netns`, `runcon`, `setpriv`, `unshare`, `nsenter`, `chroot`,
-  `sandboxd`, `hostmask`) or the platform (`zerops`, `vshosting`, `zabbly`) and
-  reproduces the rest. This removes the engine's own runner, its helper
-  binaries, the engine-named environment, the provider account and the
-  provider-named systemd units. See [DECISIONS.md](DECISIONS.md) #74, #77.
+- **profile curation** (`identity.hide_provider_tools`, default on): the host's
+  `/usr` is replaced inside the workspace with a tree **materialized from the
+  workspace's named profile** — an explicit, reviewable **allowlist**. It holds
+  only the commands the profile names plus engine base commands, the shared
+  libraries, the ELF loader and `/usr/lib/ssl`, and the data/library trees the
+  profile attaches (e.g. `/usr/lib/python3.12` for python, `/usr/lib/git-core`
+  for git). `python3`, `node`, `bash`, `perl` and `git` therefore work only when
+  the profile provides them, and `apt`, the `gcc`/`binutils` chain, `/usr/include`,
+  `/usr/libexec` and the platform's own `/usr/local` tooling do not exist at all.
+  `/etc/{passwd,group,ssl/certs}` are filtered of every entry naming the provider
+  (`zerops`, `vshosting`, `zabbly`). The engine's engine-named filter (`nsjail`,
+  `slirp4netns`, `sandboxd`, `hostmask`) still applies on top of a profile; a
+  profile entry naming the engine or platform is **refused** (fail loud). This
+  removes the engine's own runner, its helper binaries, the engine-named
+  environment, the provider account and the provider-named systemd units while
+  giving a tenant exactly the toolchain its profile promises. See
+  [DECISIONS.md](DECISIONS.md) #74, #77, #83.
 - package tiers: when the shared tier is configured and available, bind-mount it
   read-only at `/opt/python/shared`; always bind-mount the workspace's private
   tier read-write at `/opt/python/private`; inject both (shared first) via
