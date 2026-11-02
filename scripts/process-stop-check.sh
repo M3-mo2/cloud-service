@@ -168,7 +168,7 @@ GO=$(command -v go || echo /usr/local/go/bin/go)
 # Guard against silent rot: the tag mechanism and the new routes must exist in
 # the source before the run starts.
 [ -f "$ROOT/scripts/process-stop-check.sh" ] || { echo "FAIL  artifact: harness missing"; exit 1; }
-grep -q "SANDBOXD_WORKSPACE" "$ROOT/internal/executor/process.go" ||
+grep -q "WORKSPACE_ID" "$ROOT/internal/executor/process.go" ||
   { echo "FAIL  artifact: executor no longer injects the process tags"; exit 1; }
 grep -q "TagEnv" "$ROOT/configs/nsjail_python.cfg.tmpl" ||
   { echo "FAIL  artifact: nsjail template no longer renders the process tags"; exit 1; }

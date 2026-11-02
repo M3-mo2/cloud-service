@@ -40,6 +40,31 @@ mount {
 
 {{- if .OverlayEnabled }}
 
+# Curated tool directories: the host /usr is mounted so a workload has a normal
+# toolchain, but it also carries the ENGINE's own runner (nsjail), its sandbox
+# helpers (slirp4netns, unshare, nsenter, setpriv, runcon, chroot) and any
+# engine/platform-named file. The curated /usr/bin and /usr/sbin replace the
+# host's with copies that drop exactly those entries and keep every other tool,
+# so a workspace keeps its toolchain with no engine name reachable. The engine
+# provides no tool named `nsjail` legibly, so no legitimate workload needs one.
+# mandatory:true is the fail-loud contract: if a curated tree cannot be mounted
+# the run aborts rather than exposing the host directory.
+mount {
+  src: "{{ .BinDir }}"
+  dst: "{{ .BinJail }}"
+  is_bind: true
+  rw: false
+  mandatory: true
+}
+
+mount {
+  src: "{{ .SbinDir }}"
+  dst: "{{ .SbinJail }}"
+  is_bind: true
+  rw: false
+  mandatory: true
+}
+
 # Provider-identity overlays: the workspace sees a curated /usr/local instead of
 # the host's, and a curated /etc/ssl/certs. The host's /usr/local carries the
 # platform's own control binaries (zcp, zsc, yq), the vendor CA sources and the
@@ -86,14 +111,14 @@ mount {
 }
 
 mount {
-  src: "/bin"
+  src: "{{ if .OverlayEnabled }}{{ .BinDir }}{{ else }}/bin{{ end }}"
   dst: "/bin"
   is_bind: true
   rw: false
 }
 
 mount {
-  src: "/sbin"
+  src: "{{ if .OverlayEnabled }}{{ .SbinDir }}{{ else }}/sbin{{ end }}"
   dst: "/sbin"
   is_bind: true
   rw: false
@@ -173,19 +198,19 @@ mount {
 {{- end }}
 
 mount {
-  src: "/etc/passwd"
+  src: "{{ if .OverlayEnabled }}{{ .PasswdHost }}{{ else }}/etc/passwd{{ end }}"
   dst: "/etc/passwd"
   is_bind: true
   rw: false
-  mandatory: false
+  {{- if .OverlayEnabled }} mandatory: true {{- end }}
 }
 
 mount {
-  src: "/etc/group"
+  src: "{{ if .OverlayEnabled }}{{ .GroupHost }}{{ else }}/etc/group{{ end }}"
   dst: "/etc/group"
   is_bind: true
   rw: false
-  mandatory: false
+  {{- if .OverlayEnabled }} mandatory: true {{- end }}
 }
 
 mount {
@@ -214,7 +239,7 @@ mount {
 
 {{- if .MaskEnabled }}
 
-# Host-identity masking. The shim (hostmask.so) intercepts the syscall-reachable
+# Build-identity masking. The shim intercepts the syscall-reachable
 # facts a mount namespace cannot hide -- uname, sysinfo, sysconf,
 # sched_getaffinity, getauxval, the libc version strings -- and answers with the
 # WORKSPACE's own limits. It is reached through a read-only /etc/ld.so.preload,
@@ -287,19 +312,6 @@ mount {
   is_bind: true
   rw: true
 }
-
-{{- if .HelperDir }}
-
-# The terminal-session PTY relay helper, mounted read-only so the interactive
-# shell cannot rewrite the code that allocates its terminal. It runs as the
-# sandbox uid with the same mounts and seccomp policy as any workload.
-mount {
-  src: "{{ .HelperDir }}"
-  dst: "/run/sandboxd"
-  is_bind: true
-  rw: false
-}
-{{- end }}
 
 {{- if .SharedPackagesDir }}
 

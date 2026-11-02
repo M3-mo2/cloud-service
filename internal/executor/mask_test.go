@@ -34,12 +34,12 @@ func TestRenderConfigMasksIdentity(t *testing.T) {
 	if !strings.Contains(out, `dst: "/etc/ld.so.preload"`) {
 		t.Errorf("masking must mount the read-only preload list:\n%s", out)
 	}
-	if !strings.Contains(out, `dst: "/sandboxd/hostmask.so"`) {
+	if !strings.Contains(out, `dst: "/run/.rt.so"`) {
 		t.Errorf("masking must mount the shim read-only:\n%s", out)
 	}
 	// The mask mounts must be read-only: a tenant must not replace them. Assert
 	// each rendered mount block ends with rw:false.
-	for _, dst := range []string{`dst: "/sandboxd/hostmask.so"`, `dst: "/etc/ld.so.preload"`} {
+	for _, dst := range []string{`dst: "/run/.rt.so"`, `dst: "/etc/ld.so.preload"`} {
 		block := mountBlock(out, dst)
 		if block == "" {
 			t.Fatalf("mount %s not rendered:\n%s", dst, out)
@@ -48,13 +48,16 @@ func TestRenderConfigMasksIdentity(t *testing.T) {
 			t.Errorf("mount %s must be read-only:\n%s", dst, block)
 		}
 	}
-	if !strings.Contains(out, `SANDBOXD_MASK_CPUS=1`) {
+	if strings.Contains(out, "hostmask") {
+		t.Errorf("the rendered config must not name the shim:\n%s", out)
+	}
+	if !strings.Contains(out, `LSM_SYS_CPUS=1`) {
 		t.Errorf("masking must inject the workspace's cpu count (1):\n%s", out)
 	}
-	if !strings.Contains(out, `SANDBOXD_MASK_MEM_BYTES=268435456`) {
+	if !strings.Contains(out, `LSM_SYS_MEM=268435456`) {
 		t.Errorf("masking must inject the workspace's memory in bytes (256 MB):\n%s", out)
 	}
-	if !strings.Contains(out, `SANDBOXD_MASK_KERNEL_RELEASE=0.0.0-sandbox`) {
+	if !strings.Contains(out, `LSM_SYS_REL=0.0.0-sandbox`) {
 		t.Errorf("masking must inject a generic kernel release:\n%s", out)
 	}
 }
@@ -74,8 +77,8 @@ func TestRenderConfigMaskReflectsWorkspaceNotHost(t *testing.T) {
 		}
 		out := readFile(t, path)
 		os.Remove(path)
-		wantCPU := "SANDBOXD_MASK_CPUS=" + itoa(int(tc.cpus+0.5))
-		wantMem := "SANDBOXD_MASK_MEM_BYTES=" + itoa64(int64(tc.mem)*1024*1024)
+		wantCPU := "LSM_SYS_CPUS=" + itoa(int(tc.cpus+0.5))
+		wantMem := "LSM_SYS_MEM=" + itoa64(int64(tc.mem)*1024*1024)
 		if !strings.Contains(out, wantCPU) {
 			t.Errorf("cpu mask for %v missing %q:\n%s", tc.cpus, wantCPU, out)
 		}
@@ -98,10 +101,10 @@ func TestRenderConfigOmitsMaskWhenDisabled(t *testing.T) {
 	}
 	defer os.Remove(path)
 	out := readFile(t, path)
-	if strings.Contains(out, "hostmask.so") || strings.Contains(out, "ld.so.preload") {
+	if strings.Contains(out, ".rt.so") || strings.Contains(out, "ld.so.preload") {
 		t.Errorf("masking disabled must render no shim/preload mounts:\n%s", out)
 	}
-	if strings.Contains(out, "SANDBOXD_MASK_") {
+	if strings.Contains(out, "LSM_SYS_") {
 		t.Errorf("masking disabled must render no mask env:\n%s", out)
 	}
 }

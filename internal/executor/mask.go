@@ -11,13 +11,13 @@ import (
 )
 
 // This file wires host-identity masking into the sandbox. The compiled shim
-// (hostmask.c -> hostmask.so) intercepts the syscall-reachable facts that a
-// mount namespace cannot hide: uname, sysinfo, sysconf, sched_getaffinity,
-// getauxval and the libc version strings. It is reached by naming it in a
-// read-only /etc/ld.so.preload, so it applies to every dynamically-linked exec
-// regardless of the LD_PRELOAD environment variable (a tenant cannot bypass it
-// with `env -i`); the file and the shim are bind-mounted read-only so a tenant
-// cannot replace them.
+// (hostmask.c -> rt.so) intercepts the syscall-reachable facts that a mount
+// namespace cannot hide: uname, sysinfo, sysconf, sched_getaffinity, getauxval
+// and the libc version strings. It is reached by naming it in a read-only
+// /etc/ld.so.preload, so it applies to every dynamically-linked exec regardless
+// of the LD_PRELOAD environment variable (a tenant cannot bypass it with
+// `env -i`); the file and the shim are bind-mounted read-only so a tenant cannot
+// replace them.
 //
 // Masking is ON by default (config.Identity.Enabled). When it is on but the
 // shim cannot be materialized, the runner reports the masking capability as NOT
@@ -25,27 +25,35 @@ import (
 // The honest limits of the mechanism (static/musl/raw-syscall bypass) are part
 // of the design and are documented in docs/DECISIONS.md.
 
-// In-jail paths for the masking files. The shim is mounted under /sandboxd
-// (a private mount point nsjail creates in its synthetic root, outside the
-// read-only /usr bind); the preload list is mounted over /etc/ld.so.preload.
-// The curated /usr/local and /etc/ssl/certs overlays are mounted over the
-// host's own directories, so a workspace sees only the curated trees.
+// In-jail paths for the masking files. The shim is mounted at /run/.rt.so (an
+// opaque name nsjail creates in its synthetic root, outside the read-only /usr
+// bind); the name deliberately reveals nothing, so `cat /etc/ld.so.preload`
+// names no engine and no mechanism. The preload list is mounted over
+// /etc/ld.so.preload. The curated /usr/local, /usr/bin, /usr/sbin and
+// /etc/ssl/certs overlays are mounted over the host's own directories, so a
+// workspace sees only the curated trees.
 const (
-	maskShimJailPath    = "/sandboxd/hostmask.so"
+	maskShimJailPath    = "/run/.rt.so"
 	maskPreloadJailPath = "/etc/ld.so.preload"
 	toolsJailPath       = "/usr/local"
+	binJailPath         = "/usr/bin"
+	sbinJailPath        = "/usr/sbin"
 	certsJailPath       = "/etc/ssl/certs"
+	passwdJailPath      = "/etc/passwd"
+	groupJailPath       = "/etc/group"
 )
 
 // maskEnvKeys are the environment variables the shim reads. They carry the
 // WORKSPACE's own limits (cpu count, memory bytes) and generic kernel strings,
 // never a host value. They are injected directly by the runner, not through the
-// user env allowlist.
+// user env allowlist. The names are deliberately opaque: publishing an
+// engine-named variable to the workspace would announce both the engine and the
+// fact that a mask is active.
 const (
-	envMaskCPUs          = "SANDBOXD_MASK_CPUS"
-	envMaskMemBytes      = "SANDBOXD_MASK_MEM_BYTES"
-	envMaskKernelRelease = "SANDBOXD_MASK_KERNEL_RELEASE"
-	envMaskKernelVersion = "SANDBOXD_MASK_KERNEL_VERSION"
+	envMaskCPUs          = "LSM_SYS_CPUS"
+	envMaskMemBytes      = "LSM_SYS_MEM"
+	envMaskKernelRelease = "LSM_SYS_REL"
+	envMaskKernelVersion = "LSM_SYS_VER"
 )
 
 // masker materializes the shim and its ld.so.preload file on the host once, and
@@ -54,7 +62,7 @@ const (
 // bind-mounted read-only into each sandbox, so no tenant can write them.
 type masker struct {
 	cfg config.IdentityConfig
-	dir string // host directory holding hostmask.so and ld.so.preload
+	dir string // host directory holding rt.so and ld.so.preload
 
 	once   sync.Once
 	ready  bool
@@ -63,8 +71,7 @@ type masker struct {
 	// Provider-overlay state, materialized by the same prepare() pass.
 	overlayReady bool
 	overlayNote  string
-	toolsDir     string
-	certsDir     string
+	overlays     providerOverlays
 }
 
 // newMasker constructs a masker rooted at dir (the service tmp dir).
@@ -75,8 +82,10 @@ func newMasker(cfg config.IdentityConfig, dir string) *masker {
 // Enabled reports whether masking is turned on by configuration.
 func (m *masker) Enabled() bool { return m.cfg.Enabled }
 
-// shimHostPath returns the host path of the materialized shim.
-func (m *masker) shimHostPath() string { return filepath.Join(m.dir, "hostmask.so") }
+// shimHostPath returns the host path of the materialized shim. The materialized
+// file is given an opaque name so it never appears (in a diagnostic or a mount
+// source) as an engine name.
+func (m *masker) shimHostPath() string { return filepath.Join(m.dir, "rt.so") }
 
 // preloadHostPath returns the host path of the materialized ld.so.preload list.
 func (m *masker) preloadHostPath() string { return filepath.Join(m.dir, "ld.so.preload") }
@@ -137,15 +146,14 @@ func (m *masker) prepareProviderOverlays() {
 		m.overlayNote = "create provider-overlay dir: " + err.Error()
 		return
 	}
-	toolsDir, certsDir, err := materializeProviderOverlays(m.dir, m.cfg.ToolsDir)
+	overlays, err := materializeProviderOverlays(m.dir, m.cfg.ToolsDir, m.cfg.ToolsBinDir, m.cfg.ToolsSbinDir)
 	// The curated /usr/local is the hard part: without it the mount would
 	// expose the host directory, so its failure makes the overlay not ready.
 	if err != nil {
 		m.overlayNote = err.Error()
 		return
 	}
-	m.toolsDir = toolsDir
-	m.certsDir = certsDir // may be empty when the host trust store is unreadable
+	m.overlays = overlays
 	m.overlayReady = true
 }
 
@@ -200,14 +208,39 @@ func (m *masker) OverlayStatus() (enabled, ready bool, note string) {
 // not materialized).
 func (m *masker) ToolsDir() string {
 	m.prepare()
-	return m.toolsDir
+	return m.overlays.ToolsDir
 }
 
 // CertsDir returns the host path of the curated /etc/ssl/certs overlay (empty
 // when not materialized).
 func (m *masker) CertsDir() string {
 	m.prepare()
-	return m.certsDir
+	return m.overlays.CertsDir
+}
+
+// BinDir returns the host path of the curated /usr/bin overlay (empty when not
+// materialized).
+func (m *masker) BinDir() string {
+	m.prepare()
+	return m.overlays.BinDir
+}
+
+// SbinDir returns the host path of the curated /usr/sbin overlay (empty when
+// not materialized).
+func (m *masker) SbinDir() string {
+	m.prepare()
+	return m.overlays.SbinDir
+}
+
+// PasswdHost / GroupHost return the host paths of the filtered /etc/passwd and
+// /etc/group overlays (empty when not materialized).
+func (m *masker) PasswdHost() string {
+	m.prepare()
+	return m.overlays.Passwd
+}
+func (m *masker) GroupHost() string {
+	m.prepare()
+	return m.overlays.Group
 }
 
 // maskParams are the per-request masking values derived from a workspace.
@@ -223,15 +256,24 @@ type maskParams struct {
 	ShimJail    string
 	PreloadJail string
 
-	// Provider-tool overlays. OverlayEnabled mounts the curated /usr/local and
-	// (when present) /etc/ssl/certs over the host's own, so a workspace sees no
-	// platform material. ToolsDir/CertsDir are host paths, empty when the
-	// overlay is unavailable or the switch is off.
+	// Provider/engine overlays. OverlayEnabled mounts the curated /usr/local,
+	// /usr/bin, /usr/sbin, filtered /etc/passwd and /etc/group and (when
+	// present) /etc/ssl/certs over the host's own, so a workspace sees no
+	// platform or engine material. The *Dir/*Host fields are host paths, empty
+	// when the overlay is unavailable or the switch is off.
 	OverlayEnabled bool
 	ToolsDir       string
 	CertsDir       string
+	BinDir         string
+	SbinDir        string
+	PasswdHost     string
+	GroupHost      string
 	ToolsJail      string
 	CertsJail      string
+	BinJail        string
+	SbinJail       string
+	PasswdJail     string
+	GroupJail      string
 }
 
 // params builds the per-request masking parameters for a workspace's limits.
@@ -245,6 +287,10 @@ func (m *masker) params(cpus float64, memMB int) maskParams {
 		PreloadJail:   maskPreloadJailPath,
 		ToolsJail:     toolsJailPath,
 		CertsJail:     certsJailPath,
+		BinJail:       binJailPath,
+		SbinJail:      sbinJailPath,
+		PasswdJail:    passwdJailPath,
+		GroupJail:     groupJailPath,
 	}
 	// Provider-tool overlays are independent of the syscall mask: they apply
 	// whenever hiding is enabled and the trees materialized.
@@ -252,6 +298,10 @@ func (m *masker) params(cpus float64, memMB int) maskParams {
 		p.OverlayEnabled = true
 		p.ToolsDir = m.ToolsDir()
 		p.CertsDir = m.CertsDir()
+		p.BinDir = m.BinDir()
+		p.SbinDir = m.SbinDir()
+		p.PasswdHost = m.PasswdHost()
+		p.GroupHost = m.GroupHost()
 	}
 	if !m.Ready() {
 		return p

@@ -25,9 +25,9 @@ func TestTagEnvRenderedIntoConfig(t *testing.T) {
 	defer os.Remove(path)
 	out := readFile(t, path)
 	for _, want := range []string{
-		`envar: "SANDBOXD_WORKSPACE=ws_tag"`,
-		`envar: "SANDBOXD_KIND=session"`,
-		`envar: "SANDBOXD_SOURCE=ses_abc"`,
+		`envar: "WORKSPACE_ID=ws_tag"`,
+		`envar: "PROCESS_KIND=session"`,
+		`envar: "PROCESS_SOURCE=ses_abc"`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered config missing tag %q:\n%s", want, out)
@@ -41,7 +41,7 @@ func TestTagEnvOmittedWhenNoWorkspace(t *testing.T) {
 	}
 	// A workspace but no kind/source (an exec) still tags the workspace.
 	got := tagEnv(Request{Workspace: &model.Workspace{ID: "ws_x"}, ProcessKind: KindExec})
-	if len(got) != 2 || got[0] != "SANDBOXD_WORKSPACE=ws_x" || got[1] != "SANDBOXD_KIND=exec" {
+	if len(got) != 2 || got[0] != "WORKSPACE_ID=ws_x" || got[1] != "PROCESS_KIND=exec" {
 		t.Fatalf("tagEnv = %v", got)
 	}
 }

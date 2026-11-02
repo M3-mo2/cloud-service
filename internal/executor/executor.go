@@ -50,7 +50,7 @@ func (e *SandboxError) Is(target error) bool { return target == ErrSandboxUnavai
 // devpts was not mounted). It lets the executor recognise a terminal-session
 // startup failure and surface it as a failed session rather than a running one
 // whose output is a Python traceback.
-const PTYErrorMarker = "sandboxd-pty-error:"
+const PTYErrorMarker = "pty-error:"
 
 // Request describes a single execution inside a workspace sandbox.
 type Request struct {

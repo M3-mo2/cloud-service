@@ -290,7 +290,7 @@ func TestPTYHelperCloseEndsSession(t *testing.T) {
 func TestPTYRelayScriptHandlesAllocationFailure(t *testing.T) {
 	s := string(PTYRelayScript)
 	for _, want := range []string{
-		`PTY_ERROR_PREFIX = "sandboxd-pty-error:"`,
+		`PTY_ERROR_PREFIX = "pty-error:"`,
 		"except OSError as exc:",
 		"os._exit(PTY_ERROR_EXIT)",
 	} {
@@ -304,7 +304,7 @@ func TestPTYRelayScriptHandlesAllocationFailure(t *testing.T) {
 // marker into a SandboxError and does not misfire on a healthy session.
 func TestPTYFailureDetectedFromHelperStderr(t *testing.T) {
 	tail := newTailBuffer(1024)
-	_, _ = tail.Write([]byte("noise\nsandboxd-pty-error: cannot allocate a PTY: out of pty devices\n" +
+	_, _ = tail.Write([]byte("noise\npty-error: cannot allocate a PTY: out of pty devices\n" +
 		"the sandbox is missing a working /dev/ptmx and devpts\n"))
 	err := ptyFailure(tail, 69)
 	if err == nil {
@@ -340,7 +340,7 @@ func TestRenderSessionConfigMountsHostDevpts(t *testing.T) {
 		WorkspaceRoot: "/tmp/wsroot",
 		Cwd:           "/",
 		PTY:           true,
-		Argv:          []string{"/usr/bin/python3", "/run/sandboxd/pty_relay.py", `{"shell":"/bin/sh","cols":80,"rows":24}`},
+		Argv:          []string{"/usr/bin/python3", "-c", "pass", `{"shell":"/bin/sh","cols":80,"rows":24}`},
 	}, "/tmp/session-tmp")
 	if err != nil {
 		t.Fatal(err)
@@ -382,19 +382,24 @@ func TestRenderConfigOmitsDevptsForOneShotExec(t *testing.T) {
 	}
 }
 
-// TestRenderSessionConfigHelperMount proves the rendered nsjail config mounts
-// the PTY helper read-only and runs it as the entry command with the shell and
-// initial size in its JSON argument. This is the unprivileged-environment
-// assertion for the session sandbox changes (the real jail needs privileges).
-func TestRenderSessionConfigHelperMount(t *testing.T) {
+// TestRenderSessionConfigHelperNoFile proves the PTY relay source is passed to
+// the interpreter inline (`python3 -c "<source>"`) and that NO helper file or
+// fixture directory is mounted into the sandbox. The engine's relay source must
+// not exist as a readable file inside the jail, so `/run/sandboxd` (and every
+// engine-named path) is absent from the rendered config while the relay is
+// still the entry command. This is the unprivileged-environment assertion for
+// the session sandbox change (the real jail needs privileges).
+func TestRenderSessionConfigHelperNoFile(t *testing.T) {
 	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
 	ws := &model.Workspace{ID: "ws_test", Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
-	path, err := r.renderConfig(Request{
+	path, err := r.renderSessionConfig(Request{
 		Workspace:     ws,
 		WorkspaceRoot: "/tmp/wsroot",
 		Cwd:           "/",
 		PTY:           true,
-		Argv:          []string{"/usr/bin/python3", "/run/sandboxd/pty_relay.py", `{"shell":"/bin/sh","cols":80,"rows":24}`},
+		Shell:         "/bin/sh",
+		Cols:          80,
+		Rows:          24,
 	}, "/tmp/session-tmp")
 	if err != nil {
 		t.Fatal(err)
@@ -402,21 +407,24 @@ func TestRenderSessionConfigHelperMount(t *testing.T) {
 	defer os.Remove(path)
 	out := readFile(t, path)
 
-	mount := `src: "/tmp/session-tmp"
-  dst: "/run/sandboxd"
-  is_bind: true
-  rw: false`
-	if !strings.Contains(out, mount) {
-		t.Errorf("helper dir must be mounted read-only at /run/sandboxd:\n%s", out)
+	if strings.Contains(out, "/run/sandboxd") {
+		t.Errorf("the relay must not be mounted from a fixture directory:\n%s", out)
 	}
-	if !strings.Contains(out, "/run/sandboxd/pty_relay.py") {
-		t.Errorf("helper must be the entry command:\n%s", out)
+	if strings.Contains(out, "pty_relay") {
+		t.Errorf("the relay must not be named as a file inside the jail:\n%s", out)
+	}
+	// The entry command is python3 with the inline source as the argument to -c.
+	if !strings.Contains(out, `arg: "-c"`) {
+		t.Errorf("the relay must be passed inline via -c:\n%s", out)
+	}
+	if !strings.Contains(out, string(PTYRelayScript)) && !strings.Contains(out, `import pty`) {
+		t.Errorf("the relay source must be the -c argument:\n%s", out)
 	}
 	if !strings.Contains(out, `arg: "{\"shell\":\"/bin/sh\",\"cols\":80,\"rows\":24}"`) {
 		t.Errorf("helper argv must carry shell and size:\n%s", out)
 	}
 	// The session must keep the full workload isolation: seccomp, uidmap, no
-	// proc, pip0 network unless allow_net.
+	// proc, private net unless allow_net.
 	for _, want := range []string{"seccomp_string:", "uidmap {", "mount_proc: false", "clone_newnet: true"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("session config missing isolation setting %q:\n%s", want, out)

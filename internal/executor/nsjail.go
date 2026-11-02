@@ -667,11 +667,6 @@ type tmplData struct {
 	SeccompString string
 	SeccompPolicy []string
 
-	// HelperDir, when set, is the session's private /tmp host directory,
-	// bind-mounted read-only at /run/sandboxd so the PTY relay helper runs
-	// there without a writable code path. Empty for non-session requests.
-	HelperDir string
-
 	// PTY, when set, adds the host /dev/pts and /dev/ptmx bind mounts a terminal
 	// session needs (pty.fork() requires a working /dev/ptmx and devpts). It is
 	// false for one-shot exec, which gets the smaller /dev.
@@ -702,12 +697,21 @@ type tmplData struct {
 	MaskEnv         []string
 
 	// Provider-tool overlays (see provider.go). When OverlayEnabled is true the
-	// curated /usr/local (ToolsDir) and, when present, the curated /etc/ssl/certs
-	// (CertsDir) are bind-mounted read-only over the host's own, hiding the
-	// platform's tooling and vendor-named certificates from a workspace.
+	// curated /usr/bin, /usr/sbin, /usr/local and (when present) /etc/ssl/certs
+	// are bind-mounted read-only over the host's own, hiding the engine's own
+	// tooling, the platform's tooling and vendor-named certificates from a
+	// workspace.
 	OverlayEnabled bool
 	ToolsDir       string
 	CertsDir       string
+	BinDir         string
+	SbinDir        string
+	BinJail        string
+	SbinJail       string
+	PasswdHost     string
+	GroupHost      string
+	PasswdJail     string
+	GroupJail      string
 }
 
 // Paths at which the package tiers are mounted inside the sandbox.
@@ -790,13 +794,6 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 	// paths as the bind sources; an empty value omits the mount entirely.
 	sharedDir := req.SharedPackagesDir
 	privateDir := req.PrivatePackagesDir
-	// The session helper lives in the session's own /tmp host dir; mount it
-	// read-only at /run/sandboxd. Using the run tmp keeps the helper out of the
-	// workspace (which is writable) and gives it no writable code path.
-	var helperDir string
-	if req.PTY {
-		helperDir = runTmp
-	}
 	pkgPath := packageSearchPath(sharedPackagesMount, privatePackagesMount, req.SharedPackagesDir, req.PrivatePackagesDir)
 
 	// Host-identity masking: derive the per-workspace values from THIS
@@ -835,8 +832,6 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		SeccompString: seccompString(),
 		SeccompPolicy: seccompPolicy(),
 
-		HelperDir: helperDir,
-
 		PTY: req.PTY,
 
 		SharedPackagesDir:  sharedDir,
@@ -855,6 +850,14 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		OverlayEnabled: mask.OverlayEnabled,
 		ToolsDir:       mask.ToolsDir,
 		CertsDir:       mask.CertsDir,
+		BinDir:         mask.BinDir,
+		SbinDir:        mask.SbinDir,
+		BinJail:        mask.BinJail,
+		SbinJail:       mask.SbinJail,
+		PasswdHost:     mask.PasswdHost,
+		GroupHost:      mask.GroupHost,
+		PasswdJail:     mask.PasswdJail,
+		GroupJail:      mask.GroupJail,
 	}
 	if data.PidsMax <= 0 {
 		data.PidsMax = 64

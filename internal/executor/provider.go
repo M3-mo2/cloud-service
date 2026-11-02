@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // This file implements the "provider identity" part of host masking: hiding the
@@ -39,6 +42,30 @@ import (
 // exposed to a workspace. They are matched case-insensitively.
 var providerStrings = []string{"zerops", "vshosting", "zabbly"}
 
+// engineStrings are substrings that identify the sandbox engine or its masking
+// mechanism. They must not appear anywhere in a curated tool directory: the
+// engine's own runner (`nsjail`), the masking shim (`hostmask`, `sandboxd`) and
+// the engine-named environment would otherwise be visible to a tenant. They are
+// distinct from providerStrings (the platform's names) and are matched
+// case-insensitively.
+var engineStrings = []string{"sandboxd", "hostmask", "nsjail", "SANDBOXD"}
+
+// engineToolNames are the executables a workspace must never see. They either
+// name the engine (`nsjail`, `slirp4netns`) or grant the ability to manipulate
+// sandbox primitives (`runcon`, `setpriv`, `unshare`, `nsenter`, `chroot`). They
+// are denied by NAME in the curated tool directories, so a host binary that
+// merely embeds one of these words is not mistaken for the tool itself. Names
+// are compared lower-cased.
+var engineToolNames = map[string]bool{
+	"nsjail":      true,
+	"slirp4netns": true,
+	"runcon":      true,
+	"setpriv":     true,
+	"unshare":     true,
+	"nsenter":     true,
+	"chroot":      true,
+}
+
 // containsProviderString reports whether s names the provider.
 func containsProviderString(s string) bool {
 	l := strings.ToLower(s)
@@ -48,6 +75,226 @@ func containsProviderString(s string) bool {
 		}
 	}
 	return false
+}
+
+// containsEngineString reports whether s names the engine or its masking
+// mechanism.
+func containsEngineString(s string) bool {
+	l := strings.ToLower(s)
+	for _, e := range engineStrings {
+		if strings.Contains(l, strings.ToLower(e)) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsDeniedString reports whether s names the provider OR the engine.
+func containsDeniedString(s string) bool {
+	return containsProviderString(s) || containsEngineString(s)
+}
+
+// containsDeniedBytes reports whether b contains a provider or engine name. It
+// lower-cases the input once and searches for each token, so a binary that
+// embeds a vendor or engine string anywhere is caught (a `strings`-style audit,
+// not a presence check).
+func containsDeniedBytes(b []byte) bool {
+	low := strings.ToLower(string(b))
+	for _, p := range providerStrings {
+		if strings.Contains(low, p) {
+			return true
+		}
+	}
+	for _, e := range engineStrings {
+		if strings.Contains(low, strings.ToLower(e)) {
+			return true
+		}
+	}
+	return false
+}
+
+// maxToolContentScan bounds how large a curated-directory file is read for the
+// content audit. Tool binaries are small; a larger file is a data blob that does
+// not define a command, and is skipped so curating a directory stays fast.
+const maxToolContentScan = 64 << 20
+
+// buildToolDir materializes a curated copy of a host tool directory (e.g.
+// /usr/bin) under dst. An entry is omitted when:
+//
+//   - its NAME is an engineToolName or names the provider/engine (so `nsjail`,
+//     `slirp4netns`, `runcon`, `setpriv`, `unshare`, `nsenter`, `chroot` and any
+//     engine/platform-named file are gone);
+//   - it is a regular file whose CONTENT contains a provider or engine string
+//     (so a binary embedding `zerops`, `hostmask`, `sandboxd`, … cannot slip
+//     through under a bland name);
+//   - it is a symlink whose target does not resolve (a dangling link whose
+//     name would be the only surviving trace).
+//
+// Every other entry is reproduced so a workspace keeps its full legitimate
+// toolchain. The copy is a reflink/clone of the host file where the filesystem
+// supports it (measured on the target host) and a byte copy otherwise, so this
+// stays cheap and the tenant can never write the source.
+func buildToolDir(src, dst string) error {
+	if err := os.RemoveAll(dst); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if engineToolNames[strings.ToLower(name)] || containsDeniedString(name) {
+			continue
+		}
+		sp := filepath.Join(src, name)
+		dp := filepath.Join(dst, name)
+		fi, lerr := os.Lstat(sp)
+		if lerr != nil {
+			continue
+		}
+		switch {
+		case fi.Mode()&os.ModeSymlink != 0:
+			target, rerr := os.Readlink(sp)
+			if rerr != nil {
+				continue
+			}
+			resolved := target
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(src, resolved)
+			}
+			if _, serr := os.Stat(resolved); serr != nil {
+				continue // dangling: its name would be the only trace
+			}
+			if engineToolNames[strings.ToLower(filepath.Base(resolved))] ||
+				containsDeniedString(filepath.Base(resolved)) {
+				continue
+			}
+			if err := os.Symlink(target, dp); err != nil {
+				return err
+			}
+		case fi.Mode().IsRegular():
+			if fi.Size() <= maxToolContentScan {
+				if b, rerr := os.ReadFile(sp); rerr == nil && containsDeniedBytes(b) {
+					continue
+				}
+			}
+			if err := cloneOrCopyFile(sp, dp, fi.Mode().Perm()); err != nil {
+				return err
+			}
+		default:
+			// Directories and special files are not tool entries; skip.
+			continue
+		}
+	}
+	return nil
+}
+
+// cloneOrCopyFile reproduces a file into a curated directory. It first tries an
+// ioctl FICLONE (a reflink, supported by the target host's filesystem), then a
+// hard link (same result for an immutable, read-only-mounted tree, and cheap),
+// and finally a streaming byte copy. The destination is never writable by a
+// tenant: the curated tree is bind-mounted read-only.
+func cloneOrCopyFile(src, dst string, perm os.FileMode) error {
+	if err := ficlone(src, dst); err == nil {
+		return os.Chmod(dst, perm)
+	}
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	if err := copyFileBytes(src, dst, perm); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ficlone performs a filesystem reflink of src to dst. It is a no-op error on a
+// filesystem that does not support it, and the caller falls back.
+func ficlone(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := unix.IoctlFileClone(int(out.Fd()), int(in.Fd())); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	return out.Close()
+}
+
+// copyFileBytes streams a file, preserving its mode.
+func copyFileBytes(src, dst string, perm os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// buildFilteredPasswd writes a copy of /etc/passwd with every entry whose name
+// or comment names the provider or the engine removed. The host account file
+// carries the operator's own account (`zerops`), which would name the platform
+// to any `getent passwd`/`id`. The accounts a workspace legitimately needs
+// (root, nobody, its own service users) are reproduced unchanged.
+func buildFilteredPasswd(src, dst string) error {
+	return buildFilteredAccountFile(src, dst, containsDeniedString)
+}
+
+// buildFilteredGroup writes a copy of /etc/group with provider/engine-named
+// groups removed, using the same rule as buildFilteredPasswd.
+func buildFilteredGroup(src, dst string) error {
+	return buildFilteredAccountFile(src, dst, containsDeniedString)
+}
+
+// buildFilteredAccountFile copies a colon-separated account file, dropping a
+// line when the "denied" predicate matches its name (field 1) or its comment
+// (field 5, when present). A line that cannot be parsed is dropped too, because
+// an unparsed entry is exactly the kind that would smuggle a name through.
+func buildFilteredAccountFile(src, dst string, denied func(string) bool) error {
+	raw, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	var out []byte
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line == "" {
+			out = append(out, '\n')
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 3 {
+			continue
+		}
+		name := fields[0]
+		comment := ""
+		if len(fields) > 4 {
+			comment = fields[4]
+		}
+		if denied(name) || denied(comment) {
+			continue
+		}
+		out = append(out, line...)
+		out = append(out, '\n')
+	}
+	return os.WriteFile(dst, out, 0o644)
 }
 
 // providerNamesProviderSource reports whether a /etc/ssl/certs symlink target
@@ -191,22 +438,70 @@ func filterCABundle(raw []byte) []byte {
 // directory; a failure to read the host trust store only leaves certsDir empty
 // (the /etc/ssl/certs mount is then omitted, a closed outcome), so it is not an
 // error.
-func materializeProviderOverlays(dir, toolsSrc string) (toolsDir, certsDir string, err error) {
+//
+// It also builds the curated /usr/bin and /usr/sbin trees (into binDir/sbinDir).
+// Those are NOT optional: the host's /usr is mounted so a workload has a normal
+// toolchain, and it carries the engine's own runner (`nsjail`), the sandbox
+// helpers (`slirp4netns`, `unshare`, `nsenter`, `setpriv`, `runcon`, `chroot`),
+// and any engine/platform-named file. The curated copies drop exactly those
+// entries and reproduce every other tool, so a workspace keeps its toolchain
+// with no engine name reachable. Their build failure is returned as an error,
+// because a missing curated tree would leave the host's own exposed.
+// providerOverlays groups the curated host-path sources materialized for a
+// sandbox's read-only overlays. Empty fields are simply not mounted.
+type providerOverlays struct {
+	ToolsDir string // curated /usr/local
+	CertsDir string // curated /etc/ssl/certs (empty when unreadable)
+	BinDir   string // curated /usr/bin
+	SbinDir  string // curated /usr/sbin
+	Passwd   string // filtered /etc/passwd
+	Group    string // filtered /etc/group
+}
+
+func materializeProviderOverlays(dir, toolsSrc, binSrc, sbinSrc string) (providerOverlays, error) {
+	var o providerOverlays
 	if toolsSrc != "" {
 		if fi, serr := os.Stat(toolsSrc); serr == nil && fi.IsDir() {
-			toolsDir = toolsSrc
+			o.ToolsDir = toolsSrc
 		} else {
-			return "", "", fmt.Errorf("identity.tools_dir %q is not a directory", toolsSrc)
+			return o, fmt.Errorf("identity.tools_dir %q is not a directory", toolsSrc)
 		}
 	} else {
-		toolsDir = filepath.Join(dir, "usr-local")
-		if err = buildEmptyToolsDir(toolsDir); err != nil {
-			return "", "", fmt.Errorf("build curated /usr/local: %w", err)
+		o.ToolsDir = filepath.Join(dir, "usr-local")
+		if err := buildEmptyToolsDir(o.ToolsDir); err != nil {
+			return o, fmt.Errorf("build curated /usr/local: %w", err)
 		}
 	}
-	certsDir = filepath.Join(dir, "ssl-certs")
+	if binSrc == "" {
+		binSrc = "/usr/bin"
+	}
+	if sbinSrc == "" {
+		sbinSrc = "/usr/sbin"
+	}
+	o.BinDir = filepath.Join(dir, "usr-bin")
+	if err := buildToolDir(binSrc, o.BinDir); err != nil {
+		return o, fmt.Errorf("build curated /usr/bin: %w", err)
+	}
+	o.SbinDir = filepath.Join(dir, "usr-sbin")
+	if err := buildToolDir(sbinSrc, o.SbinDir); err != nil {
+		return o, fmt.Errorf("build curated /usr/sbin: %w", err)
+	}
+	certsDir := filepath.Join(dir, "ssl-certs")
 	if cerr := buildCertsDir(certsDir, "/etc/ssl/certs"); cerr != nil {
 		certsDir = ""
 	}
-	return toolsDir, certsDir, nil
+	o.CertsDir = certsDir
+	// The host account files carry the operator's own account (`zerops`),
+	// which names the platform to any `getent passwd`/`id`. Reproduce them with
+	// every provider/engine-named entry dropped. A failure here is a hard error
+	// like the tool trees: mounting the host's own file would leak the account.
+	o.Passwd = filepath.Join(dir, "passwd")
+	if err := buildFilteredPasswd("/etc/passwd", o.Passwd); err != nil {
+		return o, fmt.Errorf("build filtered /etc/passwd: %w", err)
+	}
+	o.Group = filepath.Join(dir, "group")
+	if err := buildFilteredGroup("/etc/group", o.Group); err != nil {
+		return o, fmt.Errorf("build filtered /etc/group: %w", err)
+	}
+	return o, nil
 }

@@ -51,12 +51,15 @@
  *   unreadable.
  *
  * CONFIGURATION
- *   The shim reads its answers from the environment:
- *     SANDBOXD_MASK_CPUS            decimal cpu count
- *     SANDBOXD_MASK_MEM_BYTES       decimal bytes of memory
- *     SANDBOXD_MASK_KERNEL_RELEASE  uname.release value
- *     SANDBOXD_MASK_KERNEL_VERSION  uname.version value
- *     SANDBOXD_MASK_NODENAME        uname.nodename value
+ *   The shim reads its answers from the environment. The variable names are
+ *   deliberately opaque and engine-neutral: publishing an engine-named variable
+ *   to the workspace would announce both the engine and the fact that a mask is
+ *   active (a tenant can read its own environment). The names are:
+ *     LSM_SYS_CPUS   decimal cpu count
+ *     LSM_SYS_MEM    decimal bytes of memory
+ *     LSM_SYS_REL    uname.release value
+ *     LSM_SYS_VER    uname.version value
+ *     LSM_SYS_NODE   uname.nodename value
  *   If a variable is missing the shim falls back to a conservative constant
  *   (1 cpu, 256 MB), so unsetting the environment cannot restore the host's
  *   values -- only a raw-syscall/static/musl bypass can.
@@ -165,8 +168,15 @@ void *dlsym(void *handle, const char *symbol) {
   return real_dlsym(handle, symbol);
 }
 
-#define SANDBOXD_FALLBACK_CPUS 1L
-#define SANDBOXD_FALLBACK_MEM (256L * 1024 * 1024)
+#define ENGINE_FALLBACK_CPUS 1L
+#define ENGINE_FALLBACK_MEM (256L * 1024 * 1024)
+
+/* Opaque fallback kernel strings. They are deliberately non-identifying: a
+ * generic uname.release/version that names neither the engine nor a distro, so
+ * `strings` over the shim yields no fingerprint. */
+#define ENGINE_FALLBACK_REL "0.0.0"
+#define ENGINE_FALLBACK_VER "#1 SMP"
+#define ENGINE_FALLBACK_NODE "sandbox"
 
 /* env_long reads a decimal integer from the environment, or returns d. */
 static long env_long(const char *key, long d) {
@@ -199,11 +209,11 @@ int uname(struct utsname *buf) {
   int r = real(buf);
   if (r == 0) {
     copy_field(buf->release, sizeof(buf->release),
-               env_str("SANDBOXD_MASK_KERNEL_RELEASE", "0.0.0-sandbox"));
+               env_str("LSM_SYS_REL", ENGINE_FALLBACK_REL));
     copy_field(buf->version, sizeof(buf->version),
-               env_str("SANDBOXD_MASK_KERNEL_VERSION", "#1 SMP"));
+               env_str("LSM_SYS_VER", ENGINE_FALLBACK_VER));
     copy_field(buf->nodename, sizeof(buf->nodename),
-               env_str("SANDBOXD_MASK_NODENAME", "sandbox"));
+               env_str("LSM_SYS_NODE", ENGINE_FALLBACK_NODE));
   }
   return r;
 }
@@ -217,13 +227,13 @@ long sysconf(int name) {
   switch (name) {
   case _SC_NPROCESSORS_ONLN:
   case _SC_NPROCESSORS_CONF:
-    return env_long("SANDBOXD_MASK_CPUS", SANDBOXD_FALLBACK_CPUS);
+    return env_long("LSM_SYS_CPUS", ENGINE_FALLBACK_CPUS);
   case _SC_PHYS_PAGES:
   case _SC_AVPHYS_PAGES: {
     long page = real(_SC_PAGE_SIZE);
     if (page <= 0)
       page = 4096;
-    return env_long("SANDBOXD_MASK_MEM_BYTES", SANDBOXD_FALLBACK_MEM) / page;
+    return env_long("LSM_SYS_MEM", ENGINE_FALLBACK_MEM) / page;
   }
   default:
     return real(name);
@@ -238,8 +248,8 @@ int sysinfo(struct sysinfo *si) {
     real = (sysinfo_fn)shim_next("sysinfo");
   int r = real(si);
   if (r == 0) {
-    long mem = env_long("SANDBOXD_MASK_MEM_BYTES", SANDBOXD_FALLBACK_MEM);
-    long cpus = env_long("SANDBOXD_MASK_CPUS", SANDBOXD_FALLBACK_CPUS);
+    long mem = env_long("LSM_SYS_MEM", ENGINE_FALLBACK_MEM);
+    long cpus = env_long("LSM_SYS_CPUS", ENGINE_FALLBACK_CPUS);
     /* Hide host uptime and load average too: both are host-wide signals. */
     si->uptime = 0;
     si->loads[0] = si->loads[1] = si->loads[2] = 0;
@@ -257,7 +267,7 @@ int sysinfo(struct sysinfo *si) {
 typedef int (*affinity_fn)(pid_t, size_t, cpu_set_t *);
 
 /*
- * sched_getaffinity is reduced to at most SANDBOXD_MASK_CPUS cpus. This is a
+ * sched_getaffinity is reduced to at most LSM_SYS_CPUS cpus. This is a
  * real reduction of the returned mask (not a fabricated number), so a consumer
  * that counts set bits sees the workspace's cpu count. It cannot add cpus the
  * host does not have; it only drops the extras the host exposes.
@@ -269,7 +279,7 @@ int sched_getaffinity(pid_t pid, size_t size, cpu_set_t *set) {
   int r = real(pid, size, set);
   if (r != 0)
     return r;
-  long want = env_long("SANDBOXD_MASK_CPUS", SANDBOXD_FALLBACK_CPUS);
+  long want = env_long("LSM_SYS_CPUS", ENGINE_FALLBACK_CPUS);
   if (want <= 0)
     want = 1;
   long kept = 0;

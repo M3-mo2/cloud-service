@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -22,7 +23,59 @@ func testCfg() config.Config {
 	// Pin ids so rendered-config assertions are deterministic.
 	c.Sandbox.UID = 993
 	c.Sandbox.GID = 971
+	// Point the curated tool dirs at a small fixture so a unit test does not
+	// curate the real host /usr/bin on every render (the real tree is curated
+	// once per service start in production).
+	bin, sbin := toolFixtures()
+	c.Identity.ToolsBinDir = bin
+	c.Identity.ToolsSbinDir = sbin
 	return c
+}
+
+// toolFixtures materializes a tiny /usr/bin and /usr/sbin fixture once per test
+// binary, including engine-named entries that the curator must drop and benign
+// entries it must keep.
+var (
+	toolFixOnce sync.Once
+	toolFixBin  string
+	toolFixSbin string
+)
+
+func toolFixtures() (string, string) {
+	toolFixOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "toolfix-")
+		if err != nil {
+			panic(err)
+		}
+		toolFixBin = filepath.Join(dir, "bin")
+		toolFixSbin = filepath.Join(dir, "sbin")
+		for _, d := range []string{toolFixBin, toolFixSbin} {
+			if err := os.MkdirAll(d, 0o755); err != nil {
+				panic(err)
+			}
+		}
+		// Benign entries: a plain file and a symlink.
+		writeFixture(toolFixBin, "python3", 0o755, "#!/bin/sh\necho py\n")
+		writeFixture(toolFixBin, "bash", 0o755, "#!/bin/sh\necho sh\n")
+		if err := os.Symlink("python3", filepath.Join(toolFixBin, "python")); err != nil {
+			panic(err)
+		}
+		// Engine entries the curator must drop, by name.
+		for _, n := range []string{"nsjail", "unshare", "nsenter", "setpriv", "runcon", "slirp4netns"} {
+			writeFixture(toolFixBin, n, 0o755, "#!/bin/sh\n: engine\n")
+		}
+		writeFixture(toolFixSbin, "chroot", 0o755, "#!/bin/sh\n: engine\n")
+		// An innocuously-named file that embeds an engine string: dropped.
+		writeFixture(toolFixBin, "innocent", 0o755, "binary with SANDBOXD_WORKSPACE inside")
+		writeFixture(toolFixSbin, "fine", 0o755, "#!/bin/sh\n: ok\n")
+	})
+	return toolFixBin, toolFixSbin
+}
+
+func writeFixture(dir, name string, mode os.FileMode, content string) {
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), mode); err != nil {
+		panic(err)
+	}
 }
 
 func TestAvailableFalseWhenMissing(t *testing.T) {

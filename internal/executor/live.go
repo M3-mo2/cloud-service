@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -81,23 +80,13 @@ func (r *NsjailRunner) Start(req Request) (LiveProcess, error) {
 		}
 	}
 
-	// Materialize the PTY relay helper. It lives in the session's /tmp
-	// bind-mount, so it appears at /run/sandboxd/pty_relay.py inside the jail.
-	// It runs with the same identity, mounts and seccomp policy as any workload
-	// -- the sandbox is not weakened for sessions.
-	helperPath := ""
-	if req.PTY {
-		helperPath = filepath.Join(runTmp, "pty_relay.py")
-		if err := os.WriteFile(helperPath, PTYRelayScript, 0o644); err != nil {
-			os.RemoveAll(runTmp)
-			return nil, fmt.Errorf("write pty relay helper: %w", err)
-		}
-		if err := r.identity.ChownToSandbox(helperPath); err != nil {
-			os.RemoveAll(runTmp)
-			return nil, fmt.Errorf("prepare pty relay ownership: %w", err)
-		}
-	}
-
+	// The PTY relay no longer exists as a file. It is passed to python3 inline
+	// (`python3 -c "<source>"`) as the entry command, so nothing named the
+	// engine is materialized into the sandbox: there is no helper path to read,
+	// no fixture directory to hide, and the source is the same bytes a
+	// legitimate interpreter would see (argv[0] is `-c`). The sandbox is not
+	// weakened for sessions: the relay runs with the same identity, mounts and
+	// seccomp policy as any workload.
 	cfgPath, err := r.renderSessionConfig(req, runTmp)
 	if err != nil {
 		os.RemoveAll(runTmp)
@@ -379,8 +368,10 @@ func (p *liveProcess) stdoutClose() error {
 }
 
 // renderSessionConfig renders the nsjail config for an interactive session.
-// When req.PTY is set the helper is the entry command and its JSON argv carries
-// the shell and initial window size; the requested cwd is applied by nsjail.
+// When req.PTY is set the helper source is the entry command, passed to python3
+// inline (`python3 -c "<source>" <config-json>`) so no engine-named file is
+// materialized in the sandbox; its JSON argv carries the shell and initial
+// window size, and the requested cwd is applied by nsjail.
 func (r *NsjailRunner) renderSessionConfig(req Request, runTmp string) (string, error) {
 	argv := req.Argv
 	if req.PTY {
@@ -390,12 +381,15 @@ func (r *NsjailRunner) renderSessionConfig(req Request, runTmp string) (string, 
 		}
 		// nsjail's exec_bin.path goes straight to execve (no PATH lookup), so
 		// resolve the interpreter on the host now. The host /usr is mounted at
-		// the same path inside the jail.
+		// the same path inside the jail (curated, which keeps python3).
 		py, err := resolveCommand("python3")
 		if err != nil {
 			return "", fmt.Errorf("pty helper needs python3: %w", err)
 		}
-		argv = []string{py, "/run/sandboxd/pty_relay.py", string(cfgJSON)}
+		// The relay source is passed as the argument to `-c`; python executes
+		// it without ever reading a file named anything, so there is no relay
+		// source on disk for a tenant to read.
+		argv = []string{py, "-c", string(PTYRelayScript), string(cfgJSON)}
 	}
 	clone := req
 	clone.Argv = argv

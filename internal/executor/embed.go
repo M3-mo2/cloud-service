@@ -12,10 +12,12 @@ import _ "embed"
 var PTYRelayScript []byte
 
 // HostMaskShim is the compiled host-identity masking shim (internal/executor/
-// hostmask.c, built to hostmask.so). It is embedded so a deployment that ships
-// only the sandboxd binary still has the shim; it is written to a host
-// directory the workspace cannot write and bind-mounted read-only into every
-// sandbox. See mask.go and hostmask.c.
+// hostmask/hostmask.c, built to hostmask.so, stripped). It is embedded so a
+// deployment that ships only the sandboxd binary still has the shim; it is
+// written to a host directory the workspace cannot write as an opaquely-named
+// file and bind-mounted read-only into every sandbox. See mask.go and
+// hostmask.c. The build strips engine strings and the compiler .comment line so
+// a tenant running `strings` on it learns nothing.
 //
 //go:embed hostmask.so
 var HostMaskShim []byte

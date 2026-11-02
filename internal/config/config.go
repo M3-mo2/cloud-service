@@ -27,7 +27,8 @@ type Config struct {
 
 // Default host-identity mask values. The kernel strings are deliberately
 // generic and carry no platform fingerprint; the mask is applied only to
-// uname/sysinfo/sysconf, whose real values would identify the host.
+// uname/sysinfo/sysconf, whose real values would identify the host. They name
+// no engine (never `sandboxd`), because a tenant can read them back.
 const (
 	// DefaultMaskKernelRelease is the uname.release a workspace is told.
 	DefaultMaskKernelRelease = "0.0.0-sandbox"
@@ -89,6 +90,13 @@ type IdentityConfig struct {
 	// empty curated directory, which is the safe choice: the workspace keeps
 	// the whole of /usr/bin and sees no host /usr/local material.
 	ToolsDir string `koanf:"tools_dir"`
+	// ToolsBinDir is the host directory curated into the workspace's /usr/bin.
+	// Empty (the default) uses /usr/bin. It is overridable so a unit test (or an
+	// unusual image) can point at a small fixture instead of the real host tree.
+	ToolsBinDir string `koanf:"tools_bin_dir"`
+	// ToolsSbinDir is the host directory curated into the workspace's /usr/sbin
+	// and /sbin. Empty (the default) uses /usr/sbin.
+	ToolsSbinDir string `koanf:"tools_sbin_dir"`
 }
 
 // NetworkConfig controls the per-workspace egress fabric. Egress is delivered by

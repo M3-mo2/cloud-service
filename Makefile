@@ -11,8 +11,14 @@ all: fmt vet shim build test
 # embedded in the sandboxd binary, so it must exist before `go build`. A plain
 # `go build ./...` uses the committed .so (built from the same source), so a
 # toolchain without a C compiler can still build the service.
+#
+# It is stripped and its .comment section removed at build time: a tenant can
+# `strings` the shim, so it must carry no engine name, no compiler-version
+# .comment line and no stale source path. `objcopy -R .comment` is required
+# because the `.comment` section survives `strip` (measured).
 shim:
-	$(CC) -shared -fPIC -O2 -Wall -o internal/executor/hostmask.so internal/executor/hostmask/hostmask.c -ldl
+	$(CC) -shared -fPIC -O2 -Wall -s -fno-ident -o internal/executor/hostmask.so internal/executor/hostmask/hostmask.c -ldl
+	objcopy -R .comment internal/executor/hostmask.so
 
 build: shim
 	$(GO) build -o bin/$(BINARY) ./cmd/sandboxd

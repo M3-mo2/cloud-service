@@ -60,7 +60,7 @@ func sessionJSONOf(t *testing.T, body []byte) sessionJSON {
 // runner models the relay dying at startup with a sandbox error.
 func TestSessionPTYFailureIsLoud(t *testing.T) {
 	h := newHarness(t)
-	h.runner.LiveErr = errors.New("PTY allocation failed: sandboxd-pty-error: out of pty devices")
+	h.runner.LiveErr = errors.New("PTY allocation failed: pty-error: out of pty devices")
 	ws := h.createWorkspace("ses")
 	rec := h.doJSON("POST", "/v1/workspaces/"+ws+"/sessions", keyA, map[string]any{})
 	if rec.Code != 201 {

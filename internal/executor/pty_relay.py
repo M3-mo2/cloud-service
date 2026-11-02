@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""sandboxd PTY relay helper.
+"""Terminal-session PTY relay helper.
 
 Runs *inside* the workspace sandbox as the entry command of a terminal session.
-nsjail cannot allocate a PTY itself, and the sandbox image ships neither socat
-nor expect, but Python's stdlib does have `pty`, `termios` and `fcntl` -- so a
-small stdlib-only helper is the mechanism.
+The sandbox runner cannot allocate a PTY itself, and the sandbox image ships
+neither socat nor expect, but Python's stdlib does have `pty`, `termios` and
+`fcntl` -- so a small stdlib-only helper is the mechanism. The source is passed
+to the interpreter inline (`python3 -c`), so it never exists as a readable file
+inside the sandbox.
 
 Interface:
 
   argv[1]: a JSON object {"shell": "/bin/sh", "cols": N, "rows": M}. The shell
            is exec'd as a session leader on a freshly allocated PTY; the
-           process cwd (set by nsjail to the workspace, or a requested cwd) is
-           inherited.
+           process cwd (set by the sandbox runner to the workspace, or a
+           requested cwd) is inherited.
 
   stdin:   a line-delimited JSON control protocol. Each line is one object:
              {"type":"input","data":"<raw bytes>"}   write raw bytes to the PTY
@@ -70,7 +72,7 @@ SHUTDOWN_GRACE_MS = 3000
 # failed session with the diagnostic (never a running session whose terminal
 # output is a Python traceback). The host /dev/pts and /dev/ptmx mounts are what
 # make pty.fork() succeed inside the jail; if they are missing this fires.
-PTY_ERROR_PREFIX = "sandboxd-pty-error:"
+PTY_ERROR_PREFIX = "pty-error:"
 PTY_ERROR_EXIT = 69  # EX_UNAVAILABLE (sysexits.h); not an nsjail launch code.
 
 

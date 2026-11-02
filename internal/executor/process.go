@@ -27,11 +27,13 @@ import (
 // Environment tags the executor injects into every sandbox so a process can be
 // attributed back to its workspace and (for a run/session) its source. They are
 // inherited by descendants, so a detached process started from a session still
-// carries its session id.
+// carries its session id. The names are deliberately engine-neutral: an
+// engine-named variable would announce the engine to the tenant, who can read
+// its own process environment.
 const (
-	TagEnvWorkspace = "SANDBOXD_WORKSPACE"
-	TagEnvKind      = "SANDBOXD_KIND"
-	TagEnvSource    = "SANDBOXD_SOURCE"
+	TagEnvWorkspace = "WORKSPACE_ID"
+	TagEnvKind      = "PROCESS_KIND"
+	TagEnvSource    = "PROCESS_SOURCE"
 
 	KindRun     = "run"
 	KindSession = "session"
