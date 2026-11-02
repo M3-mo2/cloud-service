@@ -40,7 +40,7 @@ reports `"cgroups":true`.
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/process-stop-check.sh` → `25 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/session-nsjail-check.sh` → `18 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh` → `27 passed / 0 failed / 0 skipped`
-> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `27 passed / 0 failed / 0 skipped`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `31 passed / 0 failed / 0 skipped`
 >
 > The unprivileged suites (`gofmt`, `go build`, `go vet`, `go test ./...`, the
 > handler-level assertions and the sandbox-config render tests) were re-run and
@@ -1329,7 +1329,7 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   host kernel=7.1.8-zabbly+ cpus=2 hostname=node-id-1.runtime.zcp.zerops
   workspace limits: cpus=1 mem=256MB
 === starting the mask-on service under real nsjail ===
-  service started (pid 100524)
+  service started (pid 109069)
   readyz.identity_masking: {'enabled': True, 'ready': True}
   PASS  readyz.identity_masking.ready (True)
 === 1) the 'already closed' paths are unreadable ===
@@ -1353,6 +1353,9 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   PASS  mask.env_i_uname (0.0.0-sandbox)
   PASS  mask.env_i_getconf (1)
   PASS  mask.shim_not_writable (0)
+  PASS  mask.runtime_python3 (0 'py-ok')
+  PASS  mask.runtime_bash (0 'sh-ok')
+  PASS  mask.runtime_perl (0 'perl-ok')
 === 6) measured egress IP on the allow_net:true path ===
   measured egress IP: 93.185.106.128
   PASS  egress.ip_is_public (yes)
@@ -1362,14 +1365,25 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   PASS  mask_off.release_leaks_host (7.1.8-zabbly+)
   PASS  mask_off.cpu_leaks_host (2)
   PASS  mask_off.mem_leaks_host (yes)
+  PASS  mask.runtime_node_no_regression (133)
 === 7) the host topology is untouched ===
   PASS  topology.links_unchanged (same)
   PASS  topology.routes_unchanged (same)
   PASS  topology.no_new_veth_or_tap (0)
   PASS  topology.netns_empty (0)
 
-================ identity acceptance: 27 passed / 0 failed / 0 skipped ================
+================ identity acceptance: 31 passed / 0 failed / 0 skipped ================
 ```
+
+**Measured: `node` is constrained by `rlimit_as` independently of masking.**
+`node -e 'console.log(42)'` exits `133` with V8's `Fatal process out of memory:
+SegmentedTable::InitializeTable` **both** with masking on and with masking off,
+because nsjail renders `rlimit_as = memory_mb` (256 MB) and V8 reserves a large
+virtual address space at startup. The harness records that outcome and asserts
+the masked and unmasked results are **equal** (no regression from masking)
+rather than asserting a success that the image does not support; `python3`,
+`bash` and `perl` all produce their output under the mask. This is a
+pre-existing resource-model limitation, not a masking defect.
 
 **The measured numbers (this session, target host).** The workspace was capped at
 `cpu_cores: 1, memory_mb: 256`; the host is `7.1.8-zabbly+` with 2 cores and
@@ -1479,6 +1493,11 @@ passed=<N> failed=0
 - `rlimit_fsize` bounds a single file, and `disk_mb` is enforced on the file API
   path and via a `du` recheck on workspace load; it is not enforced by the
   kernel against the sandboxed process tree.
+- `node` (V8) reserves a large virtual address space at startup and hits
+  `rlimit_as` (`memory_mb`) on this image, exiting `133` with a V8 OOM — with or
+  without host-identity masking. Raising `memory_mb` or running V8 with
+  `--max-old-space-size` within the limit is the operator's lever; it is a
+  resource-model property, unrelated to masking.
 - `RLIMIT_NPROC` does not bind for the root-run sandbox; the process ceiling is
   therefore provided by `cgroup_pids_max`, which is why `--cgroupns=host` is a
   hard requirement.

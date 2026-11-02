@@ -808,7 +808,7 @@ host's.
 capped at 1 CPU / 256 MB reports `uname.release=0.0.0-sandbox`,
 `os.cpu_count()=1`, `sysconf(_SC_PHYS_PAGES)·4096=268435456`, and `env -i nproc=1`;
 with masking off it reports `7.1.8-zabbly+`, `2` and `540675186688` — the host.
-`scripts/identity-check.sh`: **27 passed / 0 failed / 0 skipped**.
+`scripts/identity-check.sh`: **31 passed / 0 failed / 0 skipped**.
 
 ## Additional defaults chosen during implementation
 

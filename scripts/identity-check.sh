@@ -361,6 +361,21 @@ WRITE_OUT=$(exec_py "$A" "$WSA" /write.py 30 | jsonf "['stdout']")
 WROTE=$(printf '%s' "$WRITE_OUT" | grep -c '^WROTE' || true)
 chk "mask.shim_not_writable" "0" "${WROTE:-0}"
 
+# The mask must not break the runtimes: bash, python3 and perl still run and
+# produce their output with the shim active.
+runcmd() { # base argv-json -> "<exit_code> <stdout>"
+  curl -s -m 60 -X POST "$1/v1/workspaces/$2/exec" -H "$A" -H "$J" \
+    -d "{\"cmd\":$3,\"timeout_sec\":30}" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('exit_code'),repr(d.get('stdout','').strip()))"
+}
+chk "mask.runtime_python3" "0 'py-ok'" "$(runcmd "$BASE" "$WSA" '["python3","-c","print(\"py-ok\")"]')"
+chk "mask.runtime_bash" "0 'sh-ok'" "$(runcmd "$BASE" "$WSA" '["bash","-c","echo sh-ok"]')"
+chk "mask.runtime_perl" "0 'perl-ok'" "$(runcmd "$BASE" "$WSA" '["perl","-e","print \"perl-ok\\n\""]')"
+# node's outcome under the mask is captured and compared with its outcome
+# WITHOUT the mask below: the requirement is that masking introduces no
+# regression, and node is known to be constrained by rlimit_as independently of
+# masking on this image, so equality (not success) is the honest assertion.
+NODE_ON=$(runcmd "$BASE" "$WSA" '["node","-e","console.log(\"node-ok\")"]' | awk '{print $1}')
+
 # --- 6) egress IP, measured (may be environment-skipped) --------------------
 # Numbered to match the brief; executed here while the mask-on service (which
 # owns the allow_net workspace) is still up.
@@ -432,6 +447,11 @@ print("MEM", os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
   # proves the off-switch really disables the mask rather than reporting a
   # constant.
   chk "mask_off.mem_leaks_host" "yes" "$([ "$(lval MEM)" -gt "$((WS_MEM_MB * 1024 * 1024))" ] && echo yes || echo no)"
+  # node's result WITHOUT the mask, compared with the masked result: masking
+  # must introduce no regression. On this image node is independently limited
+  # by rlimit_as, so the honest assertion is equality of outcome.
+  NODE_OFF=$(runcmd "$BASE2" "$WSO" '["node","-e","console.log(\"node-ok\")"]' | awk '{print $1}')
+  chk "mask.runtime_node_no_regression" "$NODE_OFF" "$NODE_ON"
 fi
 
 # --- 7) the host is untouched ----------------------------------------------
