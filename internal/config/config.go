@@ -71,6 +71,24 @@ type IdentityConfig struct {
 	KernelRelease string `koanf:"kernel_release"`
 	// KernelVersion is the uname.version value a workspace is told.
 	KernelVersion string `koanf:"kernel_version"`
+	// HideProviderTools hides the hosting platform's own tooling and vendor
+	// material from a workspace. The sandbox mounts /usr so a workload has a
+	// normal toolchain, but /usr/local also carries the platform's control
+	// binaries (zcp, zsc, yq), the vendor CA sources and the Go toolchain, and
+	// their embedded vendor strings name the provider. When this is on (the
+	// default) /usr/local is overlain with a curated directory that contains
+	// only what a workspace may use, and the system TLS trust store is overlain
+	// with one filtered of the provider's certificates. Default true; the
+	// legitimate toolchain (python3, node, bash, perl, git) lives in /usr/bin
+	// and is unaffected.
+	HideProviderTools bool `koanf:"hide_provider_tools"`
+	// ToolsDir is an optional operator-provided directory mounted read-only at
+	// /usr/local inside a workspace when HideProviderTools is on. It should
+	// contain ONLY the tools a workspace may legitimately use (anything the
+	// image needs to expose outside /usr/bin). Empty (the default) mounts an
+	// empty curated directory, which is the safe choice: the workspace keeps
+	// the whole of /usr/bin and sees no host /usr/local material.
+	ToolsDir string `koanf:"tools_dir"`
 }
 
 // NetworkConfig controls the per-workspace egress fabric. Egress is delivered by
@@ -410,9 +428,10 @@ func Default() Config {
 			CloudflaredPath: "cloudflared",
 		},
 		Identity: IdentityConfig{
-			Enabled:       true,
-			KernelRelease: DefaultMaskKernelRelease,
-			KernelVersion: DefaultMaskKernelVersion,
+			Enabled:           true,
+			HideProviderTools: true,
+			KernelRelease:     DefaultMaskKernelRelease,
+			KernelVersion:     DefaultMaskKernelVersion,
 		},
 		Keys: []KeyConfig{},
 	}
@@ -657,6 +676,8 @@ tunnels:
   cloudflared_path: "cloudflared"
 identity:
   enabled: true
+  hide_provider_tools: true
+  tools_dir: ""
   kernel_release: "0.0.0-sandbox"
   kernel_version: "#1 SMP"
 `)

@@ -28,9 +28,13 @@ import (
 // In-jail paths for the masking files. The shim is mounted under /sandboxd
 // (a private mount point nsjail creates in its synthetic root, outside the
 // read-only /usr bind); the preload list is mounted over /etc/ld.so.preload.
+// The curated /usr/local and /etc/ssl/certs overlays are mounted over the
+// host's own directories, so a workspace sees only the curated trees.
 const (
 	maskShimJailPath    = "/sandboxd/hostmask.so"
 	maskPreloadJailPath = "/etc/ld.so.preload"
+	toolsJailPath       = "/usr/local"
+	certsJailPath       = "/etc/ssl/certs"
 )
 
 // maskEnvKeys are the environment variables the shim reads. They carry the
@@ -55,6 +59,12 @@ type masker struct {
 	once   sync.Once
 	ready  bool
 	reason string
+
+	// Provider-overlay state, materialized by the same prepare() pass.
+	overlayReady bool
+	overlayNote  string
+	toolsDir     string
+	certsDir     string
 }
 
 // newMasker constructs a masker rooted at dir (the service tmp dir).
@@ -71,39 +81,72 @@ func (m *masker) shimHostPath() string { return filepath.Join(m.dir, "hostmask.s
 // preloadHostPath returns the host path of the materialized ld.so.preload list.
 func (m *masker) preloadHostPath() string { return filepath.Join(m.dir, "ld.so.preload") }
 
-// prepare materializes the shim and preload file once, verifying the shim is a
-// real file. It is idempotent and caches the outcome.
+// prepare materializes the shim and preload file (when the mask is enabled) and
+// the curated /usr/local + /etc/ssl/certs overlays (when provider-tool hiding is
+// enabled) once, verifying the shim is a real file. It is idempotent and caches
+// each outcome independently: the two switches are orthogonal.
 func (m *masker) prepare() {
 	m.once.Do(func() {
-		if !m.cfg.Enabled {
-			m.ready = false
+		if m.cfg.Enabled {
+			m.prepareShim()
+		} else {
 			m.reason = "identity masking disabled by configuration (identity.enabled=false)"
-			return
 		}
-		shim, err := m.shimSource()
-		if err != nil {
-			m.reason = "masking shim unavailable: " + err.Error()
-			return
-		}
-		if err := os.MkdirAll(m.dir, 0o755); err != nil {
-			m.reason = "create masking dir: " + err.Error()
-			return
-		}
-		// The shim is written world-readable but NOT world-writable; only the
-		// orchestrator can replace it. It is bind-mounted read-only anyway, so
-		// even this is defense in depth.
-		if err := os.WriteFile(m.shimHostPath(), shim, 0o644); err != nil {
-			m.reason = "write masking shim: " + err.Error()
-			return
-		}
-		// ld.so.preload names the shim at its IN-JAIL path, because the loader
-		// resolves it after the mounts are in place.
-		if err := os.WriteFile(m.preloadHostPath(), []byte(maskShimJailPath+"\n"), 0o644); err != nil {
-			m.reason = "write ld.so.preload: " + err.Error()
-			return
-		}
-		m.ready = true
+		m.prepareProviderOverlays()
 	})
+}
+
+// prepareShim materializes the shim and the ld.so.preload list.
+func (m *masker) prepareShim() {
+	shim, err := m.shimSource()
+	if err != nil {
+		m.reason = "masking shim unavailable: " + err.Error()
+		return
+	}
+	if err := os.MkdirAll(m.dir, 0o755); err != nil {
+		m.reason = "create masking dir: " + err.Error()
+		return
+	}
+	// The shim is written world-readable but NOT world-writable; only the
+	// orchestrator can replace it. It is bind-mounted read-only anyway, so
+	// even this is defense in depth.
+	if err := os.WriteFile(m.shimHostPath(), shim, 0o644); err != nil {
+		m.reason = "write masking shim: " + err.Error()
+		return
+	}
+	// ld.so.preload names the shim at its IN-JAIL path, because the loader
+	// resolves it after the mounts are in place.
+	if err := os.WriteFile(m.preloadHostPath(), []byte(maskShimJailPath+"\n"), 0o644); err != nil {
+		m.reason = "write ld.so.preload: " + err.Error()
+		return
+	}
+	m.ready = true
+}
+
+// prepareProviderOverlays materializes the curated /usr/local and /etc/ssl/certs
+// trees. A failure to build /usr/local is a hard overlay-not-ready (the masked
+// mount would otherwise expose the host directory); a failure to read the host
+// trust store only disables the TLS overlay and is recorded, because the
+// workspace then gets no /etc/ssl/certs mount at all (a closed outcome).
+func (m *masker) prepareProviderOverlays() {
+	if !m.cfg.HideProviderTools {
+		m.overlayNote = "provider-tool hiding disabled by configuration (identity.hide_provider_tools=false)"
+		return
+	}
+	if err := os.MkdirAll(m.dir, 0o755); err != nil {
+		m.overlayNote = "create provider-overlay dir: " + err.Error()
+		return
+	}
+	toolsDir, certsDir, err := materializeProviderOverlays(m.dir, m.cfg.ToolsDir)
+	// The curated /usr/local is the hard part: without it the mount would
+	// expose the host directory, so its failure makes the overlay not ready.
+	if err != nil {
+		m.overlayNote = err.Error()
+		return
+	}
+	m.toolsDir = toolsDir
+	m.certsDir = certsDir // may be empty when the host trust store is unreadable
+	m.overlayReady = true
 }
 
 // shimSource returns the shim bytes: an operator-provided path when configured,
@@ -144,6 +187,29 @@ func (m *masker) Status() (enabled, ready bool, reason string) {
 	return m.cfg.Enabled, m.Ready(), m.Reason()
 }
 
+// OverlayStatus returns the provider-tool overlay capability. ready is true when
+// the curated /usr/local (and, when readable, /etc/ssl/certs) trees are
+// materialized; note explains the state (including that the switch is off, which
+// is reported for /v1/meta's honest limits but is not a readiness failure).
+func (m *masker) OverlayStatus() (enabled, ready bool, note string) {
+	m.prepare()
+	return m.cfg.HideProviderTools, m.overlayReady, m.overlayNote
+}
+
+// ToolsDir returns the host path of the curated /usr/local overlay (empty when
+// not materialized).
+func (m *masker) ToolsDir() string {
+	m.prepare()
+	return m.toolsDir
+}
+
+// CertsDir returns the host path of the curated /etc/ssl/certs overlay (empty
+// when not materialized).
+func (m *masker) CertsDir() string {
+	m.prepare()
+	return m.certsDir
+}
+
 // maskParams are the per-request masking values derived from a workspace.
 type maskParams struct {
 	Enabled       bool
@@ -156,6 +222,16 @@ type maskParams struct {
 	PreloadHost string
 	ShimJail    string
 	PreloadJail string
+
+	// Provider-tool overlays. OverlayEnabled mounts the curated /usr/local and
+	// (when present) /etc/ssl/certs over the host's own, so a workspace sees no
+	// platform material. ToolsDir/CertsDir are host paths, empty when the
+	// overlay is unavailable or the switch is off.
+	OverlayEnabled bool
+	ToolsDir       string
+	CertsDir       string
+	ToolsJail      string
+	CertsJail      string
 }
 
 // params builds the per-request masking parameters for a workspace's limits.
@@ -167,6 +243,15 @@ func (m *masker) params(cpus float64, memMB int) maskParams {
 		KernelVersion: m.cfg.KernelVersion,
 		ShimJail:      maskShimJailPath,
 		PreloadJail:   maskPreloadJailPath,
+		ToolsJail:     toolsJailPath,
+		CertsJail:     certsJailPath,
+	}
+	// Provider-tool overlays are independent of the syscall mask: they apply
+	// whenever hiding is enabled and the trees materialized.
+	if _, overlayReady, _ := m.OverlayStatus(); overlayReady {
+		p.OverlayEnabled = true
+		p.ToolsDir = m.ToolsDir()
+		p.CertsDir = m.CertsDir()
 	}
 	if !m.Ready() {
 		return p

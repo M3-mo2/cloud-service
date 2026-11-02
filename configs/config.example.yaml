@@ -169,13 +169,26 @@ tunnels:
 # is a diagnostic state that deliberately leaks.
 #
 # Honest limits (documented, not implied away): a statically-linked binary, a
-# musl runtime (which does not read /etc/ld.so.preload), or a raw syscall(2)
-# bypasses the shim. Masking is defense-in-depth, not a security boundary; the
-# /proc and /sys views remain hidden by the mount namespace. See
-# docs/DECISIONS.md.
+# musl runtime (which does not read /etc/ld.so.preload), a raw syscall(2), or a
+# handle-scoped dlvsym(3) bypasses the shim. Masking is defense-in-depth, not a
+# security boundary; the /proc and /sys views remain hidden by the mount
+# namespace. See docs/DECISIONS.md.
 identity:
   # Opt-out switch (default true). Set false only to measure what leaks.
   enabled: true
+  # Hide the hosting platform's own tooling and vendor material (default true).
+  # The sandbox mounts /usr for a normal toolchain, but the host's /usr/local
+  # also carries the platform's control binaries, its vendor CA sources and a
+  # vendor-named Go toolchain, and the TLS trust store names the provider in its
+  # certificate subjects. With this on, /usr/local and /etc/ssl/certs are
+  # replaced inside the workspace with curated, provider-free trees. python3,
+  # node, bash, perl and git all live under /usr and are unaffected.
+  hide_provider_tools: true
+  # Optional curated directory mounted read-only at /usr/local in place of the
+  # host's. It should contain ONLY tools a workspace may use. Empty (the
+  # default) mounts an empty curated directory: the workspace keeps all of
+  # /usr/bin and sees no host /usr/local material.
+  tools_dir: ""
   # The kernel strings a workspace is told. They must never be a real kernel.
   kernel_release: "0.0.0-sandbox"
   kernel_version: "#1 SMP"

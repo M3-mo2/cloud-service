@@ -196,6 +196,80 @@ func mountBlock(out, dst string) string {
 	return out[start : i+end]
 }
 
+// TestRenderConfigHidesProviderTools proves the provider-tool overlay is
+// rendered: the curated /usr/local and /etc/ssl/certs are mounted read-only
+// over the host's own, and the original unconditional /etc/ssl/certs mount is
+// not duplicated.
+func TestRenderConfigHidesProviderTools(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 256, DiskMB: 10, MaxWallTimeSec: 30, MaxRuns: 3}}
+	path, err := r.renderConfig(Request{Workspace: ws, WorkspaceRoot: "/tmp/wsroot", Argv: []string{"/bin/true"}}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+
+	for _, want := range []string{`dst: "/usr/local"`, `dst: "/etc/ssl/certs"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("provider overlay must mount %s:\n%s", want, out)
+		}
+	}
+	// Exactly one /etc/ssl/certs mount: the curated one replaces the host one.
+	if n := strings.Count(out, `dst: "/etc/ssl/certs"`); n != 1 {
+		t.Errorf("expected exactly one /etc/ssl/certs mount, got %d:\n%s", n, out)
+	}
+	// Both curated mounts must be read-only and mandatory (fail-loud).
+	for _, dst := range []string{`dst: "/usr/local"`, `dst: "/etc/ssl/certs"`} {
+		block := mountBlock(out, dst)
+		if !strings.Contains(block, "rw: false") {
+			t.Errorf("mount %s must be read-only:\n%s", dst, block)
+		}
+		if !strings.Contains(block, "mandatory: true") {
+			t.Errorf("mount %s must be mandatory (fail-loud):\n%s", dst, block)
+		}
+	}
+}
+
+// TestRenderConfigOmitsProviderOverlayWhenDisabled proves the opt-out switch:
+// with hide_provider_tools=false the host's /etc/ssl/certs is mounted as before
+// and no curated /usr/local appears.
+func TestRenderConfigOmitsProviderOverlayWhenDisabled(t *testing.T) {
+	cfg := testCfg()
+	cfg.Identity.HideProviderTools = false
+	r := NewNsjailRunner(cfg, writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 256, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+	path, err := r.renderConfig(Request{Workspace: ws, WorkspaceRoot: "/tmp/x", Argv: []string{"/bin/true"}}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+	if strings.Contains(out, `dst: "/usr/local"`) {
+		t.Errorf("provider-tool hiding disabled must not mount a curated /usr/local:\n%s", out)
+	}
+	if n := strings.Count(out, `dst: "/etc/ssl/certs"`); n != 1 {
+		t.Errorf("expected the host /etc/ssl/certs mount, got %d:\n%s", n, out)
+	}
+}
+
+// TestFilterCABundleDropsProviderBlocks proves the TLS bundle filter removes a
+// certificate whose DECODED DER names the provider and keeps the others. The
+// provider's name lives in the DER subject, not the base64 text, so the check
+// is on the decoded certificate.
+func TestFilterCABundleDropsProviderBlocks(t *testing.T) {
+	// A synthetic DER "certificate" body that contains the provider name.
+	keep := "-----BEGIN CERTIFICATE-----\nZ2VuZXJpYw==\n-----END CERTIFICATE-----\n"
+	drop := "-----BEGIN CERTIFICATE-----\n" + "WmVyb3Bz" + "\n-----END CERTIFICATE-----\n"
+	out := string(filterCABundle([]byte(keep + drop + keep)))
+	if strings.Contains(strings.ToLower(out), "zerops") {
+		t.Errorf("filtered bundle still names the provider:\n%s", out)
+	}
+	if strings.Count(out, "BEGIN CERTIFICATE") != 2 {
+		t.Errorf("filter must keep both generic blocks, got %d:\n%s", strings.Count(out, "BEGIN CERTIFICATE"), out)
+	}
+}
+
 func TestEmbeddedShimPresent(t *testing.T) {
 	if len(HostMaskShim) == 0 {
 		t.Fatal("embedded host-identity shim is empty; run `make shim`")

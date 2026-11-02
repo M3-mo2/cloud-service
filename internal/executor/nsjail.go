@@ -55,6 +55,11 @@ func NewNsjailRunner(cfg config.Config, tmplPath, tmpDir string) *NsjailRunner {
 // MaskStatus reports host-identity masking truthfully.
 func (r *NsjailRunner) MaskStatus() (bool, bool, string) { return r.mask.Status() }
 
+// OverlayStatus reports the provider-tool overlay capability truthfully:
+// enabled is the configured switch, ready whether the curated trees are
+// materialized, and note explains the state.
+func (r *NsjailRunner) OverlayStatus() (bool, bool, string) { return r.mask.OverlayStatus() }
+
 // Identity returns the resolved sandbox identity mapping.
 func (r *NsjailRunner) Identity() Identity { return r.identity }
 
@@ -695,6 +700,14 @@ type tmplData struct {
 	MaskShimJail    string
 	MaskPreloadJail string
 	MaskEnv         []string
+
+	// Provider-tool overlays (see provider.go). When OverlayEnabled is true the
+	// curated /usr/local (ToolsDir) and, when present, the curated /etc/ssl/certs
+	// (CertsDir) are bind-mounted read-only over the host's own, hiding the
+	// platform's tooling and vendor-named certificates from a workspace.
+	OverlayEnabled bool
+	ToolsDir       string
+	CertsDir       string
 }
 
 // Paths at which the package tiers are mounted inside the sandbox.
@@ -838,6 +851,10 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		MaskShimJail:    mask.ShimJail,
 		MaskPreloadJail: mask.PreloadJail,
 		MaskEnv:         mask.envEntries(),
+
+		OverlayEnabled: mask.OverlayEnabled,
+		ToolsDir:       mask.ToolsDir,
+		CertsDir:       mask.CertsDir,
 	}
 	if data.PidsMax <= 0 {
 		data.PidsMax = 64

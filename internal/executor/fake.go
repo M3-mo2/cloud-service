@@ -17,12 +17,18 @@ type FakeRunner struct {
 	MaskEnabledFlag bool
 	MaskReadyFlag   bool
 	MaskReasonText  string
-	Stdout          string
-	Stderr          string
-	ExitCode        int
-	TimedOut        bool
-	Err             error
-	Delay           time.Duration
+	// OverlayEnabledFlag / OverlayReadyFlag / OverlayNoteText configure
+	// OverlayStatus. The fake defaults them to disabled/absent so readiness and
+	// meta tests are unaffected unless they opt in.
+	OverlayEnabledFlag bool
+	OverlayReadyFlag   bool
+	OverlayNoteText    string
+	Stdout             string
+	Stderr             string
+	ExitCode           int
+	TimedOut           bool
+	Err                error
+	Delay              time.Duration
 
 	// Sessions: when LiveOutput is set, Start writes it to the session's
 	// StdoutPath and stays alive until Kill/Close (or the lifetime delay).
@@ -139,6 +145,11 @@ func (f *FakeRunner) CgroupsUsable() bool { return f.CgroupsFlag }
 // MaskStatus reports the configured masking capability.
 func (f *FakeRunner) MaskStatus() (bool, bool, string) {
 	return f.MaskEnabledFlag, f.MaskReadyFlag, f.MaskReasonText
+}
+
+// OverlayStatus reports the configured provider-tool overlay capability.
+func (f *FakeRunner) OverlayStatus() (bool, bool, string) {
+	return f.OverlayEnabledFlag, f.OverlayReadyFlag, f.OverlayNoteText
 }
 
 // LastRequest returns the most recent request.

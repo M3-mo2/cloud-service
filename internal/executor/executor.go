@@ -149,6 +149,11 @@ type Runner interface {
 	// and reason explains a not-ready state. A run is refused when masking is
 	// enabled but not ready.
 	MaskStatus() (enabled bool, ready bool, reason string)
+	// OverlayStatus reports the provider-tool overlay truthfully: enabled is
+	// the configured switch, ready whether the curated /usr/local (and, when
+	// available, /etc/ssl/certs) trees are materialized, and note explains the
+	// state.
+	OverlayStatus() (enabled bool, ready bool, note string)
 	// Run executes a request to completion.
 	Run(req Request) (Result, error)
 	// Start launches a long-lived interactive process (e.g. a PTY session) and

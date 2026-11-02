@@ -140,6 +140,11 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	// the shim cannot be applied, readiness is not claimed, so an operator sees
 	// a leaking deploy rather than a silent one.
 	maskEnabled, maskReady, maskReason := s.svc.Runner().MaskStatus()
+	// The provider-tool overlay is reported truthfully too: when it is enabled
+	// but the curated trees could not be materialized, readiness is not claimed,
+	// so an operator sees a deploy that would expose the platform's tooling
+	// rather than a silent one.
+	overlayEnabled, overlayReady, overlayNote := s.svc.Runner().OverlayStatus()
 	status := http.StatusOK
 	if !dataOK || !nsjailOK || !cgroupsOK {
 		status = http.StatusServiceUnavailable
@@ -151,6 +156,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusServiceUnavailable
 	}
 	if maskEnabled && !maskReady {
+		status = http.StatusServiceUnavailable
+	}
+	if overlayEnabled && !overlayReady {
 		status = http.StatusServiceUnavailable
 	}
 	body := map[string]any{
@@ -171,6 +179,10 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 			"enabled": maskEnabled,
 			"ready":   maskReady,
 		},
+		"provider_tools_hidden": map[string]any{
+			"enabled": overlayEnabled,
+			"ready":   overlayReady,
+		},
 	}
 	if netReason != "" {
 		body["network"].(map[string]any)["reason"] = netReason
@@ -180,6 +192,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	}
 	if maskReason != "" {
 		body["identity_masking"].(map[string]any)["reason"] = maskReason
+	}
+	if overlayNote != "" {
+		body["provider_tools_hidden"].(map[string]any)["reason"] = overlayNote
 	}
 	writeJSON(w, status, body)
 }
@@ -215,11 +230,21 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	maskCap := map[string]any{
 		"enabled":   maskEnabled,
 		"ready":     maskReady,
-		"mechanism": "ld.so.preload shim (uname/sysinfo/sysconf/sched_getaffinity/getauxval)",
-		"limits":    "a statically-linked binary, a musl runtime, or a raw syscall(2) bypasses the shim",
+		"mechanism": "ld.so.preload shim (uname/sysinfo/sysconf/sched_getaffinity/getauxval/dlsym)",
+		"limits":    "a statically-linked binary, a musl runtime, a raw syscall(2), or a handle-scoped dlvsym(3) bypasses the shim",
 	}
 	if maskReason != "" {
 		maskCap["reason"] = maskReason
+	}
+	overlayEnabled, overlayReady, overlayNote := s.svc.Runner().OverlayStatus()
+	overlayCap := map[string]any{
+		"enabled":   overlayEnabled,
+		"ready":     overlayReady,
+		"mechanism": "curated read-only /usr/local and /etc/ssl/certs overlays",
+		"limits":    "hides the host's own /usr/local and vendor-named certificates; it cannot change the provider the egress address is registered to",
+	}
+	if overlayNote != "" {
+		overlayCap["reason"] = overlayNote
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":     model.Version,
@@ -244,11 +269,12 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 			"allow_net":            m.AllowNet,
 			"allow_unlimited_runs": m.AllowUnlimitedRuns,
 		},
-		"tunnels":             tunCap,
-		"network":             netCap,
-		"identity_masking":    maskCap,
-		"interpreters":        model.SupportedInterpreters(),
-		"runnable_extensions": model.SupportedExtensions(),
+		"tunnels":               tunCap,
+		"network":               netCap,
+		"identity_masking":      maskCap,
+		"provider_tools_hidden": overlayCap,
+		"interpreters":          model.SupportedInterpreters(),
+		"runnable_extensions":   model.SupportedExtensions(),
 	})
 }
 

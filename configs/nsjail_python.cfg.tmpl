@@ -38,6 +38,37 @@ mount {
   rw: false
 }
 
+{{- if .OverlayEnabled }}
+
+# Provider-identity overlays: the workspace sees a curated /usr/local instead of
+# the host's, and a curated /etc/ssl/certs. The host's /usr/local carries the
+# platform's own control binaries (zcp, zsc, yq), the vendor CA sources and the
+# vendor-named Go toolchain; all of those name the provider in their embedded
+# strings. The host's TLS trust store names the provider in its certificate
+# subjects. The curated trees keep the legitimate toolchain and working TLS
+# (python3, node, bash, perl, git all live in /usr/bin, unaffected) with no
+# platform material. mandatory:true is the fail-loud contract: if a curated tree
+# cannot be mounted the run aborts rather than exposing the host directory. The
+# /etc/ssl/certs overlay is omitted when the host trust store could not be read;
+# the workspace then has no /etc/ssl/certs at all (a closed outcome).
+mount {
+  src: "{{ .ToolsDir }}"
+  dst: "/usr/local"
+  is_bind: true
+  rw: false
+  mandatory: true
+}
+{{- if .CertsDir }}
+mount {
+  src: "{{ .CertsDir }}"
+  dst: "/etc/ssl/certs"
+  is_bind: true
+  rw: false
+  mandatory: true
+}
+{{- end }}
+{{- end }}
+
 mount {
   src: "/lib"
   dst: "/lib"
@@ -77,6 +108,10 @@ mount {
   mandatory: false
 }
 
+# The system TLS trust store. Mounted only when the provider overlay is off:
+# with the overlay on, the curated tree above replaces it (and this mount would
+# otherwise duplicate the destination).
+{{- if not .OverlayEnabled }}
 mount {
   src: "/etc/ssl/certs"
   dst: "/etc/ssl/certs"
@@ -84,6 +119,7 @@ mount {
   rw: false
   mandatory: false
 }
+{{- end }}
 
 mount {
   src: "/etc/ld.so.cache"
