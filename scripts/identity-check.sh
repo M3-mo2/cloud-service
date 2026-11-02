@@ -202,10 +202,13 @@ echo "=== building ==="
 GO=$(command -v go || echo /usr/local/go/bin/go)
 [ -x "$GO" ] || { echo "SKIP: go toolchain not found"; exit 0; }
 # The shim must be built from source before go build embeds it, so a stale or
-# missing artifact cannot silently disable the mask.
+# missing artifact cannot silently disable the mask. It is stripped and its
+# .comment section removed exactly as the Makefile does, so the harness tests
+# the same zero-string artifact a deployment ships.
 if command -v cc >/dev/null 2>&1; then
-  cc -shared -fPIC -O2 -Wall -o "$ROOT/internal/executor/hostmask.so" \
+  cc -shared -fPIC -O2 -Wall -s -fno-ident -o "$ROOT/internal/executor/hostmask.so" \
     "$ROOT/internal/executor/hostmask/hostmask.c" -ldl || { echo "FAIL  shim: could not build hostmask.so"; exit 1; }
+  objcopy -R .comment "$ROOT/internal/executor/hostmask.so" 2>/dev/null || true
 fi
 (cd "$ROOT" && "$GO" build -o "$BIN" ./cmd/sandboxd) || exit 1
 
@@ -499,6 +502,131 @@ chk "bypass.default_handle_masked" "$WS_RELEASE" "$(bval DEFAULT)"
 chk "bypass.named_handle_masked" "$WS_RELEASE" "$(bval NAMED)"
 # The raw syscall is the KNOWN, documented inherent result: the real host value.
 chk "bypass.raw_syscall_known_real" "$HOST_RELEASE" "$(bval SYSCALL)"
+
+# --- 10) zero signal: no engine/platform NAME is reachable in the sandbox -----
+# The operator's bar is ZERO SIGNAL: a tenant must not be able to tell they are
+# on this platform, nor see the engine's internals. Everything below is checked
+# by reading what the tenant's own process can read.
+echo "=== 10) zero signal: no engine/platform name is reachable ==="
+put_py "$A" "$WSA" /zerosig.py 'import os, re, subprocess
+
+# Engine-distinctive name tokens (whole-word). `hostmask` is handled separately
+# below: it is a generic networking word (the inverse of a netmask), so it
+# legitimately appears inside Python'"'"'s ipaddress module and node'"'"'s netmask
+# package -- removing those would break the runtimes. As a NAME it must be gone.
+ENGINE_TOKENS = [r"\bsandboxd\b", r"\bnsjail\b", r"\bslirp4netns\b"]
+PROVIDER_TOKENS = [r"\bzerops\b", r"\bvshosting\b", r"\bzabbly\b"]
+RULES = [re.compile(t.encode()) for t in ENGINE_TOKENS + PROVIDER_TOKENS]
+TOOL_NAMES = ["nsjail","slirp4netns","runcon","setpriv","unshare","nsenter","chroot"]
+
+print("SANDBOXD_DIR", os.path.exists("/sandboxd"))
+print("RUN_FIXTURE", os.path.exists("/run/sandboxd"))
+preload = open("/etc/ld.so.preload").read().strip() if os.path.exists("/etc/ld.so.preload") else ""
+print("PRELOAD_NAMES_ENGINE", any(t in preload.lower() for t in ["sandboxd","hostmask","nsjail"]))
+# Relay source must not exist as a readable file.
+relay = [p for p in ["/run/sandboxd/pty_relay.py"] if os.path.exists(p)]
+print("RELAY_FILES", len(relay))
+# Engine tool names must not resolve.
+present = []
+for t in TOOL_NAMES:
+    if subprocess.run(["sh","-c","command -v "+t], capture_output=True, text=True).stdout.strip():
+        present.append(t)
+print("TOOL_NAMES_PRESENT", ",".join(present) if present else "")
+# Engine-named environment must be absent.
+badenv = [k for k in os.environ if any(s in k.lower() for s in ["sandboxd","hostmask","nsjail"])]
+print("ENGINE_ENV", ",".join(badenv) if badenv else "")
+BAND = re.compile(rb"sandboxd|hostmask|nsjail|slirp4netns|zerops|vshosting|zabbly")
+# Whole-word name-token and provider-token audit over every reachable file.
+hits = []
+hostmask_files = []
+scanned = 0
+for d in ["/usr","/lib","/lib64","/opt","/etc","/sbin","/bin","/run"]:
+    for root, dirs, files in os.walk(d):
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                if os.path.islink(p) or os.path.getsize(p) > 20_000_000:
+                    continue
+                data = open(p, "rb").read()
+            except Exception:
+                continue
+            scanned += 1
+            low = data.lower()
+            if b"hostmask" in low:
+                hostmask_files.append(p)
+            if not BAND.search(low):
+                continue
+            for rx in RULES:
+                if rx.search(low):
+                    hits.append((p, rx.pattern)); break
+print("SCANNED", scanned)
+print("NAME_HITS", len(hits))
+for p, s in hits[:20]:
+    print("NAME_HIT", p, s)
+# hostmask as a path NAME anywhere (a filename or dir component).
+path_names = []
+for d in ["/usr","/lib","/lib64","/opt","/etc","/sbin","/bin","/run"]:
+    for root, dirs, files in os.walk(d):
+        for n in list(dirs) + files:
+            if "hostmask" in n.lower():
+                path_names.append(os.path.join(root, n))
+print("HOSTMASK_PATHS", len(path_names))
+for p in path_names[:10]:
+    print("HOSTMASK_PATH_HIT", p)
+# Account files must name no provider.
+acct = 0
+for af in ["/etc/passwd","/etc/group"]:
+    try:
+        if re.search(rb"zerops|vshosting|zabbly", open(af,"rb").read(), re.I):
+            acct += 1
+    except Exception:
+        pass
+print("ACCOUNT_HITS", acct)
+'
+ZEROSIG_OUT=$(exec_py "$A" "$WSA" /zerosig.py 150 | jsonf "['stdout']")
+zval() { printf '%s' "$ZEROSIG_OUT" | awk -v k="$1" '$1==k{print $2}'; }
+ZEROSIG_SCANNED=$(zval SCANNED)
+chk "zero_signal.sandboxd_dir_absent" "False" "$(zval SANDBOXD_DIR)"
+chk "zero_signal.run_fixture_absent" "False" "$(zval RUN_FIXTURE)"
+chk "zero_signal.preload_names_no_engine" "False" "$(zval PRELOAD_NAMES_ENGINE)"
+chk "zero_signal.relay_source_absent" "0" "$(zval RELAY_FILES)"
+chk "zero_signal.no_engine_tool_names" "" "$(zval TOOL_NAMES_PRESENT)"
+chk "zero_signal.no_engine_env" "" "$(zval ENGINE_ENV)"
+chk "zero_signal.no_engine_or_provider_name_tokens" "0" "$(zval NAME_HITS)"
+chk "zero_signal.no_path_named_hostmask" "0" "$(zval HOSTMASK_PATHS)"
+chk "zero_signal.account_files_no_provider" "0" "$(zval ACCOUNT_HITS)"
+# The audit must have scanned a real tree; a zero scan is not a pass.
+chk "zero_signal.audit_scanned" "yes" "$([ "${ZEROSIG_SCANNED:-0}" -gt 1000 ] 2>/dev/null && echo yes || echo no)"
+# `hostmask` may remain ONLY as the generic networking word inside the Python
+# and Node standard libraries. Report the allowance so it is never silent.
+echo "  note: the generic networking word 'hostmask' survives only in stdlib/netmask (documented)"
+
+# --- Stage 2, measured: neither zero-artifact mechanism is reachable ---------
+# The brief's Stage 2 asks whether the shim can stop existing, so no engine
+# artifact is left at all. Both candidate mechanisms were measured on this host
+# and neither holds within bounded effort:
+#
+#   (A) Replace the workspace's libc view. A drop-in libc.so.6 that exports
+#       every glibc symbol WITH version information and forwards to the real
+#       libc is what a naive wrapper is not (measured: a wrapper without a
+#       version script aborts every dynamically-linked binary with
+#       "no version information available" / undefined __libc_start_main).
+#       Producing a correct one is a per-glibc-version project; its failure
+#       mode is a broken sandbox, so it is not shipped as a prototype.
+#   (B) Move interception to seccomp user_notif. This nsjail build has no
+#       --seccomp_unotify flag (measured), and its kafel libseccomp binding maps
+#       kafel's USER_NOTIF action to ENOSYS, not SECCOMP_RET_USER_NOTIF: a rule
+#       `USER_NOTIF { sysinfo }` made sysinfo fail with "Function not
+#       implemented" instead of trapping (measured). Without a listener the
+#       action cannot intercept, and secdump is not installed.
+#
+# The result is therefore the brief's valid outcome: the zero-artifact goal is
+# NOT reached, and the reasons are recorded with the measurement. The shim is
+# asserted to be untamperable and to survive `env -i`, and the raw syscall(2)
+# path remains the documented inherent limit.
+echo "=== 10b) Stage 2: zero-artifact mechanisms (measured; not reachable) ==="
+skip "zero_signal.libc_view_no_artifact" "a correct versioned libc replacement is a per-glibc project; a naive wrapper breaks every dynamic binary (measured)"
+skip "zero_signal.seccomp_user_notif_no_artifact" "nsjail 4.6 has no --seccomp_unotify; kafel maps USER_NOTIF to ENOSYS not SECCOMP_RET_USER_NOTIF (measured)"
 
 # --- 6) egress IP, measured (may be environment-skipped) --------------------
 # Numbered to match the brief; executed here while the mask-on service (which

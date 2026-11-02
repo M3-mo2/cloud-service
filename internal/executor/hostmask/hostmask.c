@@ -173,8 +173,10 @@ void *dlsym(void *handle, const char *symbol) {
 
 /* Opaque fallback kernel strings. They are deliberately non-identifying: a
  * generic uname.release/version that names neither the engine nor a distro, so
- * `strings` over the shim yields no fingerprint. */
-#define ENGINE_FALLBACK_REL "0.0.0"
+ * `strings` over the shim yields no fingerprint. They match the defaults in
+ * internal/config (DefaultMaskKernelRelease/Version) so `env -i` -- which
+ * clears the LSM_SYS_* variables -- still answers with the same generic values. */
+#define ENGINE_FALLBACK_REL "0.0.0-sandbox"
 #define ENGINE_FALLBACK_VER "#1 SMP"
 #define ENGINE_FALLBACK_NODE "sandbox"
 
