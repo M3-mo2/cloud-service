@@ -805,15 +805,30 @@ one-liner is closed; the residual is documented rather than hidden.
 3. **A direct `syscall(2)`** with a raw `uname`/`sysinfo` completely bypasses
    libc and every interposer by construction.
 
-**C. Not yet closed (the zero-artifact goal; see ADR 77).** The shim itself is
-still a visible file referenced by `/etc/ld.so.preload`, and the loader must
-read that file at the tenant's own uid, so `cat /etc/ld.so.preload` tells a
-tenant that a preload object exists at an opaque path. This is a **real,
-measured, open gap** — it is not "closed" and it is not "inherent". Two
-mechanisms could close it (replace the libc view, or move to seccomp
-`user_notif`); both were measured and neither holds on this host within bounded
-effort. The measurement and the reason are in **ADR 77**, and the harness
-reports them as `skip`, never as a pass.
+**C. Closed (the mechanism is now INVISIBLE to the tenant; see ADR 79).** An
+earlier version of this ADR filed the visible shim + `/etc/ld.so.preload` as an
+unavoidable open gap: the loader must read the file at the tenant's own uid, so
+`cat /etc/ld.so.preload` appeared to reveal a preload object at an opaque path.
+**That classification was wrong and is corrected here.** The shim is already
+LD_PRELOADed into every process the tenant runs, so it is in a position to
+answer the filesystem questions the tenant would use to discover it
+(`open`/`stat`/`access`/`readdir`/`readlink`/`realpath`). It now interposes
+those entry points (with glibc-versioned exports) and answers `ENOENT` for
+`/etc/ld.so.preload`, its own in-jail path and the engine's legacy directories,
+so `ls`, `cat`, `stat`, `test`, `find` and Python's `os.stat`/`os.listdir` all
+report the path missing. The hiding is **scoped to processes that already have
+the shim loaded**: the dynamic loader reads `/etc/ld.so.preload` *before* any
+preload object is mapped, so it is never intersected, and a real exec is still
+masked (`env -i uname -r` and `env -u LSM_SYS_* uname -r` both report the masked
+values — measured, ADR 79). The mechanism and the exact glibc-version trap are
+in ADR 79; the shim's own strings are obfuscated so `strings` over it yields
+none of the masked kernel values or variable names.
+
+The zero-artifact goal (no shim file at all, nothing for the loader to read) is
+a **separate, still-open** question; the two candidate mechanisms were measured
+and neither holds on this host within bounded effort (ADR 79 §"zero-artifact").
+That is now a *de-risked* open item: the mechanism being invisible is what the
+operator's bar required, and it is met.
 
 The masking layer is therefore **defense-in-depth, not a security boundary**. Its
 limits — now split into "closed" and "inherent" — are reported truthfully in
@@ -1067,10 +1082,15 @@ that the **generic networking word** `hostmask` survives inside Python's
 netmask, not this engine's name, and dropping it would break those standard
 libraries (measured: `ipaddress.ip_network("10.0.0.0/8").hostmask` works).
 
-**Stage 2 — honest verdict: the shim still exists, and this is an OPEN gap.**
-Two mechanisms could make the shim stop existing (no file, no preload list, no
-engine-named path at all). **Both were measured; neither holds on this host
-within bounded effort.**
+**Stage 2 — honest verdict (superseded in part by ADR 79).** This ADR
+originally concluded that the shim "still exists as a *readable* file
+referenced by `/etc/ld.so.preload`", and treated that visibility as unavoidable.
+**ADR 79 disproves the "unavoidable" part**: the shim's filesystem interposers
+now make `/etc/ld.so.preload` and the shim itself invisible to the tenant while
+the loader still reads the preload list. What remains here is the narrower
+zero-artifact question — can the shim file stop existing *at all*? Two mechanisms
+could achieve that, and **both were measured; neither holds on this host within
+bounded effort**:
 
 - **(A) Replace the workspace's libc view.** If it worked, the masking *is* the
   library the tenant already has, with no extra file and no preload entry, and
@@ -1085,29 +1105,32 @@ within bounded effort.**
   project whose failure mode is a broken sandbox; shipping an untested prototype
   would trade a small leak for a large outage, which the brief forbids.
 - **(B) Move interception to seccomp `user_notif`.** The kernel advertises
-  `user_notif` in `/proc/sys/kernel/seccomp/actions_avail` (measured). **This
-  nsjail build has no `--seccomp_unotify` flag** (`unrecognized option`, measured)
-  and **`secdump` is not installed** (measured). The flag it does offer is a
-  seccomp *filter*, and this build's kafel libseccomp binding maps kafel's
-  `USER_NOTIF` action to **`ENOSYS`, not `SECCOMP_RET_USER_NOTIF`**: a rule
-  `USER_NOTIF { sysinfo }` made `sysinfo` fail with `Function not implemented`
-  while `uname` still returned the real `7.1.8-zabbly+` (measured) — i.e. it
-  *blocks* rather than *intercepts*. A real user_notif implementation needs a
-  supervisor process that owns the listener fd returned by
-  `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, …)` and
-  answers each notification; nsjail builds no such supervisor, so there is no
-  hook to attach one without replacing the engine's seccomp handling — and the
-  brief forbids weakening the existing seccomp policy to get there.
+  `user_notif` in `/proc/sys/kernel/seccomp/actions_avail` (measured). **The
+  nsjail build the service ships (3.4, the Dockerfile pin) has no
+  `--seccomp_unotify` flag** (`unrecognized option`, measured) and **`secdump`
+  is not installed**. A newer nsjail **does** carry the feature — **ADR 80**
+  settles this: building nsjail `master` from source yields a binary that
+  supports `--seccomp_unotify` and starts an unotify loop on this kernel — but
+  `master` is an unreleased branch, and user_notif is a supervisor *tracing*
+  feature (it logs filesystem/network operations to a report), not a drop-in
+  interception hook that returns alternate values: a full replacement of the
+  masking shim still needs a supervisor owning the listener fd and answering
+  each notification. The flag is therefore recorded as *reachable-but-not-yet-a-
+  replacement* rather than adopted, and 3.4 remains the shipped pin. The
+  original measurement that this build's kafel binding maps `USER_NOTIF` to
+  `ENOSYS` rather than `SECCOMP_RET_USER_NOTIF` stands for 3.4.
 
-**The result is therefore the brief's valid outcome:** the zero-artifact goal is
-**not** reached, the reasons are recorded with the exact measurement, and the
-harness reports them as `skip` (third state), never as a pass. The visible
-shim + `ld.so.preload` reference remain the honest open gap. What *is* asserted
-and unchanged: the shim cannot be tampered with (read-only mounts; eight
-tampering attempts all failed with `Read-only file system`), it survives
-`env -i` (compiled-in generic fallbacks), and a raw `syscall(2)` from a static
-binary remains the documented permanent limit (asserted as the real value, not
-pretended closed).
+**The result.** The **visibility** gap this ADR first recorded is now **closed**
+(ADR 79): the shim's filesystem interposers make `/etc/ld.so.preload` and the
+shim itself invisible to every tool a tenant would use, while the loader still
+reads the preload list and `env -i` remains masked. What remains open is the
+narrower **zero-artifact** goal (no shim file at all); the reasons are recorded
+with the exact measurement, and the harness reports the two candidate mechanisms
+as `skip` (third state), never as a pass. What *is* asserted and unchanged: the
+shim cannot be tampered with (read-only mounts; tampering attempts all fail with
+`Read-only file system`), it survives `env -i` (compiled-in generic fallbacks),
+and a raw `syscall(2)` from a static binary remains the documented permanent
+limit (asserted as the real value, not pretended closed).
 
 ### ADR 78 — The PTY relay is passed inline, never materialized
 
@@ -1129,6 +1152,155 @@ variable is introduced. `internal/executor/live.go` builds the argv; the
 config contains `-c`, no `/run/sandboxd`, and no `pty_relay` name;
 `identity-check.sh` assertion 10 asserts no relay file is readable inside a
 session-capable workspace.
+
+## The masking mechanism is invisible inside a workspace (v0.0.17 line)
+
+### ADR 79 — The masking shim hides itself and its preload list from the tenant
+
+**Problem.** The operator found the masking mechanism by browsing inside his own
+workspace: `ls /` → `/sandboxd` → `hostmask.so`, and `cat /etc/ld.so.preload`
+named the shim's path. Two real gaps remained after the `v0.0.17` cleanup:
+
+1. `/etc/ld.so.preload` was a **readable file naming the shim's path**, and the
+   shim at that path was **readable** (`cat`/`strings` worked). Anyone who
+   thought to look learned both that a shim existed and where it lived.
+2. The shim's own strings still contained the masked kernel values
+   (`0.0.0-sandbox`, `#1 SMP`) and the configuration variable names
+   (`LSM_SYS_*`), so `strings` over it was a roadmap.
+
+The operator's bar is **silence**: nothing named, nothing browsable, nothing
+readable — not "protected, therefore fine".
+
+**Decision — the shim hides the filesystem paths that reveal it.** The shim is
+already `LD_PRELOAD`ed into every process the tenant runs, so it is in a position
+to answer the filesystem questions the tenant would use to discover it. It now
+interposes `open`/`open64`/`openat`/`openat64`, `stat`/`lstat`/`fstatat`/`statx`
+and the `*64`/`__x*` aliases, `access`/`faccessat`/`eaccess`/`euidaccess`,
+`readlink`, `readdir`/`readdir64`/`readdir_r` and `realpath`/
+`canonicalize_file_name`, and answers **`ENOENT`** (and drops the directory
+entry) for a configured list of paths:
+
+| Hidden path | Why |
+|---|---|
+| `/etc/ld.so.preload` | the list that NAMES the shim; `cat` would reveal the mechanism |
+| `/run/.rt.so` | the shim's own in-jail path |
+| `/sandboxd` | the legacy engine directory at the filesystem root |
+| `/run/sandboxd` | the legacy engine directory under `/run` |
+
+The list is a **single explicit table** in `hostmask.c` (auditable), plus up to
+four optional operator paths via the generic `HIDE_PATH`/`HIDE_PATH2..4`
+variables.
+
+**The two non-obvious things that made it work (both measured).**
+
+1. **glibc VERSIONS its symbols, and an unversioned preload definition does not
+   satisfy a versioned reference.** Merely interposing `stat`/`fstatat` hid
+   `ls`, `cat` and `find` immediately, while `python`'s `os.stat()` and `bash`'s
+   `test -f` sailed through — because they import `fstatat64@GLIBC_2.33` and
+   `stat64@GLIBC_2.33`, not the plain names. The fix is `.symver` aliases plus a
+   linker version script (`internal/executor/hostmask/hostmask.map`), emitting
+   each interposer under the version its callers reference:
+   `GLIBC_2.2.5` for `open/open64/access/euidaccess/readlink/readdir/readdir64/
+   readdir_r/__xstat/__lxstat/canonicalize_file_name`; `GLIBC_2.3` `realpath`;
+   `GLIBC_2.4` `openat/openat64/faccessat/eaccess/__fxstatat`; `GLIBC_2.28`
+   `statx`; `GLIBC_2.33` `stat/stat64/lstat/lstat64/fstat/fstat64/fstatat/
+   fstatat64`. The syscall-mask exports (`uname`/`sysconf`/`sysinfo`/…) reference
+   the ancient `GLIBC_2.2.5` versions and are deliberately left unversioned.
+   A measured surprise inside this work: coreutils `test -r` references
+   **`euidaccess@GLIBC_2.2.5`** (not `eaccess@GLIBC_2.4`), so `test -e`/`-f`
+   were hidden while `test -r` was not until `euidaccess` was bound too.
+   The version script also makes the linker emit an auto `SONAME` equal to the
+   output file name; `-Wl,-soname,rt.so` overrides it so the engine name does not
+   leak into the dynamic string table (measured: without it, `strings` showed
+   `hostmask.so`).
+
+2. **`readlink(1) -f` and `realpath(1)` canonicalize component by component and
+   pass only the LEAF with a dirfd** (`fstatat(dirfd, "secret.txt", …)`), so
+   matching the full path alone misses them. The matcher therefore matches the
+   path **and** the final component. Measured: `readlink -f` and `realpath` are
+   pure path canonicalizers that **never stat the leaf**, so they echo the
+   literal input for a hidden path and leak nothing — they are deliberately
+   **not** chased (`is_hidden` on the leaf covers the dirfd calls they *do*
+   make; there is nothing else to intercept).
+
+**The loader-scope trap — solved, and the reason it works at all.** The dynamic
+loader must read `/etc/ld.so.preload` for the mask to work. The hiding is scoped
+to processes that **already have the shim mapped**: the loader reads the preload
+list *before* any preload object is loaded, so it is never intersected by the
+interposer. Only a process that already runs this shim answers `ENOENT` for the
+file. Measured on this host: inside a workspace, `env -i uname -r`,
+`env -u LSM_SYS_REL -u LSM_SYS_VER uname -r`, and Python's `platform.uname()`
+all still report the masked `0.0.0-sandbox`, while `cat /etc/ld.so.preload`,
+`ls -la /etc/ld.so.preload`, `test -e /etc/ld.so.preload`, Python's
+`os.path.exists`/`os.listdir`, and `readdir` over `/etc` all report it missing.
+There is therefore **no** trade-off: the tenant cannot see the mechanism and the
+loader still reads it.
+
+**Strings are no longer self-announcing.** The masked kernel values
+(`0.0.0-sandbox`, `#1 SMP`), the variable names (`LSM_SYS_CPUS/MEM/REL/VER/NODE`)
+and the hidden paths are stored **XORed** and decoded at runtime, so `strings`
+over the shim yields none of them. An opaque random marker (`9f3a71c2`) is kept as
+a live literal as the **positive control** for "verify the binary you are
+testing": a stale `.so` cannot masquerade as the tested one. Measured: `strings`
+over the shipped `.so` matches none of `sandboxd|hostmask|ld.so.preload|LSM_SYS|
+SANDBOXD|0.0.0-sandbox|#1 SMP` and contains the marker.
+
+**The documented limits are unchanged and still asserted.** A statically-linked
+binary, a musl runtime, or a raw `syscall(2)` bypasses the shim; a raw
+`newfstatat(262)`/`stat(4)` still reaches the real `/etc/ld.so.preload` (measured,
+and asserted in `identity-check.sh` group 10c as the **known** result, never as a
+pass or a failure). `readlink -f`/`realpath` echo the literal input, asserted as
+a recorded non-leaking limit.
+
+**Where this leaves ADR 72.** ADR 72's class C ("not yet closed — the visible
+shim") is **corrected**: the visibility is closed by this ADR (the prototype
+disproves the "unavoidable" classification, and a wrong "inherent limit" is worse
+than an open gap). The narrower zero-artifact goal (no shim file at all) stays
+open and is de-risked.
+
+### ADR 80 — nsjail: 3.4 vs the unreleased `master` with `--seccomp_unotify`
+
+**Problem.** A measured discrepancy: this host's *service-configured*
+`/usr/local/bin/nsjail` is **902 672 bytes** and does **not** support
+`--seccomp_unotify` (`unrecognized option`), while a **1 469 432-byte** nsjail
+supports it. Which should the deployment ship?
+
+**Measured this session, with evidence.**
+
+- `/usr/local/bin/nsjail` (902 672 bytes) is **byte-identical**
+  (`sha256 9b9fb1df…`) to a from-source build of the pinned release tag **3.4**,
+  the Dockerfile's `NSJAIL_VERSION`. `--seccomp_unotify` is absent from 3.4.
+- A from-source build of nsjail **`master`** (HEAD `d8415bc`, `3.6-122-gd8415bc`,
+  2026-10-28) is **1 469 432 bytes** and supports `--seccomp_unotify`. The
+  feature landed *after* the last tag (3.6, 2026-03-18); it is **not in any
+  release**.
+- On this kernel (`/proc/sys/kernel/seccomp/actions_avail` advertises
+  `user_notif`), the `master` build **actually runs** the feature: a jailed
+  process with `seccomp_unotify: true` logged `Started unotify loop` and wrote a
+  report entry. So the flag is genuinely reachable here.
+
+**Decision: keep 3.4 as the shipped pin; do not switch the deployment to
+`master`.** Rationale, in order of weight:
+
+1. `--seccomp_unotify` in nsjail is a **tracing** feature (a supervisor logs the
+   filesystem/network operations the sandbox performs to a report file), **not a
+   value-interception hook**. It cannot, by itself, return alternate values for
+   `uname`/`sysconf`/`stat`; retiring the shim would still require a supervisor
+   that owns the listener fd and answers each notification — a new component, not
+   a config flag.
+2. Pulling an **unreleased `master`** into a security-critical sandbox runner
+   trades a stable pin for unreviewed future commits, which is the wrong default
+   for the isolation boundary. 3.4 is a tagged release.
+3. Switching does not remove the mask or the shim, so it buys nothing today.
+
+**Wiring.** No config change: `sandbox.nsjail_path` already points at the
+binary, and the shipped default remains `nsjail` (PATH) which resolves to
+`/usr/local/bin/nsjail` (3.4). The finding is recorded so a future iteration
+that builds a user_notif supervisor can bump `NSJAIL_VERSION` to a release tag
+that carries the feature. The Dockerfile pin and this decision stay in sync;
+`identity-check.sh` group 10b records the measurement as a `skip` with the
+correct reason (3.4 lacks the flag; master has it but is unreleased and is a
+tracer, not a hook).
 
 ## Additional defaults chosen during implementation
 

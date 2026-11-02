@@ -8,9 +8,15 @@ RUN go mod download
 COPY . .
 # Build the host-identity masking shim from source, so the embedded copy in the
 # binary is always the committed source (the committed .so is a convenience for
-# toolchains without a C compiler). It is a plain -shared object (no cgo).
-RUN cc -shared -fPIC -O2 -Wall \
-    -o internal/executor/hostmask.so internal/executor/hostmask/hostmask.c -ldl
+# toolchains without a C compiler). It is a plain -shared object (no cgo). The
+# version script is REQUIRED: the filesystem-hiding interposers must be exported
+# under the glibc versions their callers reference (stat64@GLIBC_2.33 etc.), and
+# -soname keeps the engine name out of the dynamic string table.
+RUN cc -shared -fPIC -O2 -Wall -s -fno-ident \
+        -Wl,-soname,rt.so \
+        -Wl,--version-script=internal/executor/hostmask/hostmask.map \
+        -o internal/executor/hostmask.so internal/executor/hostmask/hostmask.c -ldl \
+    && objcopy -R .comment internal/executor/hostmask.so
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
     -o /out/sandboxd ./cmd/sandboxd
 

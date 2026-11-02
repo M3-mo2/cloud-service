@@ -715,6 +715,20 @@ ready (`/readyz`: `identity_masking.enabled=true, ready=false`) the renderer
 returns `ErrMaskUnavailable` and the run is refused, so a missing mask is a loud
 `503`, never a silent leak.
 
+The same shim also **hides the mechanism from the tenant** (ADR 79). It
+interposes the filesystem entry points (`open`/`openat`/`stat`/`lstat`/`fstatat`/
+`statx`/`access`/`eaccess`/`euidaccess`/`readlink`/`readdir`/`realpath`, with the
+glibc-versioned exports their callers reference) and answers `ENOENT` — and drops
+the directory entry — for `/etc/ld.so.preload`, its own in-jail path
+`/run/.rt.so`, and the legacy `/sandboxd`, `/run/sandboxd`. So `ls`, `cat`,
+`stat`, `test`, `find` and Python's `os.stat`/`os.listdir` all report those paths
+missing. This is scoped to processes that **already have the shim mapped**: the
+loader reads the preload list *before* any preload object is loaded, so a real
+exec is still masked (`env -i uname -r` reports `0.0.0-sandbox`). The shim's own
+strings carry none of the masked kernel values or variable names (they are XORed
+and decoded at runtime); `readlink -f`/`realpath` never stat the leaf and echo
+the literal input, so there is nothing to intercept there.
+
 The shim also interposes **`dlsym`** itself. A handle-scoped lookup —
 `ctypes.CDLL("libc.so.6").uname`, which resolves the symbol from libc's own
 handle and normally skips a preload shim — is answered with the shim's own
@@ -725,13 +739,17 @@ defining both on this glibc makes a versioned reference bind back to the
 unversioned definition and the loader bootstrap recurses, so the residual
 `dlvsym(handle, …)` route (not reachable from `ctypes`) is documented instead.
 
-The **honest limits** are part of the design and kept in two separate classes: a
+The **honest limits** are part of the design and kept in separate classes: a
 statically-linked binary, a **musl** runtime (whose loader ignores
 `/etc/ld.so.preload`), a raw `syscall(2)`, and a handle-scoped `dlvsym(3)` bypass
-the interposition and see the real host values. The raw-syscall result is
-**asserted as a known outcome**, not left a surprise. Masking is
+the masking interposition and see the real host values; a raw `syscall(2)` (but
+not any libc call) also still reaches `/etc/ld.so.preload`, because the hiding
+sits at the libc entry points, not under the kernel ABI. The raw-syscall result
+is **asserted as a known outcome**, not left a surprise. Masking is
 **defense-in-depth, not a security boundary**; the filesystem view stays closed
-by the mount namespace on every path. See [DECISIONS.md](DECISIONS.md) #71–#76,
+by the mount namespace on every path. The *visibility* of the mechanism is closed
+(ADR 79); the narrower "no shim file at all" goal is open and measured
+(ADR 77/80). See [DECISIONS.md](DECISIONS.md) #71–#80,
 [VERIFICATION.md §10](VERIFICATION.md) for the measured numbers, and
 [`scripts/identity-check.sh`](../scripts/identity-check.sh) for the assertions.
 

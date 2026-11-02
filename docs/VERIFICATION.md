@@ -1578,9 +1578,51 @@ all run (`node` is constrained by `rlimit_as`, unchanged); `python3 -m pip
 succeed. Curating `~2.5 GB` of host trees costs **~10 s once** per service start
 (filesystem reflinks; measured) and almost no disk.
 
-**Stage 2 — measured, and honest.** The shim still exists as a readable file
-referenced by `/etc/ld.so.preload`. Two mechanisms could remove the artifact;
-both were measured on this host and **neither holds**:
+**Measured this session — the mechanism itself is now INVISIBLE (ADR 79).**
+The shim interposes the filesystem entry points and answers `ENOENT` for
+`/etc/ld.so.preload`, its own in-jail path `/run/.rt.so`, `/sandboxd` and
+`/run/sandboxd`. `identity-check.sh` group 10c measures this **from inside a
+real 1-CPU/256-MB workspace**, for every configured path across every method:
+
+```
+# With the shim loaded (the tenant's situation), each matrix reports HIDDEN:
+#   os.path.exists / os.path.isfile / open() / os.listdir          HIDDEN
+#   ls -la / cat / stat / test -e / test -f / test -r              HIDDEN
+#   find <parent> -maxdepth 1 -name <leaf>                         (no hit)
+#   readlink <path>                                                HIDDEN (ENOENT)
+#   readlink -f <path>                                             echoes the literal input
+# 48/48 method·path checks HIDDEN; 0 VISIBLE.
+#   invisible.no_hidden_path_visible            0
+#   invisible.readlink_f_echo_only              4    (4 of 4 echo, never stat the leaf)
+#   invisible.loader_env_i_still_masked         MASKED   (env -i uname -r = 0.0.0-sandbox)
+#   invisible.loader_env_u_still_masked         MASKED   (env -u LSM_SYS_* uname -r = 0.0.0-sandbox)
+#   invisible.raw_syscall_known_limit           REACHED  (newfstatat(262) still reaches it)
+#   invisible.shim_strings_clean                0
+#   invisible.shim_build_marker_present         yes      (9f3a71c2)
+```
+
+**The loader scope is the correctness core, and it holds.** The dynamic loader
+reads `/etc/ld.so.preload` *before* any preload object is mapped, so the hiding
+never intersects the loader; only a process that already has the shim answers
+`ENOENT`. Measured in the same workspace: `cat`/`ls`/`stat`/`test`/`find`/
+`os.path.exists`/`os.listdir` all report `/etc/ld.so.preload` missing, while
+`env -i /usr/bin/uname -r` and `env -u LSM_SYS_REL -u LSM_SYS_VER uname -r`
+still return the masked `0.0.0-sandbox`. There is no trade-off.
+
+**Strings are no longer self-announcing.** `strings -a` over the shipped shim
+(`sha256 3190afe8d78f072fc4a3d1818670698091d59dfe3bbd273bd6d9bf6319c73d14`,
+26 800 bytes) matches **none** of `sandboxd|hostmask|ld.so.preload|LSM_SYS|
+SANDBOXD|0.0.0-sandbox|#1 SMP` (the masked values and variable names are XORed
+and decoded at runtime) and does contain the opaque positive-control marker
+`9f3a71c2`. The previous artifact leaked all of the above
+(`sha256 ec8cf3f0…`). `-Wl,-soname,rt.so` keeps the version script's
+auto-`SONAME` from leaking the engine name into the dynamic string table.
+
+**Stage 2 — the narrower zero-artifact goal, measured and honest.** The shim
+still exists as a *file* (nothing for the loader to read would also remove the
+mask); the *visibility* of that file is closed by ADR 79. Two mechanisms could
+remove the file altogether; both were measured and **neither holds** on this
+host within bounded effort:
 
 ```
 # (A) libc replacement: a naive wrapper libc.so.6 breaks every dynamic binary.
@@ -1588,11 +1630,18 @@ $ LD_LIBRARY_PATH=<wrapper> /usr/bin/true
 /usr/bin/true: libc.so.6: no version information available (required by /usr/bin/true)
 /usr/bin/true: symbol lookup error: undefined symbol: __libc_start_main, version GLIBC_2.34
 
-# (B) seccomp user_notif: this nsjail build has no --seccomp_unotify …
-$ nsjail --seccomp_unotify -q -- true
+# (B) seccomp user_notif: the SHIPPED nsjail (3.4, the Dockerfile pin) has none.
+$ /usr/bin/nsjail --seccomp_unotify -q -- true
 nsjail: unrecognized option '--seccomp_unotify'
 
-# … and its kafel USER_NOTIF action yields ENOSYS, not SECCOMP_RET_USER_NOTIF:
+# A from-source build of the UNRELEASED master (HEAD d8415bc, 3.6-122-gd8415bc)
+# DOES support it and starts a loop on this kernel:
+$ /tmp/nsjail-master --config <seccomp_unotify:true + exec /bin/sh -c echo> 
+[I] Started unotify loop
+… but master is unreleased, and user_notif is a supervisor TRACER (it logs
+filesystem/network ops to a report), not a value-interception hook. See ADR 80.
+
+# 3.4's kafel USER_NOTIF action yields ENOSYS, not SECCOMP_RET_USER_NOTIF:
 $ nsjail --config <USER_NOTIF { sysinfo } + DEFAULT ALLOW>
 sysinfo: Function not implemented          # blocked, not intercepted
 uname=7.1.8-zabbly+                        # still the real value
@@ -1601,20 +1650,21 @@ uname=7.1.8-zabbly+                        # still the real value
 `secdump` is not installed; `/proc/sys/kernel/seccomp/actions_avail` advertises
 `user_notif` but no supervisor owns a listener fd. The kernel cannot be made to
 lie either: writing `/proc/sys/kernel/osrelease`/`version` fails with
-`Permission denied` (re-measured this session). The zero-artifact goal is
-therefore **not** reached, recorded precisely (ADR 77), and the harness reports
-both as `skip` (third state), never as a pass. What remains asserted: the shim
-is untamperable (read-only mounts; tampering attempts all `Read-only file
-system`) and survives `env -i`, and the raw `syscall(2)` path is the documented
-permanent limit (asserted as the real value).
+`Permission denied` (re-measured this session). The narrower zero-artifact goal
+is therefore **not** reached, recorded precisely (ADR 77 + ADR 80), and the
+harness reports both mechanisms as `skip` (third state), never as a pass. What
+remains asserted: the mechanism is **invisible** inside the workspace (ADR 79,
+group 10c), the shim is untamperable (read-only mounts; tampering attempts all
+`Read-only file system`) and survives `env -i`, and the raw `syscall(2)` path is
+the documented permanent limit (asserted as the real value).
 
-**identity-check.sh this session: `57 passed / 0 failed / 2 skipped`.** The two
-skips are the Stage 2 mechanisms above (each with its measurement as the
-reason).
+**identity-check.sh this session: `64 passed / 0 failed / 2 skipped`.** The two
+skips are the Stage 2 zero-artifact mechanisms above (each with its measurement
+as the reason); the seven new `PASS`es are the visibility group 10c.
 
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **78** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **80** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -1624,16 +1674,24 @@ host-topology hazard of the abandoned veth/route design, and #70, the
 quick-tunnel rate-limit / ephemeral-URL operational limit and the harness's
 skipped-environment third state), plus #71–#73, the host-identity threat model,
 the /etc/ld.so.preload masking mechanism and its honest limits, and the
-fail-loud opt-out switch; #72 was **corrected** twice, most recently to a
-three-way split: "closed", "inherent", and "not yet closed (the visible shim)".
+fail-loud opt-out switch; #72 was **corrected** three times — most recently by
+**#79**, which replaces the old third class ("not yet closed (the visible
+shim)") with "closed (the mechanism is now INVISIBLE)": the shim hides
+`/etc/ld.so.preload`, itself and the legacy engine dirs from the workspace while
+the loader still reads the preload list.
 #74 covers the engine/platform curation of every mounted tree (the engine's
 runner and helpers, the platform's tooling and vendor material, the provider
 account, the provider-named systemd units), #75 covers closing the
 dlopen-scoped `dlsym` bypass, #76 records the egress-address finding and the
 default-off `network.egress_proxy` knob, **#77** records the zero-artifact
 goal, the Stage 1 removals and the measured reason Stage 2 (libc replacement /
-seccomp user_notif) is not reachable, and **#78** records the PTY relay being
-passed inline rather than materialized.
+seccomp user_notif) is not reachable, **#78** records the PTY relay being
+passed inline rather than materialized, **#79** records the masking mechanism
+being made INVISIBLE to the tenant (the shim hides `/etc/ld.so.preload`, itself
+and the legacy dirs, with the glibc-versioned filesystem interposers, while the
+loader still reads the preload list — correcting ADR 72's "unavoidable"
+classification), and **#80** settles the shipped nsjail (3.4) versus the
+unreleased `master` with `--seccomp_unotify`.
 
 ## 11. OpenAPI
 

@@ -204,9 +204,14 @@ GO=$(command -v go || echo /usr/local/go/bin/go)
 # The shim must be built from source before go build embeds it, so a stale or
 # missing artifact cannot silently disable the mask. It is stripped and its
 # .comment section removed exactly as the Makefile does, so the harness tests
-# the same zero-string artifact a deployment ships.
+# the same zero-string artifact a deployment ships. The version script and
+# -soname MUST match the Makefile: without the version script the filesystem
+# interposers are unversioned and do not satisfy the versioned references python
+# and `test` use, so the hiding silently fails (measured).
 if command -v cc >/dev/null 2>&1; then
-  cc -shared -fPIC -O2 -Wall -s -fno-ident -o "$ROOT/internal/executor/hostmask.so" \
+  cc -shared -fPIC -O2 -Wall -s -fno-ident -Wl,-soname,rt.so \
+    -Wl,--version-script="$ROOT/internal/executor/hostmask/hostmask.map" \
+    -o "$ROOT/internal/executor/hostmask.so" \
     "$ROOT/internal/executor/hostmask/hostmask.c" -ldl || { echo "FAIL  shim: could not build hostmask.so"; exit 1; }
   objcopy -R .comment "$ROOT/internal/executor/hostmask.so" 2>/dev/null || true
 fi

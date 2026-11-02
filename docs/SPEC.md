@@ -600,9 +600,14 @@ config template `configs/nsjail_python.cfg.tmpl` must include:
   `cpu_cores`/`memory_mb` (as the engine-neutral `LSM_SYS_*` variables) so the
   shim answers `uname`, `sysinfo`, `sysconf`,
   `sched_getaffinity`, `getauxval` and the libc version strings with the
-  workspace's values instead of the host's. The mounts are `mandatory:true`:
-  a mask that cannot be applied aborts the run rather than leaking. See
-  [DECISIONS.md](DECISIONS.md) #71–#73.
+  workspace's values instead of the host's. The same shim interposes the
+  filesystem entry points so **the mechanism itself is invisible** to the tenant:
+  `/etc/ld.so.preload`, the shim's own `/run/.rt.so` and the legacy `/sandboxd`,
+  `/run/sandboxd` all report `ENOENT` to `ls`/`cat`/`stat`/`test`/`find` and
+  Python's `os.stat`/`os.listdir`, while the loader (which reads the preload list
+  before any shim is mapped) still reads it and `env -i` stays masked. The mounts
+  are `mandatory:true`: a mask that cannot be applied aborts the run rather than
+  leaking. See [DECISIONS.md](DECISIONS.md) #71–#73, #79.
 - zero-signal curation (`identity.hide_provider_tools`, default on): the host's
   `/usr/{bin,sbin,lib,local}`, `/lib`, `/usr/share/{doc,man}` and
   `/etc/{passwd,group,ssl/certs}` are each replaced inside the workspace with a

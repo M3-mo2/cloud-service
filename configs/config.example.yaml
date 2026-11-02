@@ -182,9 +182,12 @@ tunnels:
 #
 # Honest limits (documented, not implied away): a statically-linked binary, a
 # musl runtime (which does not read /etc/ld.so.preload), a raw syscall(2), or a
-# handle-scoped dlvsym(3) bypasses the shim. Masking is defense-in-depth, not a
-# security boundary; the /proc and /sys views remain hidden by the mount
-# namespace. See docs/DECISIONS.md.
+# handle-scoped dlvsym(3) bypasses the shim. The shim ALSO hides the mechanism
+# itself from the workspace (the shim, /etc/ld.so.preload and the legacy engine
+# dirs report ENOENT to ls/cat/stat/test/find and Python), while the loader still
+# reads the preload list, so the mask keeps working (ADR 79). Masking is
+# defense-in-depth, not a security boundary; the /proc and /sys views remain
+# hidden by the mount namespace. See docs/DECISIONS.md.
 identity:
   # Opt-out switch (default true). Set false only to measure what leaks.
   enabled: true

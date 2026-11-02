@@ -217,8 +217,8 @@ default per-workspace limits.
     },
     "identity_masking": {
       "enabled": true, "ready": true,
-      "mechanism": "ld.so.preload shim (uname/sysinfo/sysconf/sched_getaffinity/getauxval/dlsym)",
-      "limits": "a statically-linked binary, a musl runtime, a raw syscall(2), or a handle-scoped dlvsym(3) bypasses the shim"
+      "mechanism": "ld.so.preload shim (uname/sysinfo/sysconf/sched_getaffinity/getauxval/dlsym, plus a filesystem interposer that hides /etc/ld.so.preload, the shim itself and the legacy engine dirs from the workspace)",
+      "limits": "a statically-linked binary, a musl runtime, a raw syscall(2), or a handle-scoped dlvsym(3) bypasses the shim; the shim and its preload list are invisible to the workspace (ADR 79), and only a raw syscall(2) additionally reaches /etc/ld.so.preload"
     },
     "provider_tools_hidden": {
       "enabled": true, "ready": true,
