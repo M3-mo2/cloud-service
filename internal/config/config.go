@@ -159,9 +159,11 @@ type TunnelsConfig struct {
 	// its public URL before failing with 504 tunnel_url_not_observed (default
 	// 45). It bounds the wait; it never fabricates a URL.
 	URLTimeoutSec int `koanf:"url_timeout_sec"`
-	// CloudflaredPath is the cloudflared binary (default cloudflared). It is
-	// also visible inside a workspace on PATH (the sandbox mounts /usr), so the
-	// user's own `cloudflared tunnel --url http://localhost:PORT` works too.
+	// CloudflaredPath is the cloudflared binary (default cloudflared). The
+	// engine runs it from the HOST inside the workspace's network namespace; it
+	// is not on PATH inside the workspace when identity.hide_provider_tools is
+	// on (the curated /usr/local does not carry it), which is deliberate: the
+	// workspace uses the tunnel API rather than the binary.
 	CloudflaredPath string `koanf:"cloudflared_path"`
 }
 

@@ -40,7 +40,7 @@ reports `"cgroups":true`.
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/process-stop-check.sh` → `25 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/session-nsjail-check.sh` → `18 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh` → `27 passed / 0 failed / 0 skipped`
-> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `31 passed / 0 failed / 0 skipped`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `47 passed / 0 failed / 0 skipped`
 >
 > The unprivileged suites (`gofmt`, `go build`, `go vet`, `go test ./...`, the
 > handler-level assertions and the sandbox-config render tests) were re-run and
@@ -1329,7 +1329,7 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   host kernel=7.1.8-zabbly+ cpus=2 hostname=node-id-1.runtime.zcp.zerops
   workspace limits: cpus=1 mem=256MB
 === starting the mask-on service under real nsjail ===
-  service started (pid 109069)
+  service started (pid 140194)
   readyz.identity_masking: {'enabled': True, 'ready': True}
   PASS  readyz.identity_masking.ready (True)
   PASS  readyz.provider_tools_hidden.ready (True)
@@ -1366,8 +1366,10 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   PASS  provider.no_vendor_certs (0)
   PASS  provider.audit_scanned (yes)
   PASS  provider.runtime_python3 (0 'py-ok')
-  PASS  provider.runtime_node (0 'node-ok')
+  PASS  provider.runtime_bash (0 'sh-ok')
+  PASS  provider.runtime_perl (0 'perl-ok')
   PASS  provider.runtime_git (0 'git-ok')
+  PASS  provider.runtime_node_no_regression (133)
 === 9) the dlopen-scoped dlsym bypass is closed (syscall(2) is known) ===
   PASS  bypass.default_handle_masked (0.0.0-sandbox)
   PASS  bypass.named_handle_masked (0.0.0-sandbox)
@@ -1389,7 +1391,7 @@ $ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identit
   PASS  topology.no_new_veth_or_tap (0)
   PASS  topology.netns_empty (0)
 
-================ identity acceptance: 48 passed / 0 failed / 0 skipped ================
+================ identity acceptance: 47 passed / 0 failed / 0 skipped ================
 ```
 
 **Measured: `node` is constrained by `rlimit_as` independently of masking.**

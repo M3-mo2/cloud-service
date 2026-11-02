@@ -765,9 +765,11 @@ curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 # {"tunnel":{"id":"tun_...","url":"https://....trycloudflare.com","status":"active", ...}}
 ```
 
-The user's own simplest path is the same mechanism: with a shell inside the
-workspace, `cloudflared tunnel --url http://localhost:5000` prints a working URL
-(cloudflared is on `PATH` in the sandbox). See
+The engine runs cloudflared from the host inside the workspace's namespace; with
+the default `identity.hide_provider_tools` it is **not** on `PATH` inside the
+workspace (the curated `/usr/local` does not carry it), so a tunnel is started
+through this API. An operator who wants a raw `cloudflared` inside the workspace
+can expose one via `identity.tools_dir`. See
 [Quick tunnels and egress](#quick-tunnels-and-egress).
 
 ### GET /v1/workspaces/{workspaceID}/tunnels

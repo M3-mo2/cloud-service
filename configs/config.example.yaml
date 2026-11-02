@@ -163,8 +163,10 @@ tunnels:
   # fabricates a URL: if none is observed within this bound the create fails
   # with 504 tunnel_url_unavailable.
   url_timeout_sec: 45
-  # The cloudflared binary. It lives in /usr/local/bin, which the sandbox
-  # mounts, so it is on PATH inside a workspace too.
+  # The cloudflared binary. The engine runs it from the host inside the
+  # workspace's network namespace. With identity.hide_provider_tools on (the
+  # default) it is NOT on PATH inside the workspace: the curated /usr/local does
+  # not carry it, and a workspace starts tunnels through the API instead.
   cloudflared_path: "cloudflared"
 
 # Host-identity masking.

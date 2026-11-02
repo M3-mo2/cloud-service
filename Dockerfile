@@ -32,8 +32,10 @@ RUN git clone --depth 1 --branch "${NSJAIL_VERSION}" \
 FROM ubuntu:24.04 AS runtime
 
 # cloudflared is fetched from its own release (it is not packaged). It lives in
-# /usr/local/bin, which the sandbox bind-mounts read-only at the same path, so it
-# is on PATH inside a workspace too. Pin a known-good version.
+# /usr/local/bin on the host; the engine runs it inside the workspace's network
+# namespace. With identity.hide_provider_tools on (the default) the workspace's
+# curated /usr/local does not expose it, so it is not on PATH inside a
+# workspace. Pin a known-good version.
 ARG CLOUDFLARED_VERSION=2026.10.7
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \

@@ -443,15 +443,18 @@ replaces.
   per-workspace cap → `422 too_many_tunnels`; no URL in time → `504
   tunnel_url_unavailable`.
 - A tunnel **dies with its workspace** (`stop`/`suspend`/`DELETE`) and startup
-  reaps orphaned cloudflared processes. The user's own simplest path — a shell
-  inside the workspace running `cloudflared tunnel --url http://localhost:5000` —
-  works too, because cloudflared is on `PATH`.
+  reaps orphaned cloudflared processes. The engine runs cloudflared from the
+  host inside the workspace's network namespace; with the default
+  `identity.hide_provider_tools` it is **not** on `PATH` inside the workspace, so
+  a tunnel is started through the API (a tenant needing a raw cloudflared can be
+  given it by an operator via `identity.tools_dir`).
 
 **Config.** `network: {enabled, netns_dir, relay_netns, slirp_path, mtu,
-resolver, start_timeout_ms}` and `tunnels: {enabled, max_per_workspace,
-url_timeout_sec, cloudflared_path}`, plus `limits.allow_tunnels` (the
-per-workspace opt-in). Both blocks are **default-deny**: `enabled` defaults to
-`false`, and a workspace can opt in to tunnels only when the server switch is on
+resolver, start_timeout_ms, egress_proxy}` and `tunnels: {enabled,
+max_per_workspace, url_timeout_sec, cloudflared_path}`, plus
+`limits.allow_tunnels` (the per-workspace opt-in). Both blocks are
+**default-deny**: `enabled` defaults to `false`, and a workspace can opt in to
+tunnels only when the server switch is on
 and it has `allow_net`.
 
 ### 2.6 Auth
