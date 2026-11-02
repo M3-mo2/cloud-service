@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: sandboxd API
-  version: 0.0.15
+  version: 0.0.16
   description: |
     Secure per-principal code execution backend. All `/v1` endpoints require a
     static bearer API key. All timestamps are RFC3339 UTC.
@@ -1231,11 +1231,18 @@ components:
             enabled: { type: boolean }
             ready: { type: boolean }
             reason: { type: string }
+        identity_masking:
+          type: object
+          description: Host-identity masking capability, reported truthfully. Enabled-but-not-ready makes the probe 503.
+          properties:
+            enabled: { type: boolean }
+            ready: { type: boolean }
+            reason: { type: string }
     Meta:
       type: object
       required: [version, api_version, runtimes, limits_defaults]
       properties:
-        version: { type: string, examples: ["0.0.15"] }
+        version: { type: string, examples: ["0.0.16"] }
         api_version: { type: string, examples: [v1] }
         runtimes:
           type: array
@@ -1271,6 +1278,20 @@ components:
             max_per_workspace: { type: integer }
             url_timeout_sec: { type: integer }
             reason: { type: string }
+        identity_masking:
+          type: object
+          description: >-
+            Host-identity masking capability, reported truthfully. `enabled` is
+            the server switch (identity.enabled, default true); `ready` is
+            whether the preload shim can be applied; `mechanism`/`limits` state
+            how it works and what it does NOT cover (a statically-linked, musl
+            or raw-syscall binary bypasses it).
+          properties:
+            enabled: { type: boolean }
+            ready: { type: boolean }
+            reason: { type: string }
+            mechanism: { type: string }
+            limits: { type: string }
     Limits:
       type: object
       properties:

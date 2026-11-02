@@ -1,6 +1,6 @@
 # Verification
 
-Results for sandboxd v0.0.15 against the acceptance criteria in the spec.
+Results for sandboxd v0.0.16 against the acceptance criteria in the spec.
 
 Environment:
 
@@ -40,6 +40,7 @@ reports `"cgroups":true`.
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/process-stop-check.sh` → `25 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/session-nsjail-check.sh` → `18 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh` → `27 passed / 0 failed / 0 skipped`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `27 passed / 0 failed / 0 skipped`
 >
 > The unprivileged suites (`gofmt`, `go build`, `go vet`, `go test ./...`, the
 > handler-level assertions and the sandbox-config render tests) were re-run and
@@ -100,7 +101,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **308** (304 unit + 4 `integration`-tagged), including regression
+Test functions: **316** (312 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -146,7 +147,7 @@ file (the same measure `scripts/docs-consistency.sh` asserts against):
 
 ```
 $ find . -name '*_test.go' -exec grep -hE '^func Test' {} + | wc -l
-308
+316
 ```
 
 ## 2. Probes
@@ -176,7 +177,7 @@ ok   readyz.nsjail                True
 ### 1. healthz
 ok   healthz.status               ok
 ### 2. meta
-ok   meta.version                 0.0.15
+ok   meta.version                 0.0.16
 ### 3. create workspace
 workspace id: ws_01M6BNEZGVE2AFRADVKB01FFC2
 ### 4. mkdir /src
@@ -1306,9 +1307,117 @@ engine namespaces. The unprivileged suite covers the API contract
 (`TestMatchTunnelURL`, `TestIsQuickTunnelArgs`, `TestAllocatorReserveRelease`,
 `TestShortIDStable`, `TestShellQuote`).
 
+## 9h. Host identity: what a workspace can and cannot observe (acceptance)
+
+`scripts/identity-check.sh` is the real-nsjail acceptance harness for
+host-identity masking. It builds sandboxd, runs it under the host's REAL nsjail
+(mask-on and mask-off instances), and measures and asserts the whole property.
+It prints `SKIP` and exits 0 when root, nsjail, slirp4netns or the Go toolchain
+is absent.
+
+**The third state — skipped-environment.** Assertion 6 (the egress IP) depends
+on the public internet reachable from the workspace. If it is not, that one
+assertion is recorded as **SKIP** with the reason and the suite still exits `0`;
+a suite that goes red because the internet is down trains people to ignore it.
+This is **never** used for a masking, filesystem-view or topology failure — those
+are always hard **FAIL**. The tally separates the three states.
+
+```
+$ sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh
+=== building ===
+=== host baseline ===
+  host kernel=7.1.8-zabbly+ cpus=2 hostname=node-id-1.runtime.zcp.zerops
+  workspace limits: cpus=1 mem=256MB
+=== starting the mask-on service under real nsjail ===
+  service started (pid 100524)
+  readyz.identity_masking: {'enabled': True, 'ready': True}
+  PASS  readyz.identity_masking.ready (True)
+=== 1) the 'already closed' paths are unreadable ===
+  PASS  closed.paths_none_readable (0)
+=== 2) hostname and internal DNS reveal nothing ===
+  PASS  host.gethostname_generic (sandbox)
+  PASS  host.gethostname_not_host (no)
+  PASS  host.hostname_f_fails (no)
+  PASS  host.hostname_I_empty ()
+  PASS  host.internal_dns_unresolved ()
+=== 3) allow_net:false reaches no what-is-my-IP service ===
+  PASS  no_net.no_ip_service_reached (0)
+=== 4) masking ON reports the workspace's limits (and survives env -i) ===
+  PASS  mask.release_not_host (no)
+  PASS  mask.release_generic (0.0.0-sandbox)
+  PASS  mask.cpu_count_workspace (1)
+  PASS  mask.sysconf_cpu_workspace (1)
+  PASS  mask.memory_workspace_bytes (268435456)
+  PASS  mask.cpu_not_host (no)
+  PASS  mask.env_i_nproc (1)
+  PASS  mask.env_i_uname (0.0.0-sandbox)
+  PASS  mask.env_i_getconf (1)
+  PASS  mask.shim_not_writable (0)
+=== 6) measured egress IP on the allow_net:true path ===
+  measured egress IP: 93.185.106.128
+  PASS  egress.ip_is_public (yes)
+  note: workspace egress IP equals the host's own public egress IP (platform-shared NAT)
+=== 5) masking OFF leaks the host values (the switch is verifiable) ===
+  PASS  mask_off.readyz_enabled (False)
+  PASS  mask_off.release_leaks_host (7.1.8-zabbly+)
+  PASS  mask_off.cpu_leaks_host (2)
+  PASS  mask_off.mem_leaks_host (yes)
+=== 7) the host topology is untouched ===
+  PASS  topology.links_unchanged (same)
+  PASS  topology.routes_unchanged (same)
+  PASS  topology.no_new_veth_or_tap (0)
+  PASS  topology.netns_empty (0)
+
+================ identity acceptance: 27 passed / 0 failed / 0 skipped ================
+```
+
+**The measured numbers (this session, target host).** The workspace was capped at
+`cpu_cores: 1, memory_mb: 256`; the host is `7.1.8-zabbly+` with 2 cores and
+`132000778 × 4096 = 540675186688` bytes (≈540 GB) of RAM.
+
+| Probe | Host (mask OFF) | Workspace (mask ON) |
+|-------|-----------------|---------------------|
+| `uname.release` | `7.1.8-zabbly+` | `0.0.0-sandbox` |
+| `uname.version` | `#ubuntu24.04 SMP PREEMPT_DYNAMIC Mon Aug 10 04:00:53 UTC 2026` | `#1 SMP` |
+| `os.cpu_count()` / `getconf _NPROCESSORS_ONLN` | `2` | `1` |
+| `sysconf(_SC_PHYS_PAGES)·4096` | `540675186688` | `268435456` |
+| `env -i … nproc` | `2` | `1` |
+| `gnu_get_libc_version()` | `2.39` (distro `2.39-0ubuntu8.9` trimmed) | `2.39` |
+
+**Measured: a genuine `env -i` cannot defeat the mask.** Because the shim is
+reached through a read-only `/etc/ld.so.preload` (read by the dynamic loader for
+every dynamically-linked exec) rather than the `LD_PRELOAD` environment variable,
+`env -i PATH=/usr/bin:/bin nproc` and `env -i PATH=/usr/bin:/bin uname -r` inside
+the workspace still return the masked values. This is why the plain `LD_PRELOAD`
+environment variable was rejected (it is cleared by `env -i`).
+
+**Measured leak the fix closed: the host `/etc/hosts`.** On the `allow_net:true`
+path the engine previously bind-mounted the host's own `/etc/hosts`, which on
+this host contains `10.9.112.7  node-id-1.runtime.zcp.zerops` — the operator's
+server FQDN and LAN address. The engine now writes a per-workspace hosts file
+holding only generic localhost entries and mounts that; the host's file is never
+mounted into a workspace (`TestRenderConfigMountsResolverWhenNetAllowed` asserts
+`src: "/etc/hosts"` never appears).
+
+**Measured: the egress IP is a platform-shared NAT address.** An `allow_net:true`
+workspace fetching `https://api.ipify.org`, `https://icanhazip.com` and
+`https://ifconfig.me/ip` presented **`93.185.106.128`** — which is also the
+host's own public egress IP (measured identically from the host), i.e. a
+platform-shared NAT address, not a per-workload one. To measure it the harness
+copies `scripts/tunnel-check.sh`'s exact service startup and network block (the
+same `network:` config and `start_service`), because a plain standalone harness
+that did not configure the relay hit `interface did not come up in sbxdws-…`.
+
+**The honest limits.** A statically-linked binary, a musl runtime (whose loader
+ignores `/etc/ld.so.preload`) and a raw `syscall(2)` bypass the shim; those
+limits are stated in [DECISIONS.md](DECISIONS.md) #72, in the config example, and
+in `/v1/meta`'s `identity_masking.limits`. Masking is defense-in-depth, not a
+security boundary; the filesystem view stays closed by the mount namespace on
+every path (assertion 1), and that part holds for **every** binary.
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **70** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **73** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -1316,7 +1425,9 @@ service non-goal, #63, native process control, #64–69, per-workspace egress vi
 chained slirp4netns and quick Cloudflare tunnels, including the recorded
 host-topology hazard of the abandoned veth/route design, and #70, the
 quick-tunnel rate-limit / ephemeral-URL operational limit and the harness's
-skipped-environment third state).
+skipped-environment third state), plus #71–#73, the host-identity threat model,
+the /etc/ld.so.preload masking mechanism and its honest limits, and the
+fail-loud opt-out switch.
 
 ## 11. OpenAPI
 
@@ -1355,10 +1466,15 @@ passed=<N> failed=0
 ## Known limitations
 
 - SSE log streaming is deferred to v0.1; logs are polled with `offset`/`limit`.
+- **Host-identity masking is defense-in-depth, not a security boundary.** A
+  statically-linked binary, a musl runtime, or a raw `syscall(2)` bypasses the
+  preload shim and sees the real host kernel, core count and RAM. The
+  filesystem view (no `/proc`, no `/sys`) is closed on every path regardless;
+  see [DECISIONS.md](DECISIONS.md) #72. This is stated, not hidden.
 - Multi-node storage is deferred; storage is local filesystem JSON.
 - DB-backed/dynamic authentication is deferred; keys are static in the config
   (bearer auth itself is exercised by `TestAuth*`).
-- Per-UID-per-workspace isolation is deferred to v0.1 (v0.0.15 uses a shared
+- Per-UID-per-workspace isolation is deferred to v0.1 (v0.0.16 uses a shared
   `sandbox` UID/GID with per-run user namespaces and cgroups).
 - `rlimit_fsize` bounds a single file, and `disk_mb` is enforced on the file API
   path and via a `du` recheck on workspace load; it is not enforced by the

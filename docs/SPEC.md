@@ -1,4 +1,4 @@
-# sandboxd specification (v0.0.15)
+# sandboxd specification (v0.0.16)
 
 This document is the canonical specification for the sandboxd service. It is a
 faithful copy of the project brief, retained in-repo so implementation and
@@ -15,9 +15,9 @@ belong to the separate frontend product, §2.6.)
 
 - Language: Go 1.22 (the brief targeted 1.22; `go.mod` requires Go 1.23 because
   the mandated koanf YAML parser declares a `go 1.23` floor — see
-  [DECISIONS.md](DECISIONS.md)). The service version string is `0.0.15`
+  [DECISIONS.md](DECISIONS.md)). The service version string is `0.0.16`
   (`model.Version`): it is the highest feature group resolved in DECISIONS.md
-  (which runs to v0.0.15), not the `/v1` API contract version. The two move
+  (which runs to v0.0.16), not the `/v1` API contract version. The two move
   independently — the API prefix changes only on a breaking contract change.
 - OS: Ubuntu Noble (24.04), x86_64.
 - Router: `github.com/go-chi/chi/v5`.
@@ -30,12 +30,12 @@ belong to the separate frontend product, §2.6.)
 - Lint: `golangci-lint` if available; otherwise `go vet ./...` must pass.
 - Sandbox: `nsjail` (may or may not be installed on the host — the service must
   detect and report via `/readyz`, never crash).
-- No external DB. Storage is filesystem JSON under `./data/` in v0.0.15.
+- No external DB. Storage is filesystem JSON under `./data/` in v0.0.16.
 - The service version string (`model.Version`) tracks the highest feature group
-  resolved in [DECISIONS.md](DECISIONS.md) (currently v0.0.15), **not** the `/v1`
+  resolved in [DECISIONS.md](DECISIONS.md) (currently v0.0.16), **not** the `/v1`
   API contract version: the API prefix changes only on a breaking contract
   change, so the two are deliberately decoupled. The decision log's own
-  per-group labels (v0.0.6 … v0.0.15) are the version history this number
+  per-group labels (v0.0.6 … v0.0.16) are the version history this number
   follows.
 - Everything must build with `go build ./...` and pass `go test ./...`.
 - Generate OpenAPI 3.1 spec at `api/openapi.yaml` — it is the source of truth
@@ -53,9 +53,42 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 ### 2.1 Meta
 
 - `GET /healthz` → 200 `{"status":"ok"}`
-- `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool}`
-- `GET /v1/meta` → `{"version":"0.0.15","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...}}`
+- `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str}}`
+- `GET /v1/meta` → `{"version":"0.0.16","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
 - `GET /metrics` → Prometheus text
+
+#### What a workspace can and cannot observe
+
+This is a security property, stated plainly. A workspace runs inside an nsjail
+sandbox with no `/proc`, no `/sys`, a private mount namespace, an unprivileged
+uid, its own network namespace, and (by default) a host-identity masking shim.
+It **cannot**:
+
+- read machine identity: `/etc/machine-id`, `/etc/hostname`, `/etc/hosts`,
+  `/etc/os-release`, `/etc/hostid`, `/etc/shadow` are not present;
+- read the kernel's view: `/proc/version`, `/proc/meminfo`, `/proc/cpuinfo`,
+  `/proc/net/dev`, `/proc/self/cgroup`, `/proc/self/mountinfo` are not mounted;
+- read hardware identity: `/sys/class/net` and every `/sys/class/dmi/id/*` are
+  not mounted;
+- learn the host name (`socket.gethostname()` returns the generic `sandbox`);
+- resolve the operator's internal DNS names, or obtain its address with
+  `hostname -f` / `hostname -I`;
+- reach any "what is my IP" service without `allow_net:true`;
+- learn the platform's kernel build (`uname` reports the generic
+  `0.0.0-sandbox`), the host's core count or total RAM (`sysconf`/`sysinfo`
+  report the workspace's limits), or the base image's distro patch level
+  (`gnu_get_libc_version`/`confstr` are trimmed to the upstream number);
+- learn the operator's server FQDN or LAN address: the workspace's `/etc/hosts`
+  is a generated file holding only generic localhost entries, never the host's.
+
+It **can**: observe its own cpu/memory limits as configured, run code, read and
+write its own workspace, and — with `allow_net:true` — reach the public internet,
+presenting a **platform-shared NAT address** (measured `93.185.106.128` this
+session); that address is the platform's egress, not a per-host address the
+tenant could use to single out this machine. The honest limits of the masking
+mechanism (a statically-linked binary, a musl runtime, or a raw `syscall(2)`
+bypasses the shim) are documented in [DECISIONS.md](DECISIONS.md) #72 and
+reported by `/v1/meta`'s `identity_masking.limits`.
 
 ### 2.2 Workspaces
 
@@ -512,7 +545,7 @@ What is **still not implemented** (the honest non-goal):
 
 Stated precisely: **stop-everything for a workspace exists natively now;
 supervision (desired-state restart/autostart) remains a documented non-goal for
-this version** (v0.0.15). Where such a capability would belong if built — an
+this version** (v0.0.16). Where such a capability would belong if built — an
 engine-level supervisor versus the frontend restarting runs — is recorded in
 [DECISIONS.md](DECISIONS.md) #61. **It is deliberately not implemented in this
 version.**
@@ -540,11 +573,21 @@ config template `configs/nsjail_python.cfg.tmpl` must include:
   `setns`, `unshare`, `clone3` if problems — but allow `clone`/`clone3` with
   restrictions; default to documented safe list
 - `--disable_proc` (or read-only `/proc`)
-- DNS: mount `/etc/resolv.conf` naming **public resolvers** (and `/etc/hosts`)
-  read-only **only when `allow_net=true`**. The workspace reaches those resolvers
-  through its chained-slirp4netns egress; the host's own resolver is deliberately
-  never published to a workspace. A workspace without `allow_net` must not see
-  any resolver at all.
+- DNS: mount `/etc/resolv.conf` naming **public resolvers**, and a **generated**
+  `/etc/hosts` holding only generic localhost entries, read-only **only when
+  `allow_net=true`**. The workspace reaches those resolvers through its
+  chained-slirp4netns egress; the host's own resolver is deliberately never
+  published to a workspace. The host's own `/etc/hosts` is **never** mounted
+  (it names the operator's server FQDN and LAN address). A workspace without
+  `allow_net` must not see any resolver or hosts file at all.
+- host-identity masking (`identity.enabled`, default on): bind-mount a compiled
+  preload shim read-only at `/sandboxd/hostmask.so` and a read-only
+  `/etc/ld.so.preload` naming it, and inject the workspace's own
+  `cpu_cores`/`memory_mb` so the shim answers `uname`, `sysinfo`, `sysconf`,
+  `sched_getaffinity`, `getauxval` and the libc version strings with the
+  workspace's values instead of the host's. The mounts are `mandatory:true`:
+  a mask that cannot be applied aborts the run rather than leaking. See
+  [DECISIONS.md](DECISIONS.md) #71–#73.
 - package tiers: when the shared tier is configured and available, bind-mount it
   read-only at `/opt/python/shared`; always bind-mount the workspace's private
   tier read-write at `/opt/python/private`; inject both (shared first) via

@@ -209,6 +209,65 @@ else
   fail "tunnel-harness.documented" "docs/VERIFICATION.md does not mention scripts/tunnel-check.sh"
 fi
 
+# --- 4d-bis. the host-identity acceptance harness exists and is documented --
+# identity-check.sh is the only check that measures the syscall-reachable host
+# facts a mount namespace cannot hide (uname/sysconf/sysinfo) and that the
+# masking switch really masks, so it must exist, be executable, and be named in
+# VERIFICATION.md. It may legitimately report an environment-skip for the
+# egress-IP assertion when the public internet is unreachable.
+
+if [ -f scripts/identity-check.sh ]; then
+  ok "identity-harness.exists"
+else
+  fail "identity-harness.exists" "scripts/identity-check.sh is missing"
+fi
+if [ -x scripts/identity-check.sh ]; then
+  ok "identity-harness.executable"
+else
+  fail "identity-harness.executable" "scripts/identity-check.sh is not executable"
+fi
+if grep -qF 'identity-check.sh' docs/VERIFICATION.md; then
+  ok "identity-harness.documented"
+else
+  fail "identity-harness.documented" "docs/VERIFICATION.md does not mention scripts/identity-check.sh"
+fi
+
+# The masking shim source and the embedded artifact must both be present, so a
+# stale or missing .so cannot silently disable the mask.
+if [ -f internal/executor/hostmask/hostmask.c ]; then
+  ok "identity-shim.source"
+else
+  fail "identity-shim.source" "internal/executor/hostmask/hostmask.c is missing"
+fi
+if [ -f internal/executor/hostmask.so ]; then
+  ok "identity-shim.built"
+else
+  fail "identity-shim.built" "internal/executor/hostmask.so is missing (run \`make shim\`)"
+fi
+if grep -qi 'identity_masking' docs/API.md && grep -qi 'identity_masking' api/openapi.yaml; then
+  ok "identity-masking.documented"
+else
+  fail "identity-masking.documented" "the identity_masking capability is not documented in docs/API.md and api/openapi.yaml"
+fi
+
+# The identity harness must be wired into the Makefile (the entry point an
+# operator uses) and be in .PHONY.
+if grep -qE '^identity-check:' Makefile; then
+  ok "makefile.target.identity-check"
+else
+  fail "makefile.target.identity-check" "Makefile has no 'identity-check:' target"
+fi
+if grep -qE 'bash scripts/identity-check.sh' Makefile; then
+  ok "makefile.sudo.identity-check"
+else
+  fail "makefile.sudo.identity-check" "Makefile's 'identity-check' target does not run scripts/identity-check.sh"
+fi
+if grep -qE '^\.PHONY:.*\bidentity-check\b' Makefile; then
+  ok "makefile.phony.identity-check"
+else
+  fail "makefile.phony.identity-check" "'identity-check' is not in .PHONY"
+fi
+
 # --- 4e. the Makefile wires every acceptance harness it names ---------------
 # The Makefile is the entry point operators use; a harness with no target is one
 # nobody runs. Assert the three sudo-style host suites have targets and appear

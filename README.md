@@ -7,9 +7,9 @@ product's job; this service authenticates only static per-principal API keys.
 `sandboxd` lets clients create isolated workspaces, upload files, and run code inside
 [nsjail](https://github.com/google/nsjail) with CPU/memory/disk limits and no network by default.
 
-> Status: **v0.0.15** (pre-alpha). The service version string (`model.Version`)
+> Status: **v0.0.16** (pre-alpha). The service version string (`model.Version`)
 > tracks the highest feature group resolved in [docs/DECISIONS.md](docs/DECISIONS.md),
-> which now runs to v0.0.15; it is independent of the `/v1` API contract version.
+> which now runs to v0.0.16; it is independent of the `/v1` API contract version.
 > SSE log streaming and multi-node storage are deferred to v0.1.
 
 ## Features
@@ -46,6 +46,17 @@ product's job; this service authenticates only static per-principal API keys.
   creation can return `429`, surfaced honestly as `504 tunnel_url_unavailable`,
   and the URL is **ephemeral** (never cache it). See
   [docs/DECISIONS.md](docs/DECISIONS.md) #70.
+- **Host-identity masking** — a workspace cannot identify the machine it runs on.
+  No `/proc`, no `/sys`, a generic hostname, no internal DNS, and a preload shim
+  (on by default, `identity.enabled`) that makes `uname`/`sysconf`/`sysinfo`
+  report the **workspace's own** cpu and memory rather than the host's real size
+  or a platform kernel fingerprint. The shim is reached through a read-only
+  `/etc/ld.so.preload` a tenant cannot clear, and both files are read-only
+  mounts. The honest limits — a statically-linked, musl or raw-`syscall(2)`
+  binary bypasses it — are documented, not implied away. `GET /readyz` and
+  `GET /v1/meta` report `identity_masking` truthfully. See
+  [docs/DECISIONS.md](docs/DECISIONS.md) #71–#73 and
+  [scripts/identity-check.sh](scripts/identity-check.sh).
 
 See [docs/API.md](docs/API.md) for the full endpoint reference.
 
@@ -71,7 +82,8 @@ the service is built and how the isolation works.
 ## Build, test, lint
 
 ```sh
-make build       # builds bin/sandboxd
+make build       # builds bin/sandboxd (rebuilds the masking shim first)
+make shim        # rebuilds internal/executor/hostmask.so from hostmask.c
 make test        # go test ./...
 make test-race   # go test -race ./...
 make lint        # golangci-lint if present, else go vet
@@ -84,6 +96,26 @@ compares every step against its expected value and exits non-zero on any
 mismatch. It requires a server backed by real nsjail inside a container started
 with `--privileged --cgroupns=host`. `make acceptance` builds the official image
 and runs it.
+
+The host suites run against real nsjail on the host (root, no container), each
+with a one-line pass/fail tally: `make process-check`, `make session-check`,
+`make tunnel-check` (may report environment-skips on a Cloudflare `429`) and
+`make identity-check` (host-identity masking; may report an environment-skip if
+the public internet is unreachable). `make docs-check` asserts the docs match
+the code.
+
+### Host-identity masking
+
+Masking is **on by default** (`identity.enabled: true`). It is an `LD_PRELOAD`
+shim reached through a read-only `/etc/ld.so.preload`, so a workspace sees its
+own cpu/memory limits and a generic kernel string instead of the host's real
+size and platform build. It cannot be cleared with `env -i`, and the shim and
+preload list are read-only bind mounts. Turn it off only to measure what leaks
+(that leak is itself asserted by `scripts/identity-check.sh`). A binary that is
+statically linked, built against musl, or calls a raw `syscall(2)` bypasses the
+shim — the honest limits are in [docs/DECISIONS.md](docs/DECISIONS.md) #72.
+Building the service from source needs a C compiler for the shim; a plain
+`go build ./...` uses the committed `internal/executor/hostmask.so`.
 
 ## Requirements
 

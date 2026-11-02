@@ -1,10 +1,11 @@
 # Decisions
 
 All resolved decisions for sandboxd, grouped by the feature version in which
-they landed (v0.0.5, then v0.0.6 … v0.0.15 below). Each decision is fixed for its
+they landed (v0.0.5, then v0.0.6 … v0.0.16 below). Each decision is fixed for its
 group; deferred work is noted explicitly. Do not re-litigate these without a new
 version. The service version string (`model.Version`) tracks the highest group
-implemented, currently **v0.0.15** (see #17).
+implemented, currently **v0.0.16** (#71–#73); the HTTP contract stays `/v1`
+(see #17).
 
 1. **Isolation model**: per-run user namespaces + shared `sandbox` UID/GID + per-run cgroups.
    _Rationale_: cheap, portable isolation that works without a per-user UID allocation scheme.
@@ -48,12 +49,12 @@ implemented, currently **v0.0.15** (see #17).
 16. **Health probes**: `GET /healthz` returns 200 while the process is alive; `GET /readyz` returns
     200 only if the data dir is writable AND the nsjail binary is found, else 503 with a reason.
     _Rationale_: separates liveness from readiness for orchestrators.
-17. **Version**: the service version string is `0.0.15`, the highest feature group
+17. **Version**: the service version string is `0.0.16`, the highest feature group
     resolved in this file.
     _Rationale_: single source of truth (`model.Version`) for the implementation
     version. It is deliberately **decoupled from the `/v1` API contract version**
     (`model.APIVersion`), which changes only on a breaking contract change: the
-    service has gained ten feature groups (v0.0.6 … v0.0.15) without one, so
+    service has gained eleven feature groups (v0.0.6 … v0.0.16) without one, so
     tying the two numbers together would force a spurious `/v2`. The initial
     `0.0.5` string predated those groups and was stale; it now tracks them.
 18. **cgroup v2 is a hard requirement; `--cgroupns=host` is mandatory.** nsjail applies memory,
@@ -675,6 +676,139 @@ implemented, currently **v0.0.15** (see #17).
     of scope**. **The quick-tunnel URL is ephemeral**: it changes on every start,
     so nothing (client, cache, UI) may store or rely on it; the only valid URL is
     the one just observed from cloudflared's own output.
+
+## v0.0.16 — host identity: a workspace must not learn which machine it runs on
+
+### ADR 71 — Threat model: what a tenant must and must not be able to observe
+
+**Asset.** The identity of the machine a workspace runs on, and any fact that
+fingers the operator's infrastructure: the public/egress IP, the host name, the
+operator's internal DNS names, machine identity, hardware fingerprints, and the
+**real** size of the host (cores, RAM).
+
+**Adversary.** A tenant who controls the bytes a workload executes: arbitrary
+`python3`/`node`/`bash`/`perl` code inside the workspace, including a terminal
+session. They are assumed to be motivated and competent, and to be able to read
+anything the kernel exposes to their process, in any language or via libc/raw
+syscalls.
+
+**Why it matters here.** `sandboxd` is a multi-tenant code-execution backend.
+If a tenant can measure the host's real 64 cores and ~540 GB while their
+workspace is capped at 1 CPU / 256 MB, they learn the operator is running a
+large shared box and can size a resource-exhaustion attack, correlate
+cross-tenant activity by the machine fingerprint, and use the kernel build
+string (`7.1.8-zabbly+`, `#ubuntu24.04 …`) and the host FQDN to identify the
+platform and its provider. That is inference the operator did not consent to
+disclose.
+
+**Boundary of this ADR.** The guarantee is **isolation of inference about the
+host**, not secrecy of the code the tenant themselves runs. Everything the
+tenant uploads is theirs; the property is only that the *machine* around it is
+not fingerprinted.
+
+### ADR 72 — What is already closed, what is structurally closable, and what is not
+
+**Closed by the mount namespace (filesystem view), measured and asserted by
+`scripts/identity-check.sh` assertion 1:** `/etc/machine-id`, `/etc/os-release`,
+`/etc/hostname`, `/etc/hosts`, `/etc/resolv.conf`, `/etc/hostid`, `/etc/shadow`,
+`/proc/version`, `/proc/meminfo`, `/proc/cpuinfo`, `/proc/net/dev`,
+`/proc/1/cgroup`, `/proc/self/cgroup`, `/proc/self/mountinfo`, `/sys/class/net`,
+every `/sys/class/dmi/id/*`, `/var/run/zerops` and `/run/zerops` are unreadable
+(`ENOENT`), because nsjail mounts no `/proc` and no `/sys` (`mount_proc: false`)
+and only the specific `/etc` files it needs. `socket.gethostname()` returns the
+generic `sandbox`, `hostname -f` fails, `hostname -I` is empty, and the
+operator's internal DNS names do not resolve. With `allow_net:false` every
+"what is my IP" service fails at the network layer. **This baseline is preserved
+and asserted; it is not re-derived here.**
+
+**Closable, and now closed, by a preload shim (syscall view).** A mount hides a
+*file*, never a *syscall*. These facts stay reachable after `/proc` and `/sys`
+are gone:
+
+| Fact | Reachable by | Leaks |
+|------|--------------|-------|
+| kernel release/version | `uname(2)`, `platform.uname()` | platform + build date |
+| host core count | `sysconf(_SC_NPROCESSORS_*)`, `os.cpu_count()`, `nproc`, `sched_getaffinity(2)` | real machine size |
+| host total/available RAM | `sysconf(_SC_PHYS_PAGES)`, `sysinfo(2)` | real machine size |
+| base-image patch level | `gnu_get_libc_version(3)`, `confstr(3)`, `platform.libc_ver()` | distro → provider inference |
+| CPU capability bits | `getauxval(AT_HWCAP)` | host CPU fingerprint |
+
+**Approach evaluated and adopted: an `LD_PRELOAD` shim named in a read-only
+`/etc/ld.so.preload`.** The shim (`internal/executor/hostmask/hostmask.c` →
+`hostmask.so`) interposes `uname`, `sysinfo`, `sysconf`, `sched_getaffinity`,
+`getauxval`, `gnu_get_libc_version` and `confstr`, and answers with the
+**workspace's** limits. Two properties make it robust against the obvious
+evasions, both **measured**:
+
+- **`/etc/ld.so.preload` is read by the dynamic loader for every
+  dynamically-linked exec, independent of the environment.** A tenant cannot
+  defeat it with `env -u LD_PRELOAD` or `env -i`: `env -i PATH=… nproc` and
+  `env -i PATH=… uname -r` still return the masked values
+  (`scripts/identity-check.sh` assertion 4). This is the reason `LD_PRELOAD`
+  alone (an environment variable, trivially cleared) was **rejected**.
+- **Both the shim and the preload list are bind-mounted `rw:false` and the
+  mounts are `mandatory:true`.** A tenant cannot replace the shim, and if either
+  mount cannot be applied nsjail aborts the run rather than starting a sandbox
+  that would leak (`identity-check.sh` asserts the shim and preload files are not
+  writable; the Go test asserts the mount is read-only and the render refuses
+  with `ErrMaskUnavailable` when the shim cannot be materialized).
+
+**Not closable by this mechanism — stated, not implied away.** Preload
+interposition has three honest holes, and they are properties of the mechanism,
+not defects:
+
+1. **A statically-linked binary** does not run the dynamic loader at all, so it
+   is not intercepted and sees the real host values.
+2. **A non-glibc runtime (musl, e.g. an Alpine-built binary)** is loaded by
+   musl's own loader, which does not read `/etc/ld.so.preload`.
+3. **A direct `syscall(2)`** with a raw `uname`/`sysinfo` bypasses libc.
+
+Measured example: `python3 -c` calling `ctypes` `syscall(63, buf)` (raw `uname`)
+returns the real `7.1.8-zabbly+` even with the shim active. The masking layer is
+therefore **defense-in-depth, not a security boundary**. Its limits are reported
+truthfully in `/readyz` and `/v1/meta` (`identity_masking.limits`) and printed
+in the config example, so an operator is never told the property is stronger
+than it is.
+
+**Rejected alternatives.** (a) **`LD_PRELOAD` via the env allowlist** — an
+environment variable a tenant clears with `env -i`; measured to be defeated by
+that alone. (b) **`seccomp` returning `ENOSYS` for `uname`/`sysinfo`** — breaks
+every legitimate runtime (`glibc` calls `uname` during startup; `sysinfo` is used
+by many tools), so it fails the "must not break python3/node/bash/perl"
+requirement. (c) **A fake `/proc` (`mount_proc` with synthesized `meminfo`,
+`cpuinfo`, `version`)** — `uname`/`sysconf`/`sysinfo` do not read `/proc` at
+all, so it closes none of the syscall-reachable gaps; it was already decided
+that `/proc` is simply not mounted. (d) **A kernel-level fix (namespaces, a
+patched kernel)** — out of scope: the operator does not control this host's
+kernel (`7.1.8-zabbly+`), and the brief forbids host changes.
+
+### ADR 73 — The masking switch is opt-OUT, truthful, and fail-loud
+
+_Decision_: masking is a server switch `identity.enabled` (default **true**;
+`identity-check.sh` and the config example both default it on). It is
+opt-**out**, not opt-in, because it is the isolation guarantee, not a feature.
+When enabled but not ready, the engine **refuses** the run
+(`ErrMaskUnavailable` → `503 unavailable`) rather than launch a sandbox that
+would leak — a missing mask is a loud failure, never a silent one — and
+`/readyz` reports `503` with `identity_masking.enabled=true, ready=false,
+reason=…`. `/v1/meta` reports `identity_masking {enabled, ready, mechanism,
+limits}` on every call, so a client can see both the capability and its honest
+limits. Turning the switch off is a diagnostic state that deliberately leaks,
+and that leak is **asserted** by `identity-check.sh` assertion 5 (the host
+kernel and core count are observed) so the switch is verifiable rather than
+decorative. The masking answers come from the workspace's own `cpu_cores` and
+`memory_mb`, with a floor of one cpu and one MB, so a zeroed limit never renders
+a nonsense answer. The kernel strings default to `0.0.0-sandbox` / `#1 SMP` and
+are configurable (`identity.kernel_release`/`kernel_version`) precisely so an
+operator can pick their own generic value; the engine never substitutes the
+host's.
+
+**Measured on the target host this session** (see
+[docs/VERIFICATION.md](VERIFICATION.md) §10): with masking on, a workspace
+capped at 1 CPU / 256 MB reports `uname.release=0.0.0-sandbox`,
+`os.cpu_count()=1`, `sysconf(_SC_PHYS_PAGES)·4096=268435456`, and `env -i nproc=1`;
+with masking off it reports `7.1.8-zabbly+`, `2` and `540675186688` — the host.
+`scripts/identity-check.sh`: **27 passed / 0 failed / 0 skipped**.
 
 ## Additional defaults chosen during implementation
 

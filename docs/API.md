@@ -1,7 +1,7 @@
 # API guide
 
 Human-friendly, self-sufficient reference for the sandboxd HTTP/JSON API
-(v0.0.15). The machine-readable contract is
+(v0.0.16). The machine-readable contract is
 [api/openapi.yaml](../api/openapi.yaml); where the two disagree, **this document
 follows the implemented behaviour** and the disagreement is recorded in
 [Known discrepancies](#known-discrepancies) at the end.
@@ -147,16 +147,21 @@ curl -s localhost:8080/healthz
 Readiness probe. Unauthenticated.
 
 - **Response 200 (ready) / 503 (not ready):** `{"status":"ready"|"not_ready",
-  "nsjail":bool,"cgroups":bool,"data_dir":bool}`.
+  "nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},
+  "tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str}}`.
 - **Errors:** none; unsuitability is expressed by the 503 and the boolean fields.
 - **Semantics:** `data_dir` is true when a temp file can be created under the
   data directory; `nsjail` when the nsjail binary is found; `cgroups` when the
   cgroup v2 hierarchy at `/sys/fs/cgroup` is writable by the process (requires a
-  container started with `--cgroupns=host`). Any false ⇒ 503.
+  container started with `--cgroupns=host`). Any false ⇒ 503. When
+  `identity_masking.enabled` is true, `ready` reports whether the host-identity
+  masking shim can be applied: enabled-but-not-ready makes the whole probe 503,
+  so a deploy that would leak the host identity is never reported ready.
 
 ```sh
 curl -s localhost:8080/readyz
-# {"cgroups":true,"data_dir":true,"nsjail":true,"status":"ready"}
+# {"cgroups":true,"data_dir":true,"identity_masking":{"enabled":true,"ready":true},
+#  "nsjail":true,"status":"ready"}
 ```
 
 ### GET /metrics
@@ -183,7 +188,7 @@ default per-workspace limits.
 
   ```json
   {
-    "version": "0.0.15",
+    "version": "0.0.16",
     "api_version": "v1",
     "runtimes": ["python3"],
     "interpreters": ["bash", "node", "perl", "python3"],
@@ -204,6 +209,11 @@ default per-workspace limits.
     "tunnels": {
       "enabled": false, "ready": false,
       "max_per_workspace": 2, "url_timeout_sec": 45, "reason": "tunnels.enabled is false"
+    },
+    "identity_masking": {
+      "enabled": true, "ready": true,
+      "mechanism": "ld.so.preload shim (uname/sysinfo/sysconf/sched_getaffinity/getauxval)",
+      "limits": "a statically-linked binary, a musl runtime, or a raw syscall(2) bypasses the shim"
     }
   }
   ```
@@ -219,6 +229,11 @@ default per-workspace limits.
   `enabled` is the server switch, `ready` is whether the layer can actually
   serve, and `reason` explains a `ready:false`. `network.egress` is true only
   when the chained-slirp4netns egress fabric is configured on.
+  `identity_masking` reports the host-identity masking capability:
+  `enabled` is the server switch (`identity.enabled`, default true), `ready` is
+  whether the shim can be applied, `reason` explains a not-ready state, and
+  `mechanism`/`limits` state plainly how it works and what it does **not**
+  cover (a statically-linked, musl or raw-`syscall(2)` binary bypasses it).
 
 ```sh
 KEY=dev-key-please-rotate
@@ -2009,6 +2024,10 @@ curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 | `tunnels:` | `max_per_workspace` | `2` | concurrent tunnels per workspace |
 | `tunnels:` | `url_timeout_sec` | `45` | bounded wait for the URL |
 | `tunnels:` | `cloudflared_path` | `cloudflared` | the cloudflared binary |
+| `identity:` | `enabled` | `true` | host-identity masking switch (opt-**out**, not opt-in) |
+| `identity:` | `kernel_release` | `0.0.0-sandbox` | the generic `uname.release` a workspace is told |
+| `identity:` | `kernel_version` | `#1 SMP` | the generic `uname.version` a workspace is told |
+| `identity:` | `shim_path` | `""` | optional override of the compiled shim; empty uses the embedded copy |
 
 ## Lifecycle and limits
 
@@ -2123,7 +2142,7 @@ out-of-band changes cannot drift the quota.
   empty (no egress). With `allow_net:true` it is connected to the public internet
   through chained slirp4netns over UNIX sockets — the host network namespace is
   never shared, and the host LAN is blackholed. There is no host allowlist in
-  v0.0.15 (see [Quick tunnels and egress](#quick-tunnels-and-egress)).
+  v0.0.16 (see [Quick tunnels and egress](#quick-tunnels-and-egress)).
 - **Syscalls:** a default-allow seccomp policy KILLs a denylist of dangerous
   syscalls (`mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`,
   module loading, …). `cgroup v2` ceilings require the container to run with
@@ -2153,7 +2172,7 @@ curl -s $BASE/readyz
 # {"cgroups":true,"data_dir":true,"nsjail":true,"status":"ready"}
 
 curl -s -H "$AUTH" $BASE/v1/meta
-# {"version":"0.0.15","api_version":"v1", ... }
+# {"version":"0.0.16","api_version":"v1", ... }
 
 WS=$(curl -s -H "$AUTH" -H "$JSON" \
   -d '{"name":"demo","limits":{"memory_mb":256}}' \

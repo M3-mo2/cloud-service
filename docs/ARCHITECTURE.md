@@ -5,7 +5,7 @@
 > sandbox. Diagrams are [Mermaid](https://mermaid.js.org/); they render on
 > GitHub/GitLab and in most Markdown viewers.
 
-- Version: **0.0.15** (pre-alpha)
+- Version: **0.0.16** (pre-alpha)
 - Language: Go 1.23+
 - Isolation: [`nsjail`](https://github.com/google/nsjail) (Linux namespaces,
   cgroups v2, seccomp, rlimits)
@@ -71,7 +71,7 @@ services** that call it on a user's behalf — not the users themselves.
 
 See [DECISIONS.md](DECISIONS.md) #54 for the decision and its consequences.
 
-### What it deliberately is *not* (v0.0.15)
+### What it deliberately is *not* (v0.0.16)
 
 Pre-alpha scope. It is a single-node, static-key service. Not yet: a hardened
 public-internet multi-tenant platform, a distributed scheduler, or a
@@ -472,6 +472,7 @@ fly (`configs/nsjail_python.cfg.tmpl`). The rendered sandbox has:
 | rlimits | `as` (MB), `fsize` (MB), `nofile`, `nproc`, `core=0` | Kernel-enforced ceilings | always |
 | seccomp | default-allow, KILL a dangerous denylist | `mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`, modules, keyctl, … | always |
 | identity | uid/gid map + `--user sandbox` | Runs as the unprivileged `sandbox` user | always |
+| host-identity mask | read-only `/etc/ld.so.preload` + shim at `/sandboxd/hostmask.so`; `uname`/`sysinfo`/`sysconf`/`sched_getaffinity`/`getauxval` answer with the workspace's limits | No platform kernel string, host size or hardware fingerprint by syscall | `identity.enabled` (default on); a not-ready mask aborts the run |
 | time | `time_limit` | Wall-clock kill | always |
 
 > **Units and availability (two corrected defects).** nsjail reads `rlimit_as`
@@ -568,12 +569,14 @@ second**:
   lives in the workspace's own tree (deleted with the workspace). A package
   installed here is importable only in that workspace.
 
-**Conditional DNS mounts.** `/etc/resolv.conf` and `/etc/hosts` are bind-mounted
-read-only **only when `allow_net` is true**. Without `allow_net`, the network
-namespace is empty and there is nothing to resolve, so no resolver is exposed;
-with `allow_net`, the mounted resolver names **public** resolvers reached
-through the workspace's chained-slirp4netns egress (see §5.6). The host's own
-resolver is never published to a workspace.
+**Conditional DNS mounts.** `/etc/resolv.conf` and a **generated** `/etc/hosts`
+are bind-mounted read-only **only when `allow_net` is true**. Without
+`allow_net`, the network namespace is empty and there is nothing to resolve, so
+no resolver is exposed; with `allow_net`, the mounted resolver names **public**
+resolvers reached through the workspace's chained-slirp4netns egress (see §5.6)
+and the hosts file holds only generic localhost entries. Neither the host's own
+resolver nor the host's own `/etc/hosts` (operator FQDN + LAN address) is ever
+published to a workspace.
 
 Consequences proven by the acceptance transcript: a jailed process cannot read
 `/etc/shadow` (`FileNotFoundError` — it simply isn't mounted) and dies with
@@ -664,12 +667,59 @@ Name resolution is a *userspace* resolver problem: libc reads `/etc/resolv.conf`
 and `/etc/hosts`. Both are bind-mounted read-only **conditional on `allow_net`**
 (`{{ if .AllowNet }}` in the template), but the mounted `resolv.conf` names
 **public** resolvers (`network.resolver`) — the host's own resolver is never
-published. A workspace without `allow_net` gets a private, empty namespace and
-no resolver. Render tests pin both directions
+published — and the mounted `/etc/hosts` is a **generated** file holding only
+generic localhost entries. The host's own `/etc/hosts` names the operator's
+server FQDN and LAN address and is never mounted into a workspace. A workspace
+without `allow_net` gets a private, empty namespace and no resolver. Render
+tests pin both directions
 (`TestRenderConfigMountsResolverWhenNetAllowed`,
 `TestRenderConfigOmitsResolverWhenNetDenied`); the live egress and isolation are
 measured by [`scripts/tunnel-check.sh`](../scripts/tunnel-check.sh); see
 [VERIFICATION.md §8 and §9g](VERIFICATION.md).
+
+### 5.7 Host-identity masking (the syscall view)
+
+The mount namespace closes the **filesystem** view of the host (no `/proc`, no
+`/sys`), but a set of facts stays reachable by **syscall** and no mount hides
+them: `uname(2)` (the platform kernel fingerprint), `sysconf(3)`/`sysinfo(2)`
+(the host's real core count and total RAM), `sched_getaffinity(2)` (again the
+core count), `getauxval(AT_HWCAP)` (a CPU fingerprint) and
+`gnu_get_libc_version(3)`/`confstr(3)` (the base image's distro patch level).
+
+```mermaid
+flowchart LR
+    subgraph HOST["Host"]
+      H1["hostmask.so\n(internal/executor/hostmask.c → .so)"]
+      H2["ld.so.preload\nnames /sandboxd/hostmask.so"]
+    end
+    subgraph JAIL["Workspace sandbox (read-only binds)"]
+      J1["/sandboxd/hostmask.so  (rw:false, mandatory:true)"]
+      J2["/etc/ld.so.preload     (rw:false, mandatory:true)"]
+      J3["env SANDBOXD_MASK_CPUS=workspace cpu\nSANDBOXD_MASK_MEM_BYTES=workspace mem\nSANDBOXD_MASK_KERNEL_RELEASE=0.0.0-sandbox"]
+    end
+    H1 -->|bind ro| J1
+    H2 -->|bind ro| J2
+    H1 -.->|"interposes uname/sysinfo/\nsysconf/sched_getaffinity/\ngetauxval/gnu_get_libc_version/confstr"| JAIL
+```
+
+Every dynamically-linked exec is forced through the shim because the dynamic
+loader reads `/etc/ld.so.preload` independently of the environment — so clearing
+the environment (`env -i`) does not defeat it, which is the reason a plain
+`LD_PRELOAD` **environment variable** was rejected (it is trivially cleared).
+The shim reads the workspace's own `cpu_cores`/`memory_mb` from the injected
+`SANDBOXD_MASK_*` environment and answers with those, with a floor of one cpu
+and one MB. It is **on by default** (`identity.enabled`); when enabled but not
+ready (`/readyz`: `identity_masking.enabled=true, ready=false`) the renderer
+returns `ErrMaskUnavailable` and the run is refused, so a missing mask is a loud
+`503`, never a silent leak.
+
+The **honest limits** are part of the design: a statically-linked binary, a
+**musl** runtime (whose loader ignores `/etc/ld.so.preload`) and a raw
+`syscall(2)` bypass the interposition and see the real host values. Masking is
+**defense-in-depth, not a security boundary**; the filesystem view stays closed
+by the mount namespace on every path. See [DECISIONS.md](DECISIONS.md) #71–#73,
+[VERIFICATION.md §10](VERIFICATION.md) for the measured numbers, and
+[`scripts/identity-check.sh`](../scripts/identity-check.sh) for the assertions.
 
 ---
 
@@ -987,11 +1037,11 @@ set `NSJAIL=/usr/local/bin/nsjail` and it will verify the binary is real.
 
 Deferred to v0.1 (documented, not bugs):
 
-- **SSE log streaming** — v0.0.15 polls logs with `offset`/`limit`.
+- **SSE log streaming** — v0.0.16 polls logs with `offset`/`limit`.
 - **Multi-node storage / sharding** — storage is a local filesystem.
 - **Dynamic/DB authentication** — keys are static in config (bearer auth itself
   is exercised by `TestAuth*`).
-- **Per-UID-per-workspace isolation** — v0.0.15 uses a shared `sandbox` UID/GID
+- **Per-UID-per-workspace isolation** — v0.0.16 uses a shared `sandbox` UID/GID
   with per-run user namespaces + cgroups.
 - **Kernel-enforced per-run disk quota** — disk is accounted on the file API
   path and rechecked with `du`; the sandbox process is bounded by `rlimit_fsize`
