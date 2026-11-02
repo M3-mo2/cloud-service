@@ -1,0 +1,251 @@
+package executor
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"sandboxd/internal/model"
+)
+
+// TestRenderConfigMasksIdentity proves masking is rendered by default: the shim
+// and its read-only ld.so.preload are mounted, and the workspace's own cpu and
+// memory are injected for the shim to report. This is the unprivileged
+// assertion for the security property (the real bind mount needs root).
+func TestRenderConfigMasksIdentity(t *testing.T) {
+	cfg := testCfg() // identity.enabled defaults true
+	r := NewNsjailRunner(cfg, writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{
+		CPUCores: 1, MemoryMB: 256, DiskMB: 10, MaxWallTimeSec: 30, MaxRuns: 3,
+	}}
+	path, err := r.renderConfig(Request{
+		Workspace:     ws,
+		WorkspaceRoot: "/tmp/wsroot",
+		Argv:          []string{"/bin/true"},
+	}, "/tmp/rt")
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+
+	if !strings.Contains(out, `dst: "/etc/ld.so.preload"`) {
+		t.Errorf("masking must mount the read-only preload list:\n%s", out)
+	}
+	if !strings.Contains(out, `dst: "/sandboxd/hostmask.so"`) {
+		t.Errorf("masking must mount the shim read-only:\n%s", out)
+	}
+	// The mask mounts must be read-only: a tenant must not replace them. Assert
+	// each rendered mount block ends with rw:false.
+	for _, dst := range []string{`dst: "/sandboxd/hostmask.so"`, `dst: "/etc/ld.so.preload"`} {
+		block := mountBlock(out, dst)
+		if block == "" {
+			t.Fatalf("mount %s not rendered:\n%s", dst, out)
+		}
+		if !strings.Contains(block, "rw: false") {
+			t.Errorf("mount %s must be read-only:\n%s", dst, block)
+		}
+	}
+	if !strings.Contains(out, `SANDBOXD_MASK_CPUS=1`) {
+		t.Errorf("masking must inject the workspace's cpu count (1):\n%s", out)
+	}
+	if !strings.Contains(out, `SANDBOXD_MASK_MEM_BYTES=268435456`) {
+		t.Errorf("masking must inject the workspace's memory in bytes (256 MB):\n%s", out)
+	}
+	if !strings.Contains(out, `SANDBOXD_MASK_KERNEL_RELEASE=0.0.0-sandbox`) {
+		t.Errorf("masking must inject a generic kernel release:\n%s", out)
+	}
+}
+
+// TestRenderConfigMaskReflectsWorkspaceNotHost proves the injected values track
+// the WORKSPACE's limits, never a host constant: two workspaces get two answers.
+func TestRenderConfigMaskReflectsWorkspaceNotHost(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	for _, tc := range []struct {
+		cpus float64
+		mem  int
+	}{{1, 256}, {2, 1024}} {
+		ws := &model.Workspace{Limits: model.Limits{CPUCores: tc.cpus, MemoryMB: tc.mem, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+		path, err := r.renderConfig(Request{Workspace: ws, WorkspaceRoot: "/tmp/x", Argv: []string{"/bin/true"}}, "/tmp/rt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := readFile(t, path)
+		os.Remove(path)
+		wantCPU := "SANDBOXD_MASK_CPUS=" + itoa(int(tc.cpus+0.5))
+		wantMem := "SANDBOXD_MASK_MEM_BYTES=" + itoa64(int64(tc.mem)*1024*1024)
+		if !strings.Contains(out, wantCPU) {
+			t.Errorf("cpu mask for %v missing %q:\n%s", tc.cpus, wantCPU, out)
+		}
+		if !strings.Contains(out, wantMem) {
+			t.Errorf("mem mask for %d MB missing %q:\n%s", tc.mem, wantMem, out)
+		}
+	}
+}
+
+// TestRenderConfigOmitsMaskWhenDisabled proves the opt-out switch works: with
+// identity.enabled=false no shim, preload or mask env is rendered.
+func TestRenderConfigOmitsMaskWhenDisabled(t *testing.T) {
+	cfg := testCfg()
+	cfg.Identity.Enabled = false
+	r := NewNsjailRunner(cfg, writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 256, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+	path, err := r.renderConfig(Request{Workspace: ws, WorkspaceRoot: "/tmp/x", Argv: []string{"/bin/true"}}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+	if strings.Contains(out, "hostmask.so") || strings.Contains(out, "ld.so.preload") {
+		t.Errorf("masking disabled must render no shim/preload mounts:\n%s", out)
+	}
+	if strings.Contains(out, "SANDBOXD_MASK_") {
+		t.Errorf("masking disabled must render no mask env:\n%s", out)
+	}
+}
+
+// TestRenderConfigRefusesWhenMaskEnabledButNotReady proves the fail-loud
+// contract: with masking on but a shim that cannot be materialized the render
+// refuses with ErrMaskUnavailable rather than launch a leaking sandbox.
+func TestRenderConfigRefusesWhenMaskEnabledButNotReady(t *testing.T) {
+	cfg := testCfg()
+	cfg.Identity.Enabled = true
+	cfg.Identity.ShimPath = filepath.Join(t.TempDir(), "does-not-exist.so")
+	r := NewNsjailRunner(cfg, writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 256, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+	_, err := r.renderConfig(Request{Workspace: ws, WorkspaceRoot: "/tmp/x", Argv: []string{"/bin/true"}}, "/tmp/rt")
+	if !errors.Is(err, ErrMaskUnavailable) {
+		t.Fatalf("err = %v, want ErrMaskUnavailable", err)
+	}
+	enabled, ready, reason := r.MaskStatus()
+	if !enabled || ready {
+		t.Fatalf("status = %v/%v/%q, want enabled=true ready=false", enabled, ready, reason)
+	}
+	if reason == "" {
+		t.Fatal("a not-ready mask must carry a reason")
+	}
+}
+
+// TestMaskStatusDisabledHonest proves the switch reports itself truthfully.
+func TestMaskStatusDisabledHonest(t *testing.T) {
+	cfg := testCfg()
+	cfg.Identity.Enabled = false
+	r := NewNsjailRunner(cfg, "", t.TempDir())
+	enabled, ready, reason := r.MaskStatus()
+	if enabled || ready {
+		t.Fatalf("disabled mask must report enabled=false ready=false, got %v/%v", enabled, ready)
+	}
+	if !strings.Contains(reason, "disabled") {
+		t.Fatalf("reason should name the switch, got %q", reason)
+	}
+}
+
+// TestMaskStatusReadyByDefault proves the embedded shim materializes and the
+// capability reports ready with the default configuration.
+func TestMaskStatusReadyByDefault(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), "", t.TempDir())
+	enabled, ready, reason := r.MaskStatus()
+	if !enabled || !ready {
+		t.Fatalf("default masking must be enabled and ready, got %v/%v (%s)", enabled, ready, reason)
+	}
+	if _, err := os.Stat(r.mask.shimHostPath()); err != nil {
+		t.Fatalf("shim should be materialized: %v", err)
+	}
+	if _, err := os.Stat(r.mask.preloadHostPath()); err != nil {
+		t.Fatalf("preload file should be materialized: %v", err)
+	}
+	// The preload file must name the in-jail shim path, never a host path.
+	b, _ := os.ReadFile(r.mask.preloadHostPath())
+	if strings.TrimSpace(string(b)) != maskShimJailPath {
+		t.Fatalf("preload file = %q, want %q", string(b), maskShimJailPath)
+	}
+}
+
+// TestMaskParamsFloor proves a zeroed limit never renders a nonsense value.
+func TestMaskParamsFloor(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), "", t.TempDir())
+	p := r.mask.params(0, 0)
+	if !p.Enabled {
+		t.Fatal("masking should be enabled")
+	}
+	if p.CPUs != 1 {
+		t.Errorf("cpu floor = %d, want 1", p.CPUs)
+	}
+	if p.MemBytes != 1024*1024 {
+		t.Errorf("mem floor = %d, want 1 MB", p.MemBytes)
+	}
+}
+
+// mountBlock returns the text of the mount { ... } block whose dst matches, or
+// "" when not present.
+func mountBlock(out, dst string) string {
+	i := strings.Index(out, dst)
+	if i < 0 {
+		return ""
+	}
+	start := strings.LastIndex(out[:i], "mount {")
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(out[i:], "}")
+	if end < 0 {
+		return ""
+	}
+	return out[start : i+end]
+}
+
+func TestEmbeddedShimPresent(t *testing.T) {
+	if len(HostMaskShim) == 0 {
+		t.Fatal("embedded host-identity shim is empty; run `make shim`")
+	}
+	// ELF magic: the committed artifact must be a real shared object.
+	if string(HostMaskShim[:4]) != "\x7fELF" {
+		t.Fatalf("embedded shim is not ELF: % x", HostMaskShim[:4])
+	}
+}
+
+func itoa(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	neg := v < 0
+	if neg {
+		v = -v
+	}
+	var b [20]byte
+	i := len(b)
+	for v > 0 {
+		i--
+		b[i] = byte('0' + v%10)
+		v /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
+}
+
+func itoa64(v int64) string {
+	if v == 0 {
+		return "0"
+	}
+	neg := v < 0
+	if neg {
+		v = -v
+	}
+	var b [24]byte
+	i := len(b)
+	for v > 0 {
+		i--
+		b[i] = byte('0' + v%10)
+		v /= 10
+	}
+	if neg {
+		i--
+		b[i] = '-'
+	}
+	return string(b[i:])
+}

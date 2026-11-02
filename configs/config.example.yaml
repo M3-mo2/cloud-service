@@ -157,6 +157,32 @@ tunnels:
   # mounts, so it is on PATH inside a workspace too.
   cloudflared_path: "cloudflared"
 
+# Host-identity masking.
+#
+# Hiding /proc and /sys (the mount namespace) closes the filesystem view, but a
+# set of facts stays reachable by SYSCALL and identifies the host: the kernel
+# release/version (uname), the HOST's real cpu count and total RAM (sysconf,
+# sysinfo), and the base image's distro patch level (gnu_get_libc_version,
+# confstr). Masking is a small LD_PRELOAD shim, reached for every
+# dynamically-linked exec through a read-only /etc/ld.so.preload, that answers
+# with the WORKSPACE's own limits instead. It is ON by default; turning it off
+# is a diagnostic state that deliberately leaks.
+#
+# Honest limits (documented, not implied away): a statically-linked binary, a
+# musl runtime (which does not read /etc/ld.so.preload), or a raw syscall(2)
+# bypasses the shim. Masking is defense-in-depth, not a security boundary; the
+# /proc and /sys views remain hidden by the mount namespace. See
+# docs/DECISIONS.md.
+identity:
+  # Opt-out switch (default true). Set false only to measure what leaks.
+  enabled: true
+  # The kernel strings a workspace is told. They must never be a real kernel.
+  kernel_release: "0.0.0-sandbox"
+  kernel_version: "#1 SMP"
+  # Optional override of the compiled shim path; empty uses the copy embedded in
+  # the binary (written to the service tmp dir and bind-mounted read-only).
+  shim_path: ""
+
 # Static API keys. Each entry maps a key to a principal_id.
 # Multiple keys may share a principal_id.
 keys:

@@ -21,7 +21,56 @@ type Config struct {
 	Sessions  SessionsConfig `koanf:"sessions"`
 	Network   NetworkConfig  `koanf:"network"`
 	Tunnels   TunnelsConfig  `koanf:"tunnels"`
+	Identity  IdentityConfig `koanf:"identity"`
 	Keys      []KeyConfig    `koanf:"keys"`
+}
+
+// Default host-identity mask values. The kernel strings are deliberately
+// generic and carry no platform fingerprint; the mask is applied only to
+// uname/sysinfo/sysconf, whose real values would identify the host.
+const (
+	// DefaultMaskKernelRelease is the uname.release a workspace is told.
+	DefaultMaskKernelRelease = "0.0.0-sandbox"
+	// DefaultMaskKernelVersion is the uname.version a workspace is told.
+	DefaultMaskKernelVersion = "#1 SMP"
+	// DefaultMaskNodename is the uname.nodename a workspace is told.
+	DefaultMaskNodename = "sandbox"
+)
+
+// IdentityConfig controls host-identity masking, the layer that stops a
+// workspace from learning which machine it runs on. Hiding /proc and /sys (the
+// mount namespace) closes the filesystem view, but a set of facts remains
+// reachable by SYSCALL, which no mount hides:
+//
+//	uname().release/version  -> the platform kernel fingerprint
+//	os.cpu_count()/sysconf    -> the HOST's real core count
+//	sysinfo()/sysconf(_SC_PHYS_PAGES) -> the HOST's real total RAM
+//	gnu_get_libc_version()/confstr -> the base image's distro patch level
+//
+// The layer is an LD_PRELOAD shim reachable for every dynamically-linked exec
+// via a read-only /etc/ld.so.preload, answering with the WORKSPACE's limits.
+// It is ON by default; an operator turns it off only to measure what leaks.
+//
+// Limits (documented, not implied away): a statically-linked binary, a musl
+// runtime (which does not read /etc/ld.so.preload), or a raw syscall(2)
+// bypasses the shim and sees the host values. The masking layer is
+// defense-in-depth, not a security boundary; see docs/DECISIONS.md.
+type IdentityConfig struct {
+	// Enabled is the server-level switch. Default true: masking is the
+	// isolation guarantee, so it is opt-OUT, not opt-in. When false the shim is
+	// not mounted and the syscall-reachable facts are not masked (a diagnostic
+	// state, documented as such).
+	Enabled bool `koanf:"enabled"`
+	// ShimPath optionally overrides the host path of the compiled shim. Empty
+	// (the normal case) uses the shim embedded in the binary, written to the
+	// service tmp dir at startup. It exists so a deployment can point at a
+	// separately-built shim.
+	ShimPath string `koanf:"shim_path"`
+	// KernelRelease is the uname.release value a workspace is told. Empty uses
+	// the generic default. It must never be a real kernel string.
+	KernelRelease string `koanf:"kernel_release"`
+	// KernelVersion is the uname.version value a workspace is told.
+	KernelVersion string `koanf:"kernel_version"`
 }
 
 // NetworkConfig controls the per-workspace egress fabric. Egress is delivered by
@@ -360,6 +409,11 @@ func Default() Config {
 			URLTimeoutSec:   45,
 			CloudflaredPath: "cloudflared",
 		},
+		Identity: IdentityConfig{
+			Enabled:       true,
+			KernelRelease: DefaultMaskKernelRelease,
+			KernelVersion: DefaultMaskKernelVersion,
+		},
 		Keys: []KeyConfig{},
 	}
 }
@@ -525,6 +579,15 @@ func (c *Config) applyDefaults() {
 	if tun.CloudflaredPath == "" {
 		tun.CloudflaredPath = d.Tunnels.CloudflaredPath
 	}
+	// Identity.Enabled is deliberately NOT touched here: its default lives in
+	// rawDefaults so an explicit `identity.enabled: false` survives, while the
+	// empty kernel strings are safe to fill (an empty string is never valid).
+	if c.Identity.KernelRelease == "" {
+		c.Identity.KernelRelease = d.Identity.KernelRelease
+	}
+	if c.Identity.KernelVersion == "" {
+		c.Identity.KernelVersion = d.Identity.KernelVersion
+	}
 }
 
 func rawDefaults() []byte {
@@ -592,5 +655,9 @@ tunnels:
   max_per_workspace: 2
   url_timeout_sec: 45
   cloudflared_path: "cloudflared"
+identity:
+  enabled: true
+  kernel_release: "0.0.0-sandbox"
+  kernel_version: "#1 SMP"
 `)
 }

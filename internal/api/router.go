@@ -136,6 +136,10 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	// is enabled but cannot serve, readiness is not claimed.
 	netAvail, netReady, netReason := s.svc.NetworkStatus()
 	tunEnabled, tunReady, tunReason := s.svc.TunnelsStatus()
+	// Host-identity masking is reported truthfully too: when it is enabled but
+	// the shim cannot be applied, readiness is not claimed, so an operator sees
+	// a leaking deploy rather than a silent one.
+	maskEnabled, maskReady, maskReason := s.svc.Runner().MaskStatus()
 	status := http.StatusOK
 	if !dataOK || !nsjailOK || !cgroupsOK {
 		status = http.StatusServiceUnavailable
@@ -144,6 +148,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusServiceUnavailable
 	}
 	if tunEnabled && !tunReady {
+		status = http.StatusServiceUnavailable
+	}
+	if maskEnabled && !maskReady {
 		status = http.StatusServiceUnavailable
 	}
 	body := map[string]any{
@@ -160,12 +167,19 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 			"enabled": tunEnabled,
 			"ready":   tunReady,
 		},
+		"identity_masking": map[string]any{
+			"enabled": maskEnabled,
+			"ready":   maskReady,
+		},
 	}
 	if netReason != "" {
 		body["network"].(map[string]any)["reason"] = netReason
 	}
 	if tunReason != "" {
 		body["tunnels"].(map[string]any)["reason"] = tunReason
+	}
+	if maskReason != "" {
+		body["identity_masking"].(map[string]any)["reason"] = maskReason
 	}
 	writeJSON(w, status, body)
 }
@@ -193,6 +207,20 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	if netReason != "" {
 		netCap["reason"] = netReason
 	}
+	// Host-identity masking capability, reported truthfully: the syscall-
+	// reachable host facts are masked for a dynamically-linked workload when
+	// enabled+ready. The honest limits (static/musl/raw-syscall bypass) are
+	// documented in docs/DECISIONS.md.
+	maskEnabled, maskReady, maskReason := s.svc.Runner().MaskStatus()
+	maskCap := map[string]any{
+		"enabled":   maskEnabled,
+		"ready":     maskReady,
+		"mechanism": "ld.so.preload shim (uname/sysinfo/sysconf/sched_getaffinity/getauxval)",
+		"limits":    "a statically-linked binary, a musl runtime, or a raw syscall(2) bypasses the shim",
+	}
+	if maskReason != "" {
+		maskCap["reason"] = maskReason
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":     model.Version,
 		"api_version": model.APIVersion,
@@ -218,6 +246,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		},
 		"tunnels":             tunCap,
 		"network":             netCap,
+		"identity_masking":    maskCap,
 		"interpreters":        model.SupportedInterpreters(),
 		"runnable_extensions": model.SupportedExtensions(),
 	})

@@ -170,6 +170,34 @@ mount {
   mandatory: false
 }
 
+{{- if .MaskEnabled }}
+
+# Host-identity masking. The shim (hostmask.so) intercepts the syscall-reachable
+# facts a mount namespace cannot hide -- uname, sysinfo, sysconf,
+# sched_getaffinity, getauxval, the libc version strings -- and answers with the
+# WORKSPACE's own limits. It is reached through a read-only /etc/ld.so.preload,
+# which the dynamic loader reads for EVERY dynamically-linked exec, so a tenant
+# cannot disable it with `env -i`/`env -u LD_PRELOAD`. Both files are bind
+# mounts with rw:false: a workspace can neither replace the shim nor edit the
+# preload list. The shim is mounted under /sandboxd (a private root path, not
+# under the read-only /usr bind) so nsjail can create the mount point.
+mount {
+  src: "{{ .MaskShimHost }}"
+  dst: "{{ .MaskShimJail }}"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+
+mount {
+  src: "{{ .MaskPreloadHost }}"
+  dst: "{{ .MaskPreloadJail }}"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+{{- end }}
+
 {{- if .PTY }}
 
 # Terminal sessions only: the relay helper allocates the PTY with pty.fork(),
@@ -302,6 +330,9 @@ envar: "HOME=/tmp"
 envar: "LANG=C.UTF-8"
 envar: "PYTHONUNBUFFERED=1"
 {{- range .TagEnv }}
+envar: {{ printf "%q" . }}
+{{- end }}
+{{- range .MaskEnv }}
 envar: {{ printf "%q" . }}
 {{- end }}
 {{- range .Env }}

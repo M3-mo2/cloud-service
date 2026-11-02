@@ -10,3 +10,12 @@ import _ "embed"
 //
 //go:embed pty_relay.py
 var PTYRelayScript []byte
+
+// HostMaskShim is the compiled host-identity masking shim (internal/executor/
+// hostmask.c, built to hostmask.so). It is embedded so a deployment that ships
+// only the sandboxd binary still has the shim; it is written to a host
+// directory the workspace cannot write and bind-mounted read-only into every
+// sandbox. See mask.go and hostmask.c.
+//
+//go:embed hostmask.so
+var HostMaskShim []byte

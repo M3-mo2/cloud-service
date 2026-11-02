@@ -26,6 +26,7 @@ type NsjailRunner struct {
 	tmplPath string
 	tmpDir   string
 	identity Identity
+	mask     *masker
 
 	mu         sync.Mutex
 	procs      map[string]*os.Process // runID -> direct child (nsjail) process
@@ -45,10 +46,14 @@ func NewNsjailRunner(cfg config.Config, tmplPath, tmpDir string) *NsjailRunner {
 		tmplPath:   tmplPath,
 		tmpDir:     tmpDir,
 		identity:   ResolveIdentity(cfg),
+		mask:       newMasker(cfg.Identity, tmpDir),
 		procs:      make(map[string]*os.Process),
 		cgroupDirs: make(map[string]string),
 	}
 }
+
+// MaskStatus reports host-identity masking truthfully.
+func (r *NsjailRunner) MaskStatus() (bool, bool, string) { return r.mask.Status() }
 
 // Identity returns the resolved sandbox identity mapping.
 func (r *NsjailRunner) Identity() Identity { return r.identity }
@@ -679,6 +684,16 @@ type tmplData struct {
 	// as `KEY=VALUE` entries, injected into every sandbox so a process can be
 	// mapped back to its owning run/session in the inventory.
 	TagEnv []string
+
+	// Host-identity masking (see mask.go). When MaskEnabled is true the shim
+	// and its ld.so.preload list are bind-mounted read-only and MaskEnv carries
+	// the workspace's own cpu/memory values the shim reports.
+	MaskEnabled     bool
+	MaskShimHost    string
+	MaskPreloadHost string
+	MaskShimJail    string
+	MaskPreloadJail string
+	MaskEnv         []string
 }
 
 // Paths at which the package tiers are mounted inside the sandbox.
@@ -770,6 +785,14 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 	}
 	pkgPath := packageSearchPath(sharedPackagesMount, privatePackagesMount, req.SharedPackagesDir, req.PrivatePackagesDir)
 
+	// Host-identity masking: derive the per-workspace values from THIS
+	// workspace's limits (never the host's), and refuse the run when masking is
+	// enabled but not ready, so a sandbox that would leak is never launched.
+	mask := r.mask.params(lim.CPUCores, lim.MemoryMB)
+	if r.mask.Enabled() && !mask.Enabled {
+		return "", fmt.Errorf("%w: %s", ErrMaskUnavailable, r.mask.Reason())
+	}
+
 	data := tmplData{
 		Argv:          req.Argv,
 		Env:           withPackagePath(formatEnv(req.Env), pkgPath),
@@ -806,6 +829,13 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		PackagesPathEnv:    pkgPath,
 
 		TagEnv: tagEnv(req),
+
+		MaskEnabled:     mask.Enabled,
+		MaskShimHost:    mask.ShimHost,
+		MaskPreloadHost: mask.PreloadHost,
+		MaskShimJail:    mask.ShimJail,
+		MaskPreloadJail: mask.PreloadJail,
+		MaskEnv:         mask.envEntries(),
 	}
 	if data.PidsMax <= 0 {
 		data.PidsMax = 64

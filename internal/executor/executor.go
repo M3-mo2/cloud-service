@@ -23,6 +23,12 @@ var ErrSandboxUnavailable = errors.New("sandbox unavailable")
 // workspace root.
 var ErrInvalidCwd = errors.New("cwd escapes workspace root")
 
+// ErrMaskUnavailable is returned when host-identity masking is enabled but the
+// shim cannot be applied to a sandbox. The engine refuses the run rather than
+// launch a sandbox that would leak the host's identity: a missing mask is a
+// loud failure, never a silent leak.
+var ErrMaskUnavailable = errors.New("host-identity masking unavailable")
+
 // SandboxError reports that nsjail could not set up or launch the sandbox.
 // Diagnostic carries the relevant nsjail log lines.
 type SandboxError struct {
@@ -133,6 +139,11 @@ type Runner interface {
 	// CgroupsUsable reports whether cgroup v2 ceilings can be applied. When
 	// false, nsjail runs without cgroup memory/pids/cpu limits.
 	CgroupsUsable() bool
+	// MaskStatus reports host-identity masking truthfully: enabled is the
+	// configured switch, ready is whether the shim can be applied to a sandbox,
+	// and reason explains a not-ready state. A run is refused when masking is
+	// enabled but not ready.
+	MaskStatus() (enabled bool, ready bool, reason string)
 	// Run executes a request to completion.
 	Run(req Request) (Result, error)
 	// Start launches a long-lived interactive process (e.g. a PTY session) and

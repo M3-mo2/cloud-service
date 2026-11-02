@@ -1,12 +1,20 @@
 BINARY := sandboxd
 PKG := ./...
 GO ?= go
+CC ?= cc
 
-.PHONY: all build test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check docs-check
+.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check identity-check docs-check
 
-all: fmt vet build test
+all: fmt vet shim build test
 
-build:
+# shim rebuilds the host-identity masking shared object from source. The .so is
+# embedded in the sandboxd binary, so it must exist before `go build`. A plain
+# `go build ./...` uses the committed .so (built from the same source), so a
+# toolchain without a C compiler can still build the service.
+shim:
+	$(CC) -shared -fPIC -O2 -Wall -o internal/executor/hostmask.so internal/executor/hostmask/hostmask.c -ldl
+
+build: shim
 	$(GO) build -o bin/$(BINARY) ./cmd/sandboxd
 
 test:
@@ -69,6 +77,17 @@ process-check:
 # report skips for that external reason (never a silent pass).
 tunnel-check:
 	sudo -E bash scripts/tunnel-check.sh
+
+# Host-identity acceptance against REAL nsjail on the host (needs root, no
+# container). It asserts that the filesystem view is closed (the "already
+# closed" paths are unreadable), that hostname/DNS reveal nothing, that
+# allow_net:false reaches no "what is my IP" service, that with masking on the
+# reported cpu count and memory match the WORKSPACE's limits (not the host's)
+# and the kernel string no longer identifies the platform, that with masking off
+# the leak is documented, that the measured egress IP is a platform-shared NAT
+# address, and that the host topology is untouched.
+identity-check:
+	sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh
 
 # Documentation-consistency gate. It derives its assertions from the code
 # (router, error constants, test count) rather than the prose, so it fails when

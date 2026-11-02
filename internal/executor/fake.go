@@ -11,12 +11,18 @@ import (
 type FakeRunner struct {
 	AvailableFlag bool
 	CgroupsFlag   bool
-	Stdout        string
-	Stderr        string
-	ExitCode      int
-	TimedOut      bool
-	Err           error
-	Delay         time.Duration
+	// MaskEnabledFlag / MaskReadyFlag / MaskReasonText configure MaskStatus.
+	// Enabled defaults false in the fake so readiness tests are unaffected
+	// unless they opt in.
+	MaskEnabledFlag bool
+	MaskReadyFlag   bool
+	MaskReasonText  string
+	Stdout          string
+	Stderr          string
+	ExitCode        int
+	TimedOut        bool
+	Err             error
+	Delay           time.Duration
 
 	// Sessions: when LiveOutput is set, Start writes it to the session's
 	// StdoutPath and stays alive until Kill/Close (or the lifetime delay).
@@ -129,6 +135,11 @@ func (f *FakeRunner) Available() bool { return f.AvailableFlag }
 
 // CgroupsUsable reports the configured cgroup availability.
 func (f *FakeRunner) CgroupsUsable() bool { return f.CgroupsFlag }
+
+// MaskStatus reports the configured masking capability.
+func (f *FakeRunner) MaskStatus() (bool, bool, string) {
+	return f.MaskEnabledFlag, f.MaskReadyFlag, f.MaskReasonText
+}
 
 // LastRequest returns the most recent request.
 func (f *FakeRunner) LastRequest() *Request {

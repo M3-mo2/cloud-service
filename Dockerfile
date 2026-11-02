@@ -6,6 +6,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
+# Build the host-identity masking shim from source, so the embedded copy in the
+# binary is always the committed source (the committed .so is a convenience for
+# toolchains without a C compiler). It is a plain -shared object (no cgo).
+RUN cc -shared -fPIC -O2 -Wall \
+    -o internal/executor/hostmask.so internal/executor/hostmask/hostmask.c -ldl
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
     -o /out/sandboxd ./cmd/sandboxd
 

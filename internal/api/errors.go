@@ -64,6 +64,12 @@ func mapError(err error) *model.Error {
 	if errors.Is(err, executor.ErrNsjailUnavailable) {
 		return model.New(503, model.CodeUnavailable, "nsjail is not available")
 	}
+	if errors.Is(err, executor.ErrMaskUnavailable) {
+		// Masking is on but could not be applied, so the run is refused rather
+		// than launched with the host identity exposed. The reason is carried in
+		// the message so /readyz and the client both see why.
+		return model.Wrap(503, model.CodeUnavailable, "host-identity masking unavailable: "+err.Error(), nil)
+	}
 	var sbErr *executor.SandboxError
 	if errors.As(err, &sbErr) {
 		details := map[string]string{}
