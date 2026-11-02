@@ -1,6 +1,6 @@
 GLIBC_2.2.5 {
   global:
-    open; open64; access; readlink; readdir; readdir64; readdir_r;
+    open; open64; access; euidaccess; readlink; readdir; readdir64; readdir_r;
     __xstat; __lxstat; canonicalize_file_name;
 };
 GLIBC_2.3 {

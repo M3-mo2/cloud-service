@@ -364,7 +364,7 @@ chk "mask.env_i_uname" "$WS_RELEASE" "$(mval ENVI_UNAME)"
 chk "mask.env_i_getconf" "$WS_CPUS" "$(mval ENVI_GETCONF)"
 # A tenant must not be able to replace the shim or the preload list.
 put_py "$A" "$WSA" /write.py 'import os
-for p in ["/sandboxd/hostmask.so","/etc/ld.so.preload"]:
+for p in ["/run/.rt.so","/etc/ld.so.preload"]:
     try:
         with open(p, "a") as fh:
             fh.write("x")
@@ -626,7 +626,112 @@ echo "  note: the generic networking word 'hostmask' survives only in stdlib/net
 # path remains the documented inherent limit.
 echo "=== 10b) Stage 2: zero-artifact mechanisms (measured; not reachable) ==="
 skip "zero_signal.libc_view_no_artifact" "a correct versioned libc replacement is a per-glibc project; a naive wrapper breaks every dynamic binary (measured)"
-skip "zero_signal.seccomp_user_notif_no_artifact" "nsjail 4.6 has no --seccomp_unotify; kafel maps USER_NOTIF to ENOSYS not SECCOMP_RET_USER_NOTIF (measured)"
+skip "zero_signal.seccomp_user_notif_no_artifact" "nsjail 3.4 (the shipped pin) has no --seccomp_unotify; building master from source gives it, but master is an unreleased branch and its user_notif is a supervisor-tracing feature, not a drop-in interception hook (measured)"
+
+# --- 10c) the masking mechanism is INVISIBLE inside the workspace -----------
+# The operator's bar is silence: nothing named, nothing browsable, nothing
+# readable. The masking shim now interposes the filesystem entry points and
+# answers ENOENT (and drops the directory entry) for the configured paths, so
+# the very file that names the mechanism (/etc/ld.so.preload) and the shim
+# itself are invisible to every tool a tenant would use. This group MEASURES
+# that from inside a real workspace, across ls, cat, stat, test -f/-e/-r, find,
+# readlink, and python's os.stat/os.path.exists/os.listdir -- and re-asserts
+# that the loader scope still works (env -i must still report the masked kernel).
+#
+# The documented limit is unchanged: a RAW syscall(2) still reaches the real
+# file (asserted as the KNOWN real value below, never as a pass or a failure).
+echo "=== 10c) the masking mechanism is invisible inside the workspace ==="
+put_py "$A" "$WSA" /invisible.py 'import os, subprocess
+HIDDEN = ["/etc/ld.so.preload", "/run/.rt.so", "/sandboxd", "/run/sandboxd"]
+def vis(ok):
+    return "VISIBLE" if ok else "HIDDEN"
+for h in HIDDEN:
+    parent = os.path.dirname(h) or "/"
+    name = os.path.basename(h)
+    print("EXISTS", h, vis(os.path.exists(h)))
+    print("ISFILE", h, vis(os.path.isfile(h)))
+    try:
+        with open(h, "rb") as fh:
+            fh.read(1)
+        print("OPEN", h, "VISIBLE")
+    except Exception:
+        print("OPEN", h, "HIDDEN")
+    try:
+        listing = os.listdir(parent)
+    except Exception:
+        listing = []
+    print("LISTDIR", h, vis(name in listing))
+    for tool, args in [("ls", ["ls", "-la", h]), ("cat", ["cat", h]), ("stat", ["stat", h])]:
+        r = subprocess.run(args, capture_output=True, text=True)
+        print(tool.upper(), h, vis(r.returncode == 0))
+    for flag in ["-e", "-f", "-r"]:
+        r = subprocess.run(["test", flag, h])
+        print("TEST" + flag, h, vis(r.returncode == 0))
+    r = subprocess.run(["find", parent, "-maxdepth", "1", "-name", name], capture_output=True, text=True)
+    print("FIND", h, vis(bool(r.stdout.strip())))
+    # readlink() (the syscall wrapper) is intercepted; readlink -f / realpath are
+    # pure path canonicalizers that never stat the leaf, so they echo the literal
+    # input -- a documented non-leaking limit, asserted below as an echo.
+    r = subprocess.run(["readlink", h], capture_output=True, text=True)
+    print("READLINK", h, vis(r.returncode == 0))
+    r = subprocess.run(["readlink", "-f", h], capture_output=True, text=True)
+    print("READLINK_F_ECHO", h, "ECHOED" if r.stdout.strip() == h else "DIFFERS")
+# The loader scope: a real exec (the loader reads /etc/ld.so.preload before any
+# shim is mapped) is still masked, so env -i cannot defeat it.
+r = subprocess.run(["env", "-i", "uname", "-r"], capture_output=True, text=True)
+print("LOADER_ENV_I", "MASKED" if r.stdout.strip() == "0.0.0-sandbox" else "LEAKED")
+r = subprocess.run(["env", "-u", "LSM_SYS_REL", "-u", "LSM_SYS_VER", "uname", "-r"], capture_output=True, text=True)
+print("LOADER_ENV_U", "MASKED" if r.stdout.strip() == "0.0.0-sandbox" else "LEAKED")
+# A raw syscall(2) is the KNOWN permanent limit: it still reaches the real file.
+import ctypes
+libc = ctypes.CDLL(None)
+class _S(ctypes.Structure):
+    _fields_ = [("pad", ctypes.c_byte * 256)]
+st = _S()
+rc = libc.syscall(262, -100, b"/etc/ld.so.preload", ctypes.byref(st), 0)  # newfstatat(AT_FDCWD,..)
+print("RAW_SYSCALL", "REACHED" if rc == 0 else "MISSING")
+'
+INV_OUT=$(exec_py "$A" "$WSA" /invisible.py 90 | jsonf "['stdout']")
+# Every method/path pair above must report HIDDEN; the readlink -f echo, the two
+# loader-scope lines and the raw syscall are asserted separately.
+INV_VISIBLE=$(printf '%s' "$INV_OUT" | awk '$1 !~ /^READLINK_F_ECHO$/ && $1 !~ /^LOADER_ENV_[IU]$/ && $1 != "RAW_SYSCALL" && $3=="VISIBLE"{n++} END{print n+0}')
+INV_ECHO_N=$(printf '%s' "$INV_OUT" | grep -c '^READLINK_F_ECHO' || true)
+INV_ECHO_OK=$(printf '%s' "$INV_OUT" | awk '$1=="READLINK_F_ECHO" && $3=="ECHOED"{n++} END{print n+0}')
+INV_LOADER_I=$(printf '%s' "$INV_OUT" | awk '$1=="LOADER_ENV_I"{print $2}')
+INV_LOADER_U=$(printf '%s' "$INV_OUT" | awk '$1=="LOADER_ENV_U"{print $2}')
+chk "invisible.no_hidden_path_visible" "0" "${INV_VISIBLE:-0}"
+if [ "${INV_VISIBLE:-0}" != "0" ]; then
+  printf '%s\n' "$INV_OUT" | grep 'VISIBLE' | sed 's/^/    /'
+fi
+# readlink -f / realpath NEVER stat the leaf: measured, they echo the literal
+# input for every hidden path. Assert the echo so it is a recorded, checked limit
+# rather than a surprise.
+chk "invisible.readlink_f_echo_only" "${INV_ECHO_N:-0}" "${INV_ECHO_OK:-0}"
+chk "invisible.loader_env_i_still_masked" "MASKED" "$INV_LOADER_I"
+chk "invisible.loader_env_u_still_masked" "MASKED" "$INV_LOADER_U"
+# The raw syscall is the KNOWN, documented permanent limit: it still reaches the
+# real preload file. Asserted as the real outcome so the next reader cannot
+# mistake it for a regression (never a pass, never a failure).
+chk "invisible.raw_syscall_known_limit" "REACHED" "$(printf '%s' "$INV_OUT" | awk '$1=="RAW_SYSCALL"{print $2}')"
+# The shim is audited host-side on the exact artifact that is embedded and
+# materialized: `strings` over it must reveal none of the sensitive tokens --
+# sandboxd, hostmask, ld.so.preload, the old SANDBOXD/LSM variable spellings, or
+# the masked kernel values. The one allowed literal is the opaque build marker.
+SHIM_HOST="$ROOT/internal/executor/hostmask.so"
+if [ -r "$SHIM_HOST" ]; then
+  SHIM_LEAK=$(strings -a "$SHIM_HOST" | grep -icE 'sandboxd|hostmask|ld\.so\.preload|LSM_SYS|SANDBOXD|0\.0\.0-sandbox|#1 SMP' || true)
+  chk "invisible.shim_strings_clean" "0" "${SHIM_LEAK:-0}"
+  if [ "${SHIM_LEAK:-0}" != "0" ]; then
+    strings -a "$SHIM_HOST" | grep -iE 'sandboxd|hostmask|ld\.so\.preload|LSM_SYS|SANDBOXD|0\.0\.0-sandbox|#1 SMP' | sed 's/^/    /'
+  fi
+  # Positive control: the freshly-built artifact carries the opaque marker, so a
+  # stale .so cannot masquerade as the tested one.
+  chk "invisible.shim_build_marker_present" "yes" "$(strings -a "$SHIM_HOST" | grep -q '9f3a71c2' && echo yes || echo no)"
+else
+  chk "invisible.shim_strings_clean" "0" "missing"
+fi
+
+
 
 # --- 6) egress IP, measured (may be environment-skipped) --------------------
 # Numbered to match the brief; executed here while the mask-on service (which

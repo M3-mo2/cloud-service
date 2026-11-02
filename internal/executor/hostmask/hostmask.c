@@ -478,7 +478,11 @@ int faccessat_v(int dirfd, const char *path, int mode, int flags) {
     MISSING();
   return real(dirfd, path, mode, flags);
 }
+/* eaccess is an alias of euidaccess (same libc address); coreutils `test -r`
+ * references euidaccess@GLIBC_2.2.5, so both open names must be bound or
+ * `test -r` sails through while `test -e`/`-f` are hidden (measured). */
 int eaccess_v(const char *path, int mode) { return access_v(path, mode); }
+int euidaccess_v(const char *path, int mode) { return access_v(path, mode); }
 
 ssize_t readlink_v(const char *path, char *buf, size_t n) {
   static ssize_t (*real)(const char *, char *, size_t);
@@ -554,7 +558,7 @@ static int is_masked_symbol(const char *s) {
       "stat", "stat64", "lstat", "lstat64", "fstat", "fstat64",
       "fstatat", "fstatat64", "statx",
       "__xstat", "__lxstat", "__fxstatat",
-      "access", "faccessat", "eaccess",
+      "access", "faccessat", "eaccess", "euidaccess",
       "readlink", "readdir", "readdir64", "readdir_r",
       "realpath", "canonicalize_file_name",
   };
@@ -619,6 +623,8 @@ static void *masked_symbol_addr(const char *symbol) {
     return (void *)&faccessat_v;
   if (!strcmp(symbol, "eaccess"))
     return (void *)&eaccess_v;
+  if (!strcmp(symbol, "euidaccess"))
+    return (void *)&euidaccess_v;
   if (!strcmp(symbol, "readlink"))
     return (void *)&readlink_v;
   if (!strcmp(symbol, "readdir"))
@@ -875,6 +881,7 @@ __asm__(".symver __fxstatat_v,__fxstatat@GLIBC_2.4");
 __asm__(".symver access_v,access@GLIBC_2.2.5");
 __asm__(".symver faccessat_v,faccessat@GLIBC_2.4");
 __asm__(".symver eaccess_v,eaccess@GLIBC_2.4");
+__asm__(".symver euidaccess_v,euidaccess@GLIBC_2.2.5");
 __asm__(".symver readlink_v,readlink@GLIBC_2.2.5");
 __asm__(".symver readdir_v,readdir@GLIBC_2.2.5");
 __asm__(".symver readdir64_v,readdir64@GLIBC_2.2.5");
