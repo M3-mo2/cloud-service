@@ -381,19 +381,25 @@ WRITE_OUT=$(exec_py "$A" "$WSA" /write.py 30 | jsonf "['stdout']")
 WROTE=$(printf '%s' "$WRITE_OUT" | grep -c '^WROTE' || true)
 chk "mask.shim_not_writable" "0" "${WROTE:-0}"
 
-# The mask must not break the runtimes: bash, python3 and perl still run and
-# produce their output with the shim active.
+# The mask must not break the runtimes: python3, node, bash and perl all still
+# run and produce their output with the shim active. node is asserted to
+# SUCCEED (not merely to match a mask-off run): pinning rlimit_as = memory_mb
+# aborted V8's virtual-address reservation at startup, so the engine now sets
+# rlimit_as = memory_mb + a runtime headroom (the cgroup remains the physical
+# ceiling). This group is the regression guard for that: it fails loudly if the
+# shim's new interposers, or the address-space model, ever break a runtime again.
 runcmd() { # base argv-json -> "<exit_code> <stdout>"
   curl -s -m 60 -X POST "$1/v1/workspaces/$2/exec" -H "$A" -H "$J" \
     -d "{\"cmd\":$3,\"timeout_sec\":30}" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('exit_code'),repr(d.get('stdout','').strip()))"
 }
-chk "mask.runtime_python3" "0 'py-ok'" "$(runcmd "$BASE" "$WSA" '["python3","-c","print(\"py-ok\")"]')"
-chk "mask.runtime_bash" "0 'sh-ok'" "$(runcmd "$BASE" "$WSA" '["bash","-c","echo sh-ok"]')"
-chk "mask.runtime_perl" "0 'perl-ok'" "$(runcmd "$BASE" "$WSA" '["perl","-e","print \"perl-ok\\n\""]')"
-# node's outcome under the mask is captured and compared with its outcome
-# WITHOUT the mask below: the requirement is that masking introduces no
-# regression, and node is known to be constrained by rlimit_as independently of
-# masking on this image, so equality (not success) is the honest assertion.
+chk "runtime.python3" "0 'py-ok'" "$(runcmd "$BASE" "$WSA" '["python3","-c","print(\"py-ok\")"]')"
+chk "runtime.node" "0 'node-ok'" "$(runcmd "$BASE" "$WSA" '["node","-e","console.log(\"node-ok\")"]')"
+chk "runtime.node_arithmetic" "0 '42'" "$(runcmd "$BASE" "$WSA" '["node","-e","console.log(6*7)"]')"
+chk "runtime.bash" "0 'sh-ok'" "$(runcmd "$BASE" "$WSA" '["bash","-c","echo sh-ok"]')"
+chk "runtime.perl" "0 'perl-ok'" "$(runcmd "$BASE" "$WSA" '["perl","-e","print \"perl-ok\\n\""]')"
+chk "runtime.git" "0 'git-ok'" "$(runcmd "$BASE" "$WSA" '["sh","-c","echo git-ok"]')"
+# node's outcome under the mask, captured for the mask-off equality assertion
+# below (masking must introduce no regression: both states must be identical).
 NODE_ON=$(runcmd "$BASE" "$WSA" '["node","-e","console.log(\"node-ok\")"]' | awk '{print $1}')
 
 # --- 8) the host platform's own tooling is not visible in the workspace -----
@@ -461,18 +467,17 @@ chk "provider.no_vendor_certs" "0" "$(pval CERT_HITS)"
 SCANNED=$(pval PROVIDER_SCANNED)
 chk "provider.audit_scanned" "yes" "$([ "${SCANNED:-0}" -gt 0 ] && echo yes || echo no)"
 # The legitimate toolchain must still work with the overlay in place. node is
-# deliberately NOT asserted to succeed here: it is constrained by rlimit_as
-# (nsjail sets rlimit_as = memory_mb and V8 reserves a large virtual space),
-# independently of masking or the overlay -- the same documented limitation as
-# group 4. It is captured and compared for equality below.
+# asserted to SUCCEED here too: the curated /usr/local overlay must not break a
+# runtime, and the address-space model must keep node's V8 startup working with
+# the overlay mounted.
 chk "provider.runtime_python3" "0 'py-ok'" "$(runcmd "$BASE" "$WSA" '["python3","-c","print(\"py-ok\")"]')"
+chk "provider.runtime_node" "0 'node-ok'" "$(runcmd "$BASE" "$WSA" '["node","-e","console.log(\"node-ok\")"]')"
 chk "provider.runtime_bash" "0 'sh-ok'" "$(runcmd "$BASE" "$WSA" '["bash","-c","echo sh-ok"]')"
 chk "provider.runtime_perl" "0 'perl-ok'" "$(runcmd "$BASE" "$WSA" '["perl","-e","print \"perl-ok\\n\""]')"
 chk "provider.runtime_git" "0 'git-ok'" "$(runcmd "$BASE" "$WSA" '["sh","-c","echo git-ok"]')"
 NODE_OVL=$(runcmd "$BASE" "$WSA" '["node","-e","console.log(\"node-ok\")"]' | awk '{print $1}')
-# The overlay must not change node's outcome (which the rlimit_as limitation
-# already fixes); equality with the masked-without-overlay run is the honest
-# assertion, matching group 4/5.
+# The overlay must not change node's outcome; equality with the masked run
+# (which must itself be a success) is the assertion.
 chk "provider.runtime_node_no_regression" "$NODE_ON" "$NODE_OVL"
 
 # --- 9) the dlopen-scoped dlsym bypass is CLOSED; syscall(2) is known -------
@@ -635,16 +640,25 @@ skip "zero_signal.seccomp_user_notif_no_artifact" "nsjail 3.4 (the shipped pin) 
 
 # --- 10c) the masking mechanism is INVISIBLE inside the workspace -----------
 # The operator's bar is silence: nothing named, nothing browsable, nothing
-# readable. The masking shim now interposes the filesystem entry points and
-# answers ENOENT (and drops the directory entry) for the configured paths, so
-# the very file that names the mechanism (/etc/ld.so.preload) and the shim
-# itself are invisible to every tool a tenant would use. This group MEASURES
-# that from inside a real workspace, across ls, cat, stat, test -f/-e/-r, find,
-# readlink, and python's os.stat/os.path.exists/os.listdir -- and re-asserts
-# that the loader scope still works (env -i must still report the masked kernel).
+# readable. The masking shim interposes the filesystem entry points and answers
+# ENOENT (and drops the directory entry) for the configured paths, so the very
+# file that names the mechanism (/etc/ld.so.preload) and the shim itself are
+# invisible to every tool a tenant would use. This group MEASURES that from
+# inside a real workspace, across ls, cat, stat, test -f/-e/-r, find, and
+# python's os.stat/os.path.exists/os.listdir -- and re-asserts that the loader
+# scope still works (env -i must still report the masked kernel).
 #
-# The documented limit is unchanged: a RAW syscall(2) still reaches the real
-# file (asserted as the KNOWN real value below, never as a pass or a failure).
+# THE TWO ERROR MODES (both measured, both asserted here):
+#   * the EXISTENCE family answers ENOENT, so a tool that asks "does this exist"
+#     sees it as absent (ls/cat/find/test, os.path.exists/open/listdir/glob);
+#   * the CANONICALIZATION family answers EACCES, because coreutils' realpath(1)/
+#     readlink -f treat ENOENT as "not yet created" and ECHO their literal
+#     argument, while EACCES makes them abort. Asserting that no canonicalizer
+#     echoes a hidden path is the regression guard for that leak.
+#
+# The documented limits are unchanged: a RAW syscall(2) still reaches the real
+# file, and python's os.path.realpath() still returns its own argument; both are
+# asserted as the KNOWN real outcome below, never as a pass or a failure.
 echo "=== 10c) the masking mechanism is invisible inside the workspace ==="
 put_py "$A" "$WSA" /invisible.py 'import os, subprocess
 HIDDEN = ["/etc/ld.so.preload", "/run/.rt.so", "/sandboxd", "/run/sandboxd"]
@@ -674,13 +688,25 @@ for h in HIDDEN:
         print("TEST" + flag, h, vis(r.returncode == 0))
     r = subprocess.run(["find", parent, "-maxdepth", "1", "-name", name], capture_output=True, text=True)
     print("FIND", h, vis(bool(r.stdout.strip())))
-    # readlink() (the syscall wrapper) is intercepted; readlink -f / realpath are
-    # pure path canonicalizers that never stat the leaf, so they echo the literal
-    # input -- a documented non-leaking limit, asserted below as an echo.
+    # The CANONICALIZATION family. readlink(1)/realpath(1) canonicalize without
+    # a leaf stat, but the coreutils canonicalizer calls readlink(2) on the leaf
+    # and echoes the literal on ENOENT; the shim now answers EACCES for the
+    # canonicalization family, which makes coreutils abort (rc!=0, no stdout)
+    # instead of echoing. Assert the path is never echoed here.
     r = subprocess.run(["readlink", h], capture_output=True, text=True)
     print("READLINK", h, vis(r.returncode == 0))
     r = subprocess.run(["readlink", "-f", h], capture_output=True, text=True)
-    print("READLINK_F_ECHO", h, "ECHOED" if r.stdout.strip() == h else "DIFFERS")
+    print("READLINK_F", h, "ECHOED" if r.stdout.strip() == h else "NOT_ECHOED")
+    r = subprocess.run(["readlink", "-e", h], capture_output=True, text=True)
+    print("READLINK_E", h, "ECHOED" if r.stdout.strip() == h else "NOT_ECHOED")
+    r = subprocess.run(["realpath", h], capture_output=True, text=True)
+    print("REALPATH", h, "ECHOED" if r.stdout.strip() == h else "NOT_ECHOED")
+    r = subprocess.run(["realpath", "-e", h], capture_output=True, text=True)
+    print("REALPATH_E", h, "ECHOED" if r.stdout.strip() == h else "NOT_ECHOED")
+    # os.path.realpath() swallows the OSError and returns its own argument: the
+    # documented residual (it reveals nothing the tenant did not type). Assert it
+    # is capped at the literal, never a resolved host path.
+    print("PY_REALPATH", h, "ECHOED" if os.path.realpath(h) == h else "DIFFERS")
 # The loader scope: a real exec (the loader reads /etc/ld.so.preload before any
 # shim is mapped) is still masked, so env -i cannot defeat it.
 r = subprocess.run(["env", "-i", "uname", "-r"], capture_output=True, text=True)
@@ -697,21 +723,33 @@ rc = libc.syscall(262, -100, b"/etc/ld.so.preload", ctypes.byref(st), 0)  # newf
 print("RAW_SYSCALL", "REACHED" if rc == 0 else "MISSING")
 '
 INV_OUT=$(exec_py "$A" "$WSA" /invisible.py 90 | jsonf "['stdout']")
-# Every method/path pair above must report HIDDEN; the readlink -f echo, the two
-# loader-scope lines and the raw syscall are asserted separately.
-INV_VISIBLE=$(printf '%s' "$INV_OUT" | awk '$1 !~ /^READLINK_F_ECHO$/ && $1 !~ /^LOADER_ENV_[IU]$/ && $1 != "RAW_SYSCALL" && $3=="VISIBLE"{n++} END{print n+0}')
-INV_ECHO_N=$(printf '%s' "$INV_OUT" | grep -c '^READLINK_F_ECHO' || true)
-INV_ECHO_OK=$(printf '%s' "$INV_OUT" | awk '$1=="READLINK_F_ECHO" && $3=="ECHOED"{n++} END{print n+0}')
+# Every method/path pair above must report HIDDEN; the canonicalization family,
+# the os.path.realpath residual, the two loader-scope lines and the raw syscall
+# are asserted separately (their third field is not VISIBLE/HIDDEN).
+INV_VISIBLE=$(printf '%s' "$INV_OUT" | awk '$1 !~ /^LOADER_ENV_[IU]$/ && $1 != "RAW_SYSCALL" && $3=="VISIBLE"{n++} END{print n+0}')
 INV_LOADER_I=$(printf '%s' "$INV_OUT" | awk '$1=="LOADER_ENV_I"{print $2}')
 INV_LOADER_U=$(printf '%s' "$INV_OUT" | awk '$1=="LOADER_ENV_U"{print $2}')
 chk "invisible.no_hidden_path_visible" "0" "${INV_VISIBLE:-0}"
 if [ "${INV_VISIBLE:-0}" != "0" ]; then
   printf '%s\n' "$INV_OUT" | grep 'VISIBLE' | sed 's/^/    /'
 fi
-# readlink -f / realpath NEVER stat the leaf: measured, they echo the literal
-# input for every hidden path. Assert the echo so it is a recorded, checked limit
-# rather than a surprise.
-chk "invisible.readlink_f_echo_only" "${INV_ECHO_N:-0}" "${INV_ECHO_OK:-0}"
+# The canonicalization family (readlink -f/-e, realpath, realpath -e) must NEVER
+# echo a hidden path: the shim answers EACCES for it, so coreutils aborts. This
+# is the regression guard for the readlink/realpath leak.
+INV_CANON_N=$(printf '%s' "$INV_OUT" | awk '$1=="READLINK_F"||$1=="READLINK_E"||$1=="REALPATH"||$1=="REALPATH_E"{n++} END{print n+0}')
+INV_CANON_ECHO=$(printf '%s' "$INV_OUT" | awk '($1=="READLINK_F"||$1=="READLINK_E"||$1=="REALPATH"||$1=="REALPATH_E") && $3=="ECHOED"{n++} END{print n+0}')
+chk "invisible.canonicalization_no_echo" "0" "${INV_CANON_ECHO:-0}"
+if [ "${INV_CANON_ECHO:-0}" != "0" ]; then
+  printf '%s\n' "$INV_OUT" | awk '($1=="READLINK_F"||$1=="READLINK_E"||$1=="REALPATH"||$1=="REALPATH_E") && $3=="ECHOED"' | sed 's/^/    /'
+fi
+# The canonicalization probe must have actually run; a zero count is not a pass.
+chk "invisible.canonicalization_probe_ran" "yes" "$([ "${INV_CANON_N:-0}" -gt 0 ] && echo yes || echo no)"
+# os.path.realpath() is the documented RESIDUAL: Python swallows the EACCES and
+# returns its own argument, so every hidden path is echoed back to the caller
+# unchanged. Assert the exact count so a resolved host path can never appear.
+INV_PYREAL_N=$(printf '%s' "$INV_OUT" | grep -c '^PY_REALPATH' || true)
+INV_PYREAL_ECHO=$(printf '%s' "$INV_OUT" | awk '$1=="PY_REALPATH" && $3=="ECHOED"{n++} END{print n+0}')
+chk "invisible.py_realpath_residual_literal" "${INV_PYREAL_N:-0}" "${INV_PYREAL_ECHO:-0}"
 chk "invisible.loader_env_i_still_masked" "MASKED" "$INV_LOADER_I"
 chk "invisible.loader_env_u_still_masked" "MASKED" "$INV_LOADER_U"
 # The raw syscall is the KNOWN, documented permanent limit: it still reaches the
@@ -832,8 +870,8 @@ print("MEM", os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
   # constant.
   chk "mask_off.mem_leaks_host" "yes" "$([ "$(lval MEM)" -gt "$((WS_MEM_MB * 1024 * 1024))" ] && echo yes || echo no)"
   # node's result WITHOUT the mask, compared with the masked result: masking
-  # must introduce no regression. On this image node is independently limited
-  # by rlimit_as, so the honest assertion is equality of outcome.
+  # must introduce no regression. Both states now run node successfully (the
+  # address-space model lets V8 start), so a masked/off mismatch is a real bug.
   NODE_OFF=$(runcmd "$BASE2" "$WSO" '["node","-e","console.log(\"node-ok\")"]' | awk '{print $1}')
   chk "mask.runtime_node_no_regression" "$NODE_OFF" "$NODE_ON"
 fi

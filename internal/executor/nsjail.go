@@ -66,6 +66,42 @@ func (r *NsjailRunner) Identity() Identity { return r.identity }
 // CgroupMount is the location nsjail uses for the cgroup v2 hierarchy.
 const CgroupMount = "/sys/fs/cgroup"
 
+// The physical memory ceiling of a workspace is cgroup_mem_max = memory_mb
+// (bytes): a process that COMMITS past it is OOM-killed there. rlimit_as is a
+// separate, coarser virtual-address-space backstop and is deliberately NOT set
+// to memory_mb, because a modern managed runtime reserves a large VIRTUAL
+// address space at startup that it never commits, and RLIMIT_AS counts every
+// reservation including PROT_NONE ones. Measured: the pinned node/V8 build
+// (v24.22.2) mmaps a 512 MiB PROT_NONE CodeRange plus heap reservations --
+// ~1.1 GiB of address space -- before it runs a single line, so rlimit_as =
+// memory_mb aborts it with "Fatal process out of memory:
+// SegmentedTable::InitializeTable (subspace allocation)" / "Failed to reserve
+// virtual memory for CodeRange". This is a property of rlimit_as vs V8, NOT of
+// the host-identity shim: `node -e 'console.log(42)'` fails identically with
+// masking on and off, and under a bare `ulimit -v 262144` with no shim loaded.
+// The address-space limit is therefore memory_mb plus a fixed runtime headroom,
+// with a floor so the smallest workspace still has room to start a managed
+// runtime. The cgroup remains the ceiling that actually bounds physical use.
+const (
+	runtimeAddressSpaceHeadroomMB = 1024
+	minAddressSpaceMB             = 2048
+)
+
+// addressSpaceMB returns the rlimit_as value (MB) for a workspace's memory_mb.
+// It is the physical ceiling plus a runtime address-space headroom, floored so
+// a small workspace can still start node/V8. See the block above for why this
+// is not simply memory_mb.
+func addressSpaceMB(memoryMB int) int {
+	if memoryMB < 1 {
+		memoryMB = 1
+	}
+	as := memoryMB + runtimeAddressSpaceHeadroomMB
+	if as < minAddressSpaceMB {
+		as = minAddressSpaceMB
+	}
+	return as
+}
+
 // CgroupsUsable reports whether the cgroup v2 hierarchy is writable by this
 // process. nsjail's cgroup ceilings (memory, pids, cpu) require it, which in
 // turn requires the container to be started with --cgroupns=host. The result is
@@ -647,9 +683,12 @@ type tmplData struct {
 	MemoryBytes  int64
 	PidsMax      int
 	FsizeMB      int
-	AsMB         int
-	AllowNet     bool
-	DisableNet   bool
+	// AsMB is the rlimit_as backstop in MB: the workspace's memory_mb plus a
+	// runtime address-space headroom (see addressSpaceMB), never memory_mb
+	// alone -- a managed runtime reserves more VIRTUAL space than it commits.
+	AsMB       int
+	AllowNet   bool
+	DisableNet bool
 	// JoinNetns, when true, means the runner has already entered the
 	// workspace's own network namespace and nsjail must not create another one
 	// (clone_newnet:false). It is never a host-network share.
@@ -822,7 +861,7 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		MemoryBytes:   int64(lim.MemoryMB) * 1024 * 1024,
 		PidsMax:       lim.MaxRuns * 64,
 		FsizeMB:       lim.DiskMB,
-		AsMB:          lim.MemoryMB,
+		AsMB:          addressSpaceMB(lim.MemoryMB),
 		AllowNet:      lim.AllowNet,
 		DisableNet:    !lim.AllowNet,
 		JoinNetns:     req.NetnsPath != "",

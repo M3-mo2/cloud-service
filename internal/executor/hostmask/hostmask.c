@@ -54,12 +54,20 @@
  *   syscall-mask exports (uname/sysconf/...) reference their ancient GLIBC_2.2.5
  *   versions and keep working unversioned, so they are deliberately NOT listed.
  *
- * THE readlink -f / realpath DETAIL (measured)
+ * THE readlink -f / realpath DETAIL (measured; EACCES closes the echo)
  *   readlink(1) -f and realpath(1) canonicalize component by component and pass
- *   only the LEAF with a dirfd (`fstatat(dirfd, "secret.txt", ...)`), so matching
- *   the full path alone misses them. The matcher therefore matches the path AND
- *   the final component. Do NOT chase readlink -f / realpath themselves: they
- *   never stat the leaf, so there is nothing there to intercept.
+ *   only the LEAF with a dirfd (`readlink(dirfd, "leaf", ...)`), so matching the
+ *   full path alone misses them; the matcher therefore matches the final
+ *   component too. They never stat the leaf, so there is no leaf stat to
+ *   intercept -- but coreutils' canonicalizer DOES call readlink(2) on the leaf,
+ *   and its behaviour depends on the errno: on ENOENT it treats the component as
+ *   "not yet created" and echoes the literal argument (measured: `realpath
+ *   /etc/ld.so.preload` printed the path), while on EACCES it aborts and prints
+ *   nothing (measured: `realpath -e` and `readlink -f` exit 1). The canonical-
+ *   ization family (readlink/readlinkat/realpath/canonicalize_file_name)
+ *   therefore answers EACCES, not ENOENT, so the path is never echoed. The
+ *   EXISTENCE family stays ENOENT so `ls`/`cat`/`find`/`test`/os.path.exists()
+ *   still see the path as absent. See docs/DECISIONS.md ADR 81.
  *
  * ZERO SELF-ANNOUNCEMENT (measured)
  *   A tenant can `strings` this shim and read its own environment, so it must
@@ -335,6 +343,46 @@ static int is_hidden_name(const char *n) {
 
 #define MISSING() do { errno = ENOENT; return -1; } while (0)
 
+/*
+ * THE CANONICALIZATION FAMILY ANSWERS EACCES, NOT ENOENT (measured; this is the
+ * fix for the "readlink -f / realpath still echo the hidden path" regression).
+ *
+ *   Coreutils' realpath(1)/readlink -f and Python's os.path.realpath() do NOT
+ *   stat the leaf with a syscall we can answer: they canonicalize the path with
+ *   readlink(2)/lstat(2) component by component. Measured (strace, coreutils
+ *   9.4), on a path whose final component the kernel reports ENOENT:
+ *
+ *       readlink("/etc", ...)               = -1 EINVAL (not a symlink)
+ *       readlink("/etc/ld.so.preload", ...) = -1 ENOENT
+ *       -> stdout: /etc/ld.so.preload          (the literal ARGUMENT, echoed)
+ *       -> exit 0
+ *
+ *   An ENOENT from the canonicalizer's readlink() is interpreted by coreutils as
+ *   "this component does not exist yet", so it KEEPS the literal it was given
+ *   and prints it -- an ENOENT cannot hide the path. Measured: the same path
+ *   under EACCES instead aborts:
+ *
+ *       readlink("/etc/ld.so.preload", ...) = -1 EACCES
+ *       -> stderr: realpath: /etc/ld.so.preload: Permission denied
+ *       -> exit 1 (no stdout)
+ *
+ *   EACCES is therefore the errno that closes the echo, and it is the natural
+ *   answer for a path whose components exist but whose leaf is withheld. The
+ *   EXISTENCE family (open/stat/lstat/fstatat/statx/access/readdir) still
+ *   answers ENOENT, so human tools (ls/cat/find/test) and Python's
+ *   os.path.exists()/open()/listdir()/glob() continue to see the path as simply
+ *   absent -- the measured, working hide. Only the canonicalization family (the
+ *   tools that would otherwise echo the literal) answers EACCES.
+ *
+ *   RESIDUAL (documented, not closed): Python's os.path.realpath() swallows the
+ *   OSError and returns the input unchanged, so it still echoes the tenant's own
+ *   argument. It reveals nothing the tenant did not type, and os.path.exists()
+ *   correctly reports False. A raw syscall(2) readlink bypasses this too, like
+ *   every other interposer.
+ */
+#define DENIED() do { errno = EACCES; return -1; } while (0)
+#define DENIED_NULL() do { errno = EACCES; return NULL; } while (0)
+
 /* ───────────────────────── filesystem interposers ──────────────────────── */
 /* These are exported under the version names their callers reference; the
  * .symver block at the bottom of this file builds that mapping and
@@ -489,8 +537,16 @@ ssize_t readlink_v(const char *path, char *buf, size_t n) {
   if (!real)
     real = (ssize_t (*)(const char *, char *, size_t))shim_next("readlink");
   if (is_hidden(path))
-    MISSING();
+    DENIED();
   return real(path, buf, n);
+}
+ssize_t readlinkat_v(int dirfd, const char *path, char *buf, size_t n) {
+  static ssize_t (*real)(int, const char *, char *, size_t);
+  if (!real)
+    real = (ssize_t (*)(int, const char *, char *, size_t))shim_next("readlinkat");
+  if (is_hidden(path))
+    DENIED();
+  return real(dirfd, path, buf, n);
 }
 
 struct dirent *readdir_v(DIR *d) {
@@ -525,20 +581,16 @@ char *realpath_v(const char *path, char *resolved) {
   static char *(*real)(const char *, char *);
   if (!real)
     real = (char *(*)(const char *, char *))shim_next("realpath");
-  if (is_hidden(path)) {
-    errno = ENOENT;
-    return NULL;
-  }
+  if (is_hidden(path))
+    DENIED_NULL();
   return real(path, resolved);
 }
 char *canonicalize_file_name_v(const char *path) {
   static char *(*real)(const char *);
   if (!real)
     real = (char *(*)(const char *))shim_next("canonicalize_file_name");
-  if (is_hidden(path)) {
-    errno = ENOENT;
-    return NULL;
-  }
+  if (is_hidden(path))
+    DENIED_NULL();
   return real(path);
 }
 
@@ -559,7 +611,7 @@ static int is_masked_symbol(const char *s) {
       "fstatat", "fstatat64", "statx",
       "__xstat", "__lxstat", "__fxstatat",
       "access", "faccessat", "eaccess", "euidaccess",
-      "readlink", "readdir", "readdir64", "readdir_r",
+      "readlink", "readlinkat", "readdir", "readdir64", "readdir_r",
       "realpath", "canonicalize_file_name",
   };
   for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
@@ -627,6 +679,8 @@ static void *masked_symbol_addr(const char *symbol) {
     return (void *)&euidaccess_v;
   if (!strcmp(symbol, "readlink"))
     return (void *)&readlink_v;
+  if (!strcmp(symbol, "readlinkat"))
+    return (void *)&readlinkat_v;
   if (!strcmp(symbol, "readdir"))
     return (void *)&readdir_v;
   if (!strcmp(symbol, "readdir64"))
@@ -883,6 +937,7 @@ __asm__(".symver faccessat_v,faccessat@GLIBC_2.4");
 __asm__(".symver eaccess_v,eaccess@GLIBC_2.4");
 __asm__(".symver euidaccess_v,euidaccess@GLIBC_2.2.5");
 __asm__(".symver readlink_v,readlink@GLIBC_2.2.5");
+__asm__(".symver readlinkat_v,readlinkat@GLIBC_2.4");
 __asm__(".symver readdir_v,readdir@GLIBC_2.2.5");
 __asm__(".symver readdir64_v,readdir64@GLIBC_2.2.5");
 __asm__(".symver readdir_r_v,readdir_r@GLIBC_2.2.5");

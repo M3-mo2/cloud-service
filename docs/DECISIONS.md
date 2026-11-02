@@ -1202,9 +1202,10 @@ variables.
    each interposer under the version its callers reference:
    `GLIBC_2.2.5` for `open/open64/access/euidaccess/readlink/readdir/readdir64/
    readdir_r/__xstat/__lxstat/canonicalize_file_name`; `GLIBC_2.3` `realpath`;
-   `GLIBC_2.4` `openat/openat64/faccessat/eaccess/__fxstatat`; `GLIBC_2.28`
-   `statx`; `GLIBC_2.33` `stat/stat64/lstat/lstat64/fstat/fstat64/fstatat/
-   fstatat64`. The syscall-mask exports (`uname`/`sysconf`/`sysinfo`/…) reference
+   `GLIBC_2.4` `openat/openat64/faccessat/eaccess/__fxstatat/readlinkat`;
+   `GLIBC_2.28` `statx`; `GLIBC_2.33` `stat/stat64/lstat/lstat64/fstat/fstat64/
+   fstatat/fstatat64`. The syscall-mask exports (`uname`/`sysconf`/`sysinfo`/…)
+   reference
    the ancient `GLIBC_2.2.5` versions and are deliberately left unversioned.
    A measured surprise inside this work: coreutils `test -r` references
    **`euidaccess@GLIBC_2.2.5`** (not `eaccess@GLIBC_2.4`), so `test -e`/`-f`
@@ -1215,13 +1216,13 @@ variables.
    `hostmask.so`).
 
 2. **`readlink(1) -f` and `realpath(1)` canonicalize component by component and
-   pass only the LEAF with a dirfd** (`fstatat(dirfd, "secret.txt", …)`), so
-   matching the full path alone misses them. The matcher therefore matches the
-   path **and** the final component. Measured: `readlink -f` and `realpath` are
-   pure path canonicalizers that **never stat the leaf**, so they echo the
-   literal input for a hidden path and leak nothing — they are deliberately
-   **not** chased (`is_hidden` on the leaf covers the dirfd calls they *do*
-   make; there is nothing else to intercept).
+   pass only the LEAF**, so matching the full path alone misses them. The matcher
+   therefore matches the path **and** the final component. A first pass concluded
+   from this that they "never stat the leaf" and could only echo their argument,
+   and left them alone — measured **wrong** in the follow-up: the coreutils
+   canonicalizer *does* call `readlink(2)` on the leaf, and its behaviour depends
+   on the errno. See **ADR 81**: the canonicalization family now answers `EACCES`,
+   not `ENOENT`, which makes it abort instead of echoing.
 
 **The loader-scope trap — solved, and the reason it works at all.** The dynamic
 loader must read `/etc/ld.so.preload` for the mask to work. The hiding is scoped
@@ -1301,6 +1302,115 @@ that carries the feature. The Dockerfile pin and this decision stay in sync;
 `identity-check.sh` group 10b records the measurement as a `skip` with the
 correct reason (3.4 lacks the flag; master has it but is unreleased and is a
 tracer, not a hook).
+
+### ADR 81 — the canonicalization family answers EACCES, not ENOENT
+
+**Problem.** After ADR 79 the hiding worked for every *existence* probe (`ls`,
+`cat`, `stat`, `test -f/-r/-e`, `find`, `os.stat`, `os.path.exists`, `open`,
+`os.listdir`, `glob`), but `readlink -f /etc/ld.so.preload` and
+`realpath /etc/ld.so.preload` still printed the hidden path. The follow-up
+measurement also showed the interposers added in the hiding pass were **not**
+what broke `node` (see ADR 82), so the two findings are independent.
+
+**Measured (strace, coreutils 9.4, inside a real workspace).** The canonicalizer
+never `stat`s the leaf; it calls `readlink(2)` on each component:
+
+```
+readlink("/etc", ...)                = -1 EINVAL   (not a symlink)
+readlink("/etc/ld.so.preload", ...)  = -1 ENOENT
+  -> stdout "/etc/ld.so.preload"        exit 0    (the literal ARGUMENT, echoed)
+readlink("/etc/ld.so.preload", ...)  = -1 EACCES
+  -> stderr "realpath: /etc/ld.so.preload: Permission denied"  exit 1, no stdout
+```
+
+An **`ENOENT` from the canonicalizer means "this component does not exist yet"**,
+so coreutils keeps the literal it was given and prints it — an `ENOENT` *cannot*
+hide the path from `readlink -f`/`realpath`. `EACCES` is the only errno that
+makes them abort, and it is the natural answer for a path whose components exist
+but whose leaf is withheld.
+
+**Decision.** Split the filesystem interposers into two error modes:
+
+- **Existence family** (`open`/`openat`/`stat`/`lstat`/`fstatat`/`statx`/`access`/
+  `faccessat`/`eaccess`/`euidaccess`/`readdir`/`readdir64`/`readdir_r`) keeps
+  **`ENOENT`**: human tools and Python report the path as simply absent.
+- **Canonicalization family** (`readlink`/`readlinkat`/`realpath`/
+  `canonicalize_file_name`) answers **`EACCES`**: coreutils aborts instead of
+  echoing. `readlinkat@GLIBC_2.4` is now interposed too (it was a gap: the libc
+  `readlinkat` returned the real target).
+
+**Measured after the change** (inside a real workspace, all four hidden paths):
+`readlink -f`/`readlink -e`/`realpath`/`realpath -e` return rc=1 with **no
+stdout**; `ls`/`cat`/`stat`/`test -f` still report the path as absent; a
+non-hidden path and a real symlink resolve normally.
+
+**Documented residual (not closed).** Python's `os.path.realpath()` swallows the
+`OSError` and returns its own argument, so it still echoes the tenant's literal
+input. That reveals nothing the tenant did not type, and `os.path.exists()`
+correctly reports `False`; it is asserted as the known outcome (a *literal* echo
+count), never as a pass or a failure. A raw `syscall(2)` bypasses the interposer
+like every other one. `identity-check.sh` group 10c guards both: the
+canonicalization family must **never** echo, and the `os.path.realpath` echo is
+counted.
+
+### ADR 82 — `rlimit_as` is not `memory_mb`: a managed runtime reserves virtual space
+
+**Problem (a regression report).** After ADR 79, `node -e 'console.log(42)'`
+inside a workspace died with `Fatal process out of memory:
+SegmentedTable::InitializeTable (subspace allocation)`, exit 133, while
+`node -v` printed `v24.22.2`. The report named the newly interposed filesystem
+symbols as the prime suspect.
+
+**Measured — the interposers are not the cause.** The crash reproduces with the
+shim **not loaded at all**:
+
+```
+$ (ulimit -v 262144; node -e 'console.log(42)')
+# Fatal process out of memory: SegmentedTable::InitializeTable ...
+```
+
+and identically with the **previous, syscall-only** shim, and inside a real
+sandbox with host-identity masking **off** (`identity.enabled: false`). Node's
+virtual-address threshold is the *same* (1121 MB) with and without the shim.
+The cause is `rlimit_as`: nsjail renders `rlimit_as = memory_mb`, and the pinned
+node/V8 build reserves ~1.1 GiB of **virtual** address space before `main` — a
+512 MiB `PROT_NONE` `CodeRange` `mmap` plus heap reservations:
+
+```
+$ (ulimit -v 1048576; strace -e mmap node -e '1')
+mmap(0xea5000, 536870912, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)
+  = -1 ENOMEM
+# Fatal process out of memory: Failed to reserve virtual memory for CodeRange
+```
+
+`RLIMIT_AS` counts every reservation, including `PROT_NONE` ones the process
+never commits, so `rlimit_as = memory_mb` aborts a managed runtime on startup.
+Node's own `--jitless` lowers the reservation (~768 MB) but is a behavioural
+change with a large throughput cost, not an acceptable default.
+
+**Decision — separate the physical ceiling from the virtual backstop.**
+
+- The **physical** memory ceiling stays `cgroup_mem_max = memory_mb` bytes; a
+  process that commits past it is OOM-killed there.
+- `rlimit_as` becomes a **generous virtual backstop**:
+  `rlimit_as = memory_mb + 1024`, floored at `2048` MB
+  (`addressSpaceMB()` in `internal/executor/nsjail.go`). The workspace's own
+  `memory_mb` is still the physical limit a tenant is charged against; the
+  headroom only covers the address space a runtime reserves but does not commit.
+
+**Measured after the change.** `node -e 'console.log(42)'` → `42` at the default
+512 MB and at 256 MB, mask on and off; `python3`/`bash`/`perl`/`git` unaffected;
+the mask still reports `0.0.0-sandbox`, `1` cpu. `python3` touching 4 GiB is
+killed by the cgroup (exit 137) rather than raising `MemoryError` — the physical
+ceiling is now the cgroup, and `acceptance.sh` #19 is updated to assert that
+(exactly one of `exit 137` or `MEMORY_DENIED`), which still catches the unit bug
+(a 512 TiB `rlimit_as` would let 4 GiB succeed). `identity-check.sh` gains a
+**runtime group** that asserts `node`/`python3`/`bash`/`perl`/`git` succeed
+under the mask, so a runtime regression can never pass silently again.
+
+**Cost.** `rlimit_as` no longer bounds a single process's virtual address space
+to `memory_mb`; the cgroup does. This is the correct model: `memory_mb` is a
+committed-memory budget, and a virtual reservation is not committed memory.
 
 ## Additional defaults chosen during implementation
 

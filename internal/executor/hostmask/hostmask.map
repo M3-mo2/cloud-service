@@ -7,8 +7,8 @@ GLIBC_2.3 {
   global: realpath;
 };
 GLIBC_2.4 {
-  global:
-    openat; openat64; faccessat; eaccess; __fxstatat;
+global:
+openat; openat64; faccessat; eaccess; __fxstatat; readlinkat;
 };
 GLIBC_2.28 {
   global: statx;

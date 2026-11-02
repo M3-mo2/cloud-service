@@ -334,13 +334,34 @@ print("FORKED",n)
 ' 20 | jsonfield "['stdout']")" "FORK_LIMITED"
 
 echo "### 19. resource ceiling: memory limit enforced (F-1)"
-# With a 512 MiB RLIMIT_AS, allocating ~1 GiB must fail rather than succeed.
-check_contains "rlimit.memory" "$(write_and_exec /mem.py 'try:
-    b=bytearray(1024*1024*1024)
+# memory_mb is enforced PHYSICALLY by cgroup_mem_max = memory_mb bytes; a process
+# that commits far past it is OOM-killed (exit 137). rlimit_as is a separate
+# virtual-address backstop set ABOVE memory_mb (memory_mb + headroom), because a
+# managed runtime reserves a large VIRTUAL address space it never commits and
+# RLIMIT_AS counts that reservation -- pinning rlimit_as = memory_mb aborts
+# node/V8 with "Fatal process out of memory: SegmentedTable::InitializeTable".
+# The probe therefore TOUCHES 4 GiB: it must not print ALLOC_OK -- either the
+# cgroup kills it (137) or the virtual backstop raises MemoryError. This still
+# catches the byte-unit bug (a 512 TiB rlimit_as would let 4 GiB succeed).
+MEM_OUT=$(write_and_exec /mem.py 'import sys
+try:
+    blocks = []
+    while len(blocks) < 64:          # up to 64 * 64 MiB = 4 GiB
+        b = bytearray(64 * 1024 * 1024)
+        for i in range(0, len(b), 4096):
+            b[i] = 1
+        blocks.append(b)
     print("ALLOC_OK")
 except MemoryError:
     print("MEMORY_DENIED")
-' 20 | jsonfield "['stdout']")" "MEMORY_DENIED"
+' 30)
+MEM_CODE=$(printf '%s' "$MEM_OUT" | jsonfield "['exit_code']")
+MEM_STDOUT=$(printf '%s' "$MEM_OUT" | jsonfield "['stdout']")
+if [ "$MEM_CODE" = "137" ] || [ "$MEM_STDOUT" = "MEMORY_DENIED" ]; then
+  pass=$((pass + 1)); printf 'ok   %-28s memory_limited (exit %s)\n' "rlimit.memory" "$MEM_CODE"
+else
+  fail=$((fail + 1)); printf 'FAIL %-28s memory NOT limited: exit %s out %s\n' "rlimit.memory" "$MEM_CODE" "$MEM_STDOUT"
+fi
 
 echo "### 20. stop long run kills process group"
 write_and_exec /long.py 'import time

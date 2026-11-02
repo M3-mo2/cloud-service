@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -174,7 +175,7 @@ func TestRenderConfig(t *testing.T) {
 		`cgroup_mem_max: 268435456`,
 		`cgroup_cpu_ms_per_sec: 2000`,
 		`rlimit_nproc: 192`,
-		`rlimit_as: 256`,
+		`rlimit_as: 2048`,
 		`rlimit_fsize: 10`,
 		`use_cgroupv2: true`,
 		`mount_proc: false`,
@@ -247,10 +248,12 @@ func TestRenderConfigJoinsWorkspaceNetns(t *testing.T) {
 	}
 }
 
-// TestRenderConfigRlimitUnits guards F-1: nsjail interprets rlimit_as and
-// rlimit_fsize in megabytes, so the rendered values must equal the workspace's
-// MB limits -- never bytes. A regression to bytes would render ~10^6x larger
-// numbers and silently disable the memory and file-size ceilings.
+// TestRenderConfigRlimitUnits guards F-1 and the rlimit_as-vs-V8 finding:
+// nsjail interprets rlimit_as and rlimit_fsize in megabytes, so neither may be
+// byte-scaled. rlimit_as is the workspace's memory_mb PLUS a runtime
+// address-space headroom (never memory_mb alone, which aborts node/V8, whose
+// PROT_NONE reservations count against RLIMIT_AS), while rlimit_fsize is the
+// disk limit. The physical memory ceiling remains cgroup_mem_max = memory_mb.
 func TestRenderConfigRlimitUnits(t *testing.T) {
 	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
 	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 256, DiskMB: 10, MaxWallTimeSec: 5, MaxRuns: 1}}
@@ -262,8 +265,15 @@ func TestRenderConfigRlimitUnits(t *testing.T) {
 	b, _ := os.ReadFile(path)
 	out := string(b)
 
-	if !strings.Contains(out, "rlimit_as: 256\n") {
-		t.Errorf("rlimit_as must be the MB value (256), got:\n%s", out)
+	// The physical ceiling is still the workspace's memory_mb.
+	if !strings.Contains(out, "cgroup_mem_max: 268435456") {
+		t.Errorf("cgroup_mem_max must be memory_mb in bytes (268435456), got:\n%s", out)
+	}
+	// rlimit_as is memory_mb + headroom, floored at minAddressSpaceMB. For a
+	// 256 MB workspace that is 2048 MB.
+	wantAS := fmt.Sprintf("rlimit_as: %d\n", addressSpaceMB(256))
+	if !strings.Contains(out, wantAS) {
+		t.Errorf("rlimit_as must be the address-space value (%s), got:\n%s", strings.TrimSpace(wantAS), out)
 	}
 	if !strings.Contains(out, "rlimit_fsize: 10\n") {
 		t.Errorf("rlimit_fsize must be the MB value (10), got:\n%s", out)
@@ -271,6 +281,25 @@ func TestRenderConfigRlimitUnits(t *testing.T) {
 	// A byte-scaled value would be at least 1024x the intended MB figure.
 	if strings.Contains(out, "rlimit_as: 268435456") || strings.Contains(out, "rlimit_fsize: 10485760") {
 		t.Error("rlimit values are byte-scaled; nsjail expects megabytes")
+	}
+}
+
+// TestAddressSpaceMB proves the rlimit_as formula keeps a runtime headroom over
+// the physical ceiling and never falls below the floor.
+func TestAddressSpaceMB(t *testing.T) {
+	cases := []struct {
+		memMB, want int
+	}{
+		{1, 2048},    // floor wins over 1+1024
+		{256, 2048},  // floor wins over 1280
+		{512, 2048},  // 512+1024 = 1536 < floor
+		{2048, 3072}, // 2048+1024
+		{8192, 9216}, // 8192+1024
+	}
+	for _, c := range cases {
+		if got := addressSpaceMB(c.memMB); got != c.want {
+			t.Errorf("addressSpaceMB(%d) = %d, want %d", c.memMB, got, c.want)
+		}
 	}
 }
 
