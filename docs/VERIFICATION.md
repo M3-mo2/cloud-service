@@ -1,6 +1,6 @@
 # Verification
 
-Results for sandboxd v0.0.16 against the acceptance criteria in the spec.
+Results for sandboxd v0.0.17 against the acceptance criteria in the spec.
 
 Environment:
 
@@ -177,7 +177,7 @@ ok   readyz.nsjail                True
 ### 1. healthz
 ok   healthz.status               ok
 ### 2. meta
-ok   meta.version                 0.0.16
+ok   meta.version                 0.0.17
 ### 3. create workspace
 workspace id: ws_01M6BNEZGVE2AFRADVKB01FFC2
 ### 4. mkdir /src
@@ -1488,7 +1488,7 @@ passed=<N> failed=0
 - Multi-node storage is deferred; storage is local filesystem JSON.
 - DB-backed/dynamic authentication is deferred; keys are static in the config
   (bearer auth itself is exercised by `TestAuth*`).
-- Per-UID-per-workspace isolation is deferred to v0.1 (v0.0.16 uses a shared
+- Per-UID-per-workspace isolation is deferred to v0.1 (v0.0.17 uses a shared
   `sandbox` UID/GID with per-run user namespaces and cgroups).
 - `rlimit_fsize` bounds a single file, and `disk_mb` is enforced on the file API
   path and via a `du` recheck on workspace load; it is not enforced by the

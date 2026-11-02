@@ -1,4 +1,4 @@
-# sandboxd specification (v0.0.16)
+# sandboxd specification (v0.0.17)
 
 This document is the canonical specification for the sandboxd service. It is a
 faithful copy of the project brief, retained in-repo so implementation and
@@ -15,9 +15,9 @@ belong to the separate frontend product, §2.6.)
 
 - Language: Go 1.22 (the brief targeted 1.22; `go.mod` requires Go 1.23 because
   the mandated koanf YAML parser declares a `go 1.23` floor — see
-  [DECISIONS.md](DECISIONS.md)). The service version string is `0.0.16`
+  [DECISIONS.md](DECISIONS.md)). The service version string is `0.0.17`
   (`model.Version`): it is the highest feature group resolved in DECISIONS.md
-  (which runs to v0.0.16), not the `/v1` API contract version. The two move
+  (which runs to v0.0.17), not the `/v1` API contract version. The two move
   independently — the API prefix changes only on a breaking contract change.
 - OS: Ubuntu Noble (24.04), x86_64.
 - Router: `github.com/go-chi/chi/v5`.
@@ -30,12 +30,12 @@ belong to the separate frontend product, §2.6.)
 - Lint: `golangci-lint` if available; otherwise `go vet ./...` must pass.
 - Sandbox: `nsjail` (may or may not be installed on the host — the service must
   detect and report via `/readyz`, never crash).
-- No external DB. Storage is filesystem JSON under `./data/` in v0.0.16.
+- No external DB. Storage is filesystem JSON under `./data/` in v0.0.17.
 - The service version string (`model.Version`) tracks the highest feature group
-  resolved in [DECISIONS.md](DECISIONS.md) (currently v0.0.16), **not** the `/v1`
+  resolved in [DECISIONS.md](DECISIONS.md) (currently v0.0.17), **not** the `/v1`
   API contract version: the API prefix changes only on a breaking contract
   change, so the two are deliberately decoupled. The decision log's own
-  per-group labels (v0.0.6 … v0.0.16) are the version history this number
+  per-group labels (v0.0.6 … v0.0.17) are the version history this number
   follows.
 - Everything must build with `go build ./...` and pass `go test ./...`.
 - Generate OpenAPI 3.1 spec at `api/openapi.yaml` — it is the source of truth
@@ -54,7 +54,7 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 
 - `GET /healthz` → 200 `{"status":"ok"}`
 - `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str}}`
-- `GET /v1/meta` → `{"version":"0.0.16","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
+- `GET /v1/meta` → `{"version":"0.0.17","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
 - `GET /metrics` → Prometheus text
 
 #### What a workspace can and cannot observe
@@ -545,7 +545,7 @@ What is **still not implemented** (the honest non-goal):
 
 Stated precisely: **stop-everything for a workspace exists natively now;
 supervision (desired-state restart/autostart) remains a documented non-goal for
-this version** (v0.0.16). Where such a capability would belong if built — an
+this version** (v0.0.17). Where such a capability would belong if built — an
 engine-level supervisor versus the frontend restarting runs — is recorded in
 [DECISIONS.md](DECISIONS.md) #61. **It is deliberately not implemented in this
 version.**

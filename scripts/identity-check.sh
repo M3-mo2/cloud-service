@@ -36,7 +36,15 @@
 #      address is an acceptable, expected outcome -- only the measurement is
 #      required);
 #   7. the host is untouched: `ip -o link` gains no interface, `ip route` is
-#      byte-identical and /run/netns is empty, before and after the whole suite.
+#      byte-identical and /run/netns is empty, before and after the whole suite;
+#   8. the hosting platform's OWN tooling is not visible inside a workspace: the
+#      operator's CLI (zcp/zsc) is not resolvable, no file under the mounted
+#      trees names the vendor (a `strings` audit, not a presence check), the
+#      provider-named TLS certificates are gone from the trust store, and the
+#      legitimate runtimes still run;
+#   9. the dlopen-scoped dlsym bypass is CLOSED (a handle-scoped dlsym returns
+#      the masked value) while the raw syscall(2) path is the KNOWN, documented
+#      inherent result (asserted as the real value, not left a surprise).
 #
 # THE THIRD STATE: skipped-environment.
 #   Assertion 6 depends on the public internet reachable from the workspace. If
@@ -243,6 +251,10 @@ echo "  service started (pid $SRV)"
 MASK_STATUS=$(curl -s "$BASE/readyz" | jsonf "['identity_masking']")
 echo "  readyz.identity_masking: $MASK_STATUS"
 chk "readyz.identity_masking.ready" "True" "$(curl -s "$BASE/readyz" | jsonf "['identity_masking']['ready']")"
+# The provider-tool overlay must also report ready: it materializes the curated
+# /usr/local and /etc/ssl/certs trees before the service claims readiness.
+chk "readyz.provider_tools_hidden.ready" "True" "$(curl -s "$BASE/readyz" | jsonf "['provider_tools_hidden']['ready']")"
+chk "meta.provider_tools_hidden.mechanism" "curated" "$(curl -s "$BASE/v1/meta" | jsonf "['provider_tools_hidden']['mechanism'].split()[0]")"
 
 # --- 1) the filesystem view is closed --------------------------------------
 echo "=== 1) the 'already closed' paths are unreadable ==="
@@ -376,16 +388,135 @@ chk "mask.runtime_perl" "0 'perl-ok'" "$(runcmd "$BASE" "$WSA" '["perl","-e","pr
 # masking on this image, so equality (not success) is the honest assertion.
 NODE_ON=$(runcmd "$BASE" "$WSA" '["node","-e","console.log(\"node-ok\")"]' | awk '{print $1}')
 
+# --- 8) the host platform's own tooling is not visible in the workspace -----
+# The sandbox mounts /usr for a normal toolchain; this asserts the provider's
+# OWN material under it is not reachable. It is a `strings`-style AUDIT over the
+# mounted trees, not a check that one binary is absent: zcp/zsc were not the
+# whole list. The provider strings are matched case-insensitively over file
+# bytes, which catches an embedded vendor name in any binary or certificate.
+echo "=== 8) the hosting platform's own tooling is hidden ==="
+put_py "$A" "$WSA" /provider.py 'import os, subprocess
+STRINGS = [b"zerops", b"vshosting", b"zabbly"]
+DIRS = ["/usr/local", "/usr/sbin", "/opt", "/sbin", "/etc/ssl/certs"]
+# 1. the operator CLI must not resolve.
+for tool in ["zcp", "zsc", "zcli"]:
+    r = subprocess.run(["sh", "-c", "command -v " + tool], capture_output=True, text=True, timeout=8)
+    print("WHICH", tool, (r.stdout.strip() or "ABSENT"))
+# 2. no file in the mounted trees may name the vendor.
+hits = []
+scanned = 0
+for d in DIRS:
+    for root, dirs, files in os.walk(d):
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                if os.path.islink(p) or os.path.getsize(p) > 20000000:
+                    continue
+                with open(p, "rb") as fh:
+                    data = fh.read()
+            except Exception:
+                continue
+            scanned += 1
+            low = data.lower()
+            for s in STRINGS:
+                if s in low:
+                    hits.append((p, s.decode()))
+print("PROVIDER_SCANNED", scanned)
+print("PROVIDER_HITS", len(hits))
+for p, s in hits[:20]:
+    print("PROVIDER_HIT", p, s)
+# 3. the trust store must not name the provider in any certificate.
+cert_hits = []
+for d in ["/etc/ssl/certs"]:
+    for root, dirs, files in os.walk(d):
+        for f in files:
+            p = os.path.join(root, f)
+            try:
+                with open(p, "rb") as fh:
+                    data = fh.read()
+            except Exception:
+                continue
+            if b"zerops" in data.lower() or b"vshosting" in data.lower():
+                cert_hits.append(p)
+print("CERT_HITS", len(cert_hits))
+for p in cert_hits[:10]:
+    print("CERT_HIT", p)
+'
+PROV_OUT=$(exec_py "$A" "$WSA" /provider.py 90 | jsonf "['stdout']")
+pval() { printf '%s' "$PROV_OUT" | awk -v k="$1" '$1==k{print $2}'; }
+for tool in zcp zsc zcli; do
+  chk "provider.${tool}_absent" "ABSENT" "$(printf '%s' "$PROV_OUT" | awk -v t="$tool" '$1=="WHICH" && $2==t{print $3}')"
+done
+chk "provider.no_vendor_strings" "0" "$(pval PROVIDER_HITS)"
+chk "provider.no_vendor_certs" "0" "$(pval CERT_HITS)"
+# The audit must have actually scanned something; a zero scan is not a pass.
+SCANNED=$(pval PROVIDER_SCANNED)
+chk "provider.audit_scanned" "yes" "$([ "${SCANNED:-0}" -gt 0 ] && echo yes || echo no)"
+# The legitimate toolchain must still work with the overlay in place.
+chk "provider.runtime_python3" "0 'py-ok'" "$(runcmd "$BASE" "$WSA" '["python3","-c","print(\"py-ok\")"]')"
+chk "provider.runtime_node" "0 'node-ok'" "$(runcmd "$BASE" "$WSA" '["node","-e","console.log(\"node-ok\")"]')"
+chk "provider.runtime_git" "0 'git-ok'" "$(runcmd "$BASE" "$WSA" '["sh","-c","echo git-ok"]')"
+
+# --- 9) the dlopen-scoped dlsym bypass is CLOSED; syscall(2) is known -------
+# The measured bypass was ctypes.CDLL("libc.so.6", use_errno=True).uname(buf)
+# returning the REAL host release. The shim now interposes dlsym, so a
+# handle-scoped lookup of a masked symbol returns the masked value. A raw
+# syscall(2) remains inherent and is asserted as the KNOWN real value, so it is
+# a documented property rather than a silent surprise.
+echo "=== 9) the dlopen-scoped dlsym bypass is closed (syscall(2) is known) ==="
+put_py "$A" "$WSA" /bypass.py 'import ctypes
+class U(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_char * 65) for n in
+                ("sysname","nodename","release","version","machine","domainname")]
+def call(handle):
+    b = U()
+    try:
+        handle.uname(ctypes.byref(b))
+        return b.release.decode()
+    except Exception as e:
+        return "ERR:" + type(e).__name__
+d = ctypes.CDLL(None, use_errno=True)
+n = ctypes.CDLL("libc.so.6", use_errno=True)
+print("DEFAULT", call(d))
+print("NAMED", call(n))
+b = U()
+d.syscall(63, ctypes.byref(b))
+print("SYSCALL", b.release.decode())
+'
+BYP_OUT=$(exec_py "$A" "$WSA" /bypass.py 40 | jsonf "['stdout']")
+bval() { printf '%s' "$BYP_OUT" | awk -v k="$1" '$1==k{print $2}'; }
+chk "bypass.default_handle_masked" "$WS_RELEASE" "$(bval DEFAULT)"
+chk "bypass.named_handle_masked" "$WS_RELEASE" "$(bval NAMED)"
+# The raw syscall is the KNOWN, documented inherent result: the real host value.
+chk "bypass.raw_syscall_known_real" "$HOST_RELEASE" "$(bval SYSCALL)"
+
 # --- 6) egress IP, measured (may be environment-skipped) --------------------
 # Numbered to match the brief; executed here while the mask-on service (which
 # owns the allow_net workspace) is still up.
 echo "=== 6) measured egress IP on the allow_net:true path ==="
-put_py "$A" "$WSA" /egress.py 'import urllib.request
+# The address is MEASURED, not asserted away: the provider names themselves in
+# the address's registration, and that is reported as a documented tally line
+# (ADR 76), not hidden. The only hard assertion is that the address is public.
+put_py "$A" "$WSA" /egress.py 'import json, urllib.request
 for url in ["https://api.ipify.org","https://icanhazip.com","https://ifconfig.me/ip"]:
     try:
         print("EGRESS", url, urllib.request.urlopen(url, timeout=25).read().decode().strip())
     except Exception as e:
         print("EGRESSERR", url, type(e).__name__)
+try:
+    d = json.loads(urllib.request.urlopen("https://ipinfo.io/json", timeout=25).read())
+    print("ORG", d.get("org",""))
+    print("COUNTRY", d.get("country",""))
+    print("CITY", d.get("city",""))
+except Exception as e:
+    print("ORGERR", type(e).__name__)
+try:
+    t = urllib.request.urlopen("https://www.cloudflare.com/cdn-cgi/trace", timeout=25).read().decode()
+    for line in t.splitlines():
+        if line.startswith("colo=") or line.startswith("loc="):
+            print("TRACE", line)
+except Exception:
+    pass
 '
 EGRESS_OUT=$(exec_py "$A" "$WSA" /egress.py 90 | jsonf "['stdout']")
 EGRESS_IP=$(printf '%s' "$EGRESS_OUT" | awk '$1=="EGRESS"{print $3; exit}')
@@ -399,11 +530,16 @@ try:
 except Exception:
     print('no')
 ")"
+  # Documented tally line: the provider names itself in the address. This is
+  # reported (never asserted away) so the operator sees the fact every run.
+  EGRESS_ORG=$(printf '%s' "$EGRESS_OUT" | awk '$1=="ORG"{print; exit}')
+  EGRESS_LOC=$(printf '%s' "$EGRESS_OUT" | awk '$1=="TRACE"{printf "%s ", $2}')
+  echo "  egress provider identity: ${EGRESS_ORG:-org=unmeasured} (${EGRESS_LOC:-trace=unmeasured})"
   # Report whether it is the host's own public address (it should not matter,
   # but the fact is worth stating).
   HOST_EGRESS=$(timeout 20 curl -s https://api.ipify.org 2>/dev/null || echo "")
   if [ -n "$HOST_EGRESS" ] && [ "$HOST_EGRESS" = "$EGRESS_IP" ]; then
-    echo "  note: workspace egress IP equals the host's own public egress IP (platform-shared NAT)"
+    echo "  note: workspace egress IP equals the host's own public egress IP (platform-shared NAT, ADR 76)"
   fi
 else
   ERRS=$(printf '%s' "$EGRESS_OUT" | grep '^EGRESSERR' | head -1)

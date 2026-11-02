@@ -753,22 +753,61 @@ evasions, both **measured**:
   writable; the Go test asserts the mount is read-only and the render refuses
   with `ErrMaskUnavailable` when the shim cannot be materialized).
 
-**Not closable by this mechanism — stated, not implied away.** Preload
-interposition has three honest holes, and they are properties of the mechanism,
-not defects:
+**Inherently bypassable vs a gap we closed — a corrected classification.** An
+earlier version of this ADR filed *every* `dlsym`/`dlopen` route as "not closable
+by this mechanism". That was wrong: a **handle-scoped `dlsym`** of an interposed
+symbol is a gap in the shim, not a property of preload interposition, and it is
+now **closed**. The two classes are kept separate on purpose:
+
+**A. Closed this iteration (a gap in the shim, now shut).**
+`dlopen("libc.so.6")` returns a SPECIFIC object handle, and `dlsym(handle, …)`
+on it searches only libc's local scope — deliberately skipping a preload shim.
+Measured before the fix, `ctypes.CDLL("libc.so.6", use_errno=True).uname(buf)`
+returned the **real** `7.1.8-zabbly+` **with no raw syscall at all**. The shim
+now interposes `dlsym` itself and answers a request for a masked symbol, from
+**any** handle, with the shim's own function — the same value the `RTLD_DEFAULT`
+path already returned. Measured closed (`scripts/identity-check.sh` assertion 8,
+`docs/VERIFICATION.md`): `CDLL("libc.so.6")`, `CDLL("/lib/…/libc.so.6")`,
+`libc.dlopen` + `dlsym`, `dlmopen(LM_ID_NEWLM)`, and `dlsym(RTLD_NEXT, "uname")`
+all return the masked value.
+
+**Residual inside this class: a handle-scoped `dlvsym(3)`.** `dlvsym(handle,
+"uname", "GLIBC_2.2.5")` still reaches the real value. The shim does **not**
+interpose `dlvsym`: on this glibc, defining both `dlsym` and `dlvsym` makes a
+versioned reference (`dlsym@GLIBC_2.2.5`) bind back to the shim's own unversioned
+definition and the dynamic loader's bootstrap then recurses at process start —
+measured, reproducible; interposing `dlsym` alone is stable and closes the
+measured one-liner. `dlvsym` requires compiled code or a FFI that exposes it
+(CPython's `ctypes` does not; `ctypes.CDLL` is `dlsym`-based), so the practical
+one-liner is closed; the residual is documented rather than hidden.
+
+**B. Inherently bypassable (properties of the mechanism / the kernel ABI).**
 
 1. **A statically-linked binary** does not run the dynamic loader at all, so it
    is not intercepted and sees the real host values.
 2. **A non-glibc runtime (musl, e.g. an Alpine-built binary)** is loaded by
    musl's own loader, which does not read `/etc/ld.so.preload`.
-3. **A direct `syscall(2)`** with a raw `uname`/`sysinfo` bypasses libc.
+3. **A direct `syscall(2)`** with a raw `uname`/`sysinfo` completely bypasses
+   libc and every interposer by construction.
 
-Measured example: `python3 -c` calling `ctypes` `syscall(63, buf)` (raw `uname`)
-returns the real `7.1.8-zabbly+` even with the shim active. The masking layer is
-therefore **defense-in-depth, not a security boundary**. Its limits are reported
-truthfully in `/readyz` and `/v1/meta` (`identity_masking.limits`) and printed
-in the config example, so an operator is never told the property is stronger
-than it is.
+The masking layer is therefore **defense-in-depth, not a security boundary**. Its
+limits — now split into "closed" and "inherent" — are reported truthfully in
+`/readyz` and `/v1/meta` (`identity_masking.limits` says *"a statically-linked
+binary, a musl runtime, a raw syscall(2), or a handle-scoped dlvsym(3) bypasses
+the shim"*) and printed in the config example.
+
+**The raw-syscall result is a KNOWN, asserted outcome, not a surprise.**
+`libc.syscall(63, buf)` (raw `uname`) returns the real `7.1.8-zabbly+`, and
+`libc.syscall(99, sysinfo_buf)` returns the host's real `totalram` and `procs`.
+`scripts/identity-check.sh` **asserts both as expected** (assertion 9): a tenant
+who takes this route is *expected* to see the host values, because no glibc-level
+shim can sit under the kernel ABI. **What a tenant actually learns and can do:**
+they learn the host's real kernel string, that the box is large (≈540 GB / many
+cores) and shared, and the current process count — enough to *fingerprint the
+machine and size an attack*, but **not** to read another workspace, escape the
+namespace, or reach the host (the mount/pid/net/cgroup namespaces still hold);
+the raw syscall is an oracle, not a door. Because the outcome is asserted, the
+next reader cannot mistake it for a regression.
 
 **Rejected alternatives.** (a) **`LD_PRELOAD` via the env allowlist** — an
 environment variable a tenant clears with `env -i`; measured to be defeated by
@@ -808,7 +847,128 @@ host's.
 capped at 1 CPU / 256 MB reports `uname.release=0.0.0-sandbox`,
 `os.cpu_count()=1`, `sysconf(_SC_PHYS_PAGES)·4096=268435456`, and `env -i nproc=1`;
 with masking off it reports `7.1.8-zabbly+`, `2` and `540675186688` — the host.
-`scripts/identity-check.sh`: **31 passed / 0 failed / 0 skipped**.
+
+### ADR 74 — The hosting platform's own tooling is not visible inside a workspace
+
+**Problem.** The sandbox bind-mounts the host's whole `/usr` (`src: "/usr"`,
+`dst: "/usr"`, `rw: false`) so a workload gets a normal toolchain. That also
+brought in `/usr/local`, which on this platform carries the **operator's own
+control binaries** and vendor material. Measured inside a real workspace with
+`identity.enabled=true`:
+
+```
+$ command -v zcp      → /usr/local/bin/zcp
+$ ls /usr/local/bin/  → cloudflared nsjail yq zcp zsc
+$ strings /usr/local/bin/zcp | grep -i zerops
+    ZEROPS_Y
+    ub.com/zeropsio          ← the vendor's GitHub org
+```
+
+A full audit (not just `zcp`) found the vendor-named material under the mounted
+trees: `/usr/local/bin/{zcp,zsc,yq}` (zsc additionally embeds the vendor's
+database templates, `/opt/zerops/bin`, `ZeropsPassword`, and internal
+`*.zerops` service names), `/usr/local/sbin/includes/basic_inc`
+(`bubenik@vshosting.cz`), the vendor CA sources under
+`/usr/local/share/ca-certificates/` (`O = Zerops Infra`, `CN = Zerops Infra Root
+CA`), and the Go toolchain at `/usr/local/go` (a large host-tree mount).
+
+**Decision.** A new default-on switch `identity.hide_provider_tools`. When it is
+on, the sandbox **overlays** `/usr/local` and `/etc/ssl/certs` with curated,
+read-only copies:
+
+- **`/usr/local`** is replaced by an operator-providable curated directory
+  (`identity.tools_dir`). When no directory is configured it is **empty**: the
+  workspace keeps the whole of `/usr/bin` (where `python3`, `node`, `bash`,
+  `perl`, `git`, `curl` and the Go-less toolchain live) and sees **no** host
+  `/usr/local` material. A curated directory is preferred over exposing a real
+  host directory because the host directory is exactly what leaks.
+- **`/etc/ssl/certs`** is rebuilt from the host's own trust store with every
+  certificate that **names the provider** dropped — from the per-certificate
+  files and from the concatenated `ca-certificates.crt` bundle. The provider's
+  name lives in the **decoded DER** subject/issuer, not the base64 PEM text, so
+  the filter decodes each certificate before testing (a base64 substring test
+  finds nothing; measured). Generic roots are untouched, so TLS keeps working.
+
+Both mounts are `mandatory: true`: if a curated tree cannot be mounted the run
+**aborts** (`503 sandbox_unavailable`) rather than expose the host's directory —
+the same fail-loud contract as the masking shim. The overlay is materialized by
+the same one-time `masker.prepare()` pass into the service tmp dir, owned by the
+orchestrator; a workspace cannot write it, and it is bind-mounted read-only.
+
+**Why not "hide the strings by stripping binaries"?** The binary is the
+operator's; modifying it would break their tooling and signatures. The workspace
+does not need it, so the correct fix is not to mount it.
+
+**Vendor-string audit is asserted, not assumed.** `scripts/identity-check.sh`
+assertion 8 runs `strings` over **every** mounted binary path (not just checks
+that `zcp` is absent) and asserts none names the provider, while asserting
+`python3`/`node`/`bash`/`perl`/`git` still run. This is the lesson from the
+brief: `zcp`/`zsc` were not the whole list.
+
+**Honest limit.** `/usr/bin` still contains distro packages; the filter hides
+*files that name this provider*, not every byte of a large distro. It does not
+touch the egress address (ADR 76).
+
+### ADR 75 — The `dlopen`-scoped `dlsym` bypass is closed, not inherent
+
+**Problem.** ADR 72's original text classified the `syscall(2)` family
+(including `dlsym`-after-`dlopen`) as one blob of inherent holes. Measurement
+showed at least one member was a **shim gap**: `ctypes.CDLL("libc.so.6")` then
+`.uname(buf)` returned the real host release with **no raw syscall**.
+
+**Decision.** Interpose `dlsym` in the shim. A handle-scoped lookup of a masked
+symbol is answered with the shim's own function for any handle; all other lookups
+pass through. Measured closed: `CDLL("libc.so.6")`, `CDLL(abs path)`,
+`libc.dlopen`+`dlsym`, `dlmopen(LM_ID_NEWLM)`, `dlsym(RTLD_NEXT,"uname")`,
+`dlsym(RTLD_DEFAULT,"uname")`. **Not** interposed: `dlvsym` — on this glibc,
+defining both makes the loader bootstrap recurse (a versioned reference binds to
+the unversioned definition), measured. The residual `dlvsym(handle, …)` route is
+documented and asserted as the known remaining gap (assertion 8). The full
+classification is in the corrected ADR 72.
+
+**Consequence for the raw-syscall path.** `syscall(63)`/`syscall(99)` remain
+inherent. They are now asserted as an **expected, documented** result
+(`identity-check.sh` assertion 9), with the one-line reality written down in ADR
+72: a tenant learns the real kernel string, that the host is large/shared, and
+the process count — an oracle for fingerprinting and attack-sizing, not a route
+to another workspace or the host.
+
+### ADR 76 — The egress address names the provider; an egress proxy is opt-in
+
+**Problem.** A workspace with `allow_net` reaches the internet through the
+platform's shared NAT. That address names the provider in several independent
+ways: `ipinfo.io` reports `org: "AS43541 VSHosting s.r.o."` (Prague, CZ); RDAP
+at RIPE reports the block's registered name `ZEROPS-IO`; `ipwho.is` reports
+Czechia/Prague; the Cloudflare trace says `colo=PRG loc=CZ`; and the reverse DNS
+of the neighbouring address `93.185.106.1` is `gw.vshosting.cz`. The address is
+`93.185.106.128`, which is **also the host's own egress**.
+
+**Measured this session (the NEEDS-CONFIRMATION item).** No egress address
+outside the vendor's registered ranges is obtainable on this platform: the host
+has exactly one public path (the `10.9.112.0/22` private interface NATed to
+`93.185.106.128`; the `/32` addresses on `lo` are private), there is **no** proxy
+configured or available (`env` carries no `*_proxy`), and `93.185.106.0/24` is
+registered to `ZEROPS-IO` (`MNT-VSHOSTING`, `VS2641-RIPE`). Changing the source
+address is therefore **structurally out of reach** from inside this platform.
+
+**Decision.** Record the fact honestly and add **one opt-in knob**, default
+**off**: `network.egress_proxy` (an optional outbound HTTP/SOCKS proxy a
+workspace's egress is routed through). It defaults off because, when on, it
+**changes the outbound address and therefore the operator's abuse/reputation
+profile** — that is the operator's call, not a default the engine applies. With
+it off (the default) the workspace uses the platform NAT and the provider is
+named, exactly as measured; the operator is told this plainly. The knob exists so
+an operator who *does* run a proxy can point at it; the engine never invents one.
+A rented/proxied egress is the only path to a differently-registered address on
+this platform, and it is the operator's to choose.
+
+**What a tenant can infer, and what the operator can change.** A tenant can
+learn the provider (AS/org/registry name/country) and the shared-NAT address
+from a "what is my IP" call; they cannot reach the host LAN or another workspace
+through it (the relay blackholes every private range). The operator can change
+nothing about the address on this platform except by introducing an external
+proxy — which is why the knob is off by default and documented as a reputation
+decision.
 
 ## Additional defaults chosen during implementation
 

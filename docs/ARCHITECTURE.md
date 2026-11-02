@@ -5,7 +5,7 @@
 > sandbox. Diagrams are [Mermaid](https://mermaid.js.org/); they render on
 > GitHub/GitLab and in most Markdown viewers.
 
-- Version: **0.0.16** (pre-alpha)
+- Version: **0.0.17** (pre-alpha)
 - Language: Go 1.23+
 - Isolation: [`nsjail`](https://github.com/google/nsjail) (Linux namespaces,
   cgroups v2, seccomp, rlimits)
@@ -71,7 +71,7 @@ services** that call it on a user's behalf — not the users themselves.
 
 See [DECISIONS.md](DECISIONS.md) #54 for the decision and its consequences.
 
-### What it deliberately is *not* (v0.0.16)
+### What it deliberately is *not* (v0.0.17)
 
 Pre-alpha scope. It is a single-node, static-key service. Not yet: a hardened
 public-internet multi-tenant platform, a distributed scheduler, or a
@@ -1037,11 +1037,11 @@ set `NSJAIL=/usr/local/bin/nsjail` and it will verify the binary is real.
 
 Deferred to v0.1 (documented, not bugs):
 
-- **SSE log streaming** — v0.0.16 polls logs with `offset`/`limit`.
+- **SSE log streaming** — v0.0.17 polls logs with `offset`/`limit`.
 - **Multi-node storage / sharding** — storage is a local filesystem.
 - **Dynamic/DB authentication** — keys are static in config (bearer auth itself
   is exercised by `TestAuth*`).
-- **Per-UID-per-workspace isolation** — v0.0.16 uses a shared `sandbox` UID/GID
+- **Per-UID-per-workspace isolation** — v0.0.17 uses a shared `sandbox` UID/GID
   with per-run user namespaces + cgroups.
 - **Kernel-enforced per-run disk quota** — disk is accounted on the file API
   path and rechecked with `du`; the sandbox process is bounded by `rlimit_fsize`

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: sandboxd API
-  version: 0.0.16
+  version: 0.0.17
   description: |
     Secure per-principal code execution backend. All `/v1` endpoints require a
     static bearer API key. All timestamps are RFC3339 UTC.
@@ -1242,7 +1242,7 @@ components:
       type: object
       required: [version, api_version, runtimes, limits_defaults]
       properties:
-        version: { type: string, examples: ["0.0.16"] }
+        version: { type: string, examples: ["0.0.17"] }
         api_version: { type: string, examples: [v1] }
         runtimes:
           type: array

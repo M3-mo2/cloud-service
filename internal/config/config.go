@@ -127,6 +127,17 @@ type NetworkConfig struct {
 	// StartTimeoutMS bounds how long a slirp instance is given to configure its
 	// tap before the interface is treated as up (default 5000).
 	StartTimeoutMS int `koanf:"start_timeout_ms"`
+	// EgressProxy, when set, is an outbound proxy URL (http://host:port or
+	// socks5://host:port) that an allow_net workspace's tooling is told to use,
+	// via the standard HTTP_PROXY/HTTPS_PROXY/ALL_PROXY environment variables.
+	// Default empty (off): the workspace egresses through the platform's shared
+	// NAT, whose address is registered to the hosting provider (see
+	// docs/DECISIONS.md ADR 76). Setting it changes the outbound address and
+	// therefore the operator's abuse/reputation profile, so it is the operator's
+	// explicit choice, never a default. It is a soft mechanism: a program that
+	// ignores the proxy environment variables, or reaches an address directly,
+	// is not constrained by it.
+	EgressProxy string `koanf:"egress_proxy"`
 }
 
 // TunnelsConfig controls quick Cloudflare tunnels (cloudflared), exposing one
@@ -420,6 +431,7 @@ func Default() Config {
 			MTU:            65520,
 			Resolver:       []string{"1.1.1.1", "8.8.8.8"},
 			StartTimeoutMS: 5000,
+			EgressProxy:    "",
 		},
 		Tunnels: TunnelsConfig{
 			Enabled:         false,
@@ -669,6 +681,7 @@ network:
   mtu: 65520
   resolver: ["1.1.1.1", "8.8.8.8"]
   start_timeout_ms: 5000
+  egress_proxy: ""
 tunnels:
   enabled: false
   max_per_workspace: 2

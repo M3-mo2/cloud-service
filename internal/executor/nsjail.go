@@ -935,6 +935,17 @@ var allowedEnvKeys = map[string]bool{
 	"LC_ALL":                  true,
 	"LC_CTYPE":                true,
 	"TZ":                      true,
+	// The standard proxy variables, used only when an operator sets
+	// network.egress_proxy (off by default; see ADR 76). They are a soft
+	// opt-in mechanism, never set by the engine unless the operator asks.
+	"HTTP_PROXY":  true,
+	"HTTPS_PROXY": true,
+	"ALL_PROXY":   true,
+	"NO_PROXY":    true,
+	"http_proxy":  true,
+	"https_proxy": true,
+	"all_proxy":   true,
+	"no_proxy":    true,
 }
 
 // allowEnvKey reports whether a variable name may be passed into the sandbox.

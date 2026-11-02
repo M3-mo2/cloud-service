@@ -106,6 +106,20 @@ func (s *Service) ApplyNetwork(w *model.Workspace, req executor.Request) (execut
 		if hc, err := s.net.WriteHostsConf(alloc); err == nil {
 			req.HostsConf = hc
 		}
+		// Optional operator-chosen egress proxy (off by default; see ADR 76).
+		// It is injected as the standard proxy environment variables, so it is
+		// a soft mechanism: a program that ignores them is unaffected.
+		if p := s.cfg.Network.EgressProxy; p != "" {
+			if req.Env == nil {
+				req.Env = map[string]string{}
+			}
+			req.Env["HTTP_PROXY"] = p
+			req.Env["HTTPS_PROXY"] = p
+			req.Env["ALL_PROXY"] = p
+			req.Env["http_proxy"] = p
+			req.Env["https_proxy"] = p
+			req.Env["all_proxy"] = p
+		}
 		return req, nil
 	}
 	// Not opted in (or egress disabled): a private, empty namespace. The

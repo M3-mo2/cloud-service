@@ -137,6 +137,16 @@ network:
   resolver: ["1.1.1.1", "8.8.8.8"]
   # How long a slirp instance is given to configure its interface.
   start_timeout_ms: 5000
+  # Optional outbound proxy for a workspace's egress (http:// or socks5://).
+  # DEFAULT EMPTY (off). With it off a workspace egresses through the platform's
+  # shared NAT, whose address is registered to the hosting provider and names
+  # them (AS/org/registry/country); see docs/DECISIONS.md ADR 76. Setting a
+  # proxy CHANGES THE OUTBOUND ADDRESS and therefore the operator's
+  # abuse/reputation profile, so it is the operator's explicit decision, never a
+  # default. It is a soft mechanism: it is injected as the standard
+  # HTTP(S)_PROXY/ALL_PROXY environment variables, so a program that ignores
+  # them, or opens an address directly, is not constrained by it.
+  egress_proxy: ""
 
 # Quick Cloudflare tunnels (one command -> public URL).
 #

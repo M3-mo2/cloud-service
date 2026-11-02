@@ -1,7 +1,7 @@
 # API guide
 
 Human-friendly, self-sufficient reference for the sandboxd HTTP/JSON API
-(v0.0.16). The machine-readable contract is
+(v0.0.17). The machine-readable contract is
 [api/openapi.yaml](../api/openapi.yaml); where the two disagree, **this document
 follows the implemented behaviour** and the disagreement is recorded in
 [Known discrepancies](#known-discrepancies) at the end.
@@ -188,7 +188,7 @@ default per-workspace limits.
 
   ```json
   {
-    "version": "0.0.16",
+    "version": "0.0.17",
     "api_version": "v1",
     "runtimes": ["python3"],
     "interpreters": ["bash", "node", "perl", "python3"],
@@ -2142,7 +2142,7 @@ out-of-band changes cannot drift the quota.
   empty (no egress). With `allow_net:true` it is connected to the public internet
   through chained slirp4netns over UNIX sockets — the host network namespace is
   never shared, and the host LAN is blackholed. There is no host allowlist in
-  v0.0.16 (see [Quick tunnels and egress](#quick-tunnels-and-egress)).
+  v0.0.17 (see [Quick tunnels and egress](#quick-tunnels-and-egress)).
 - **Syscalls:** a default-allow seccomp policy KILLs a denylist of dangerous
   syscalls (`mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`,
   module loading, …). `cgroup v2` ceilings require the container to run with
@@ -2172,7 +2172,7 @@ curl -s $BASE/readyz
 # {"cgroups":true,"data_dir":true,"nsjail":true,"status":"ready"}
 
 curl -s -H "$AUTH" $BASE/v1/meta
-# {"version":"0.0.16","api_version":"v1", ... }
+# {"version":"0.0.17","api_version":"v1", ... }
 
 WS=$(curl -s -H "$AUTH" -H "$JSON" \
   -d '{"name":"demo","limits":{"memory_mb":256}}' \
