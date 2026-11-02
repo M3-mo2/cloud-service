@@ -14,6 +14,8 @@
  *                    consumer that counts CPUs (nproc, node's os.cpus()) sees
  *                    the workspace's count even when it does not call sysconf.
  *     getauxval(3)   AT_HWCAP/AT_HWCAP2         -> 0 (no host CPU fingerprint)
+ *     dlsym(3) of a masked symbol (any handle)  -> the shim's own function, so
+ *                    a handle-scoped lookup cannot step behind the shim.
  *
  * WHY IT IS REACHED
  *   It is named in /etc/ld.so.preload, which the dynamic loader reads for EVERY
@@ -22,6 +24,19 @@
  *   (measured). The file and the shim are bind-mounted READ-ONLY by nsjail, so a
  *   tenant cannot replace them.
  *
+ * THE dlopen-SCOPED LOOKUP (closed; this is NOT an inherent limit)
+ *   `dlopen("libc.so.6")` returns a SPECIFIC object handle, and `dlsym` on that
+ *   handle normally searches only that object's local scope -- which skips this
+ *   shim. The shim therefore interposes `dlsym` itself: a request to resolve one
+ *   of the masked symbols from ANY handle is answered with the shim's own
+ *   function, the same value the RTLD_DEFAULT path already returns. This is
+ *   idiomatic dlsym interposition (the symbol interposed is the same symbol that
+ *   is being looked up), measured to close CDLL("libc.so.6"),
+ *   CDLL("/lib/.../libc.so.6"), libc.dlopen+dlsym, dlmopen, and
+ *   dlsym(RTLD_NEXT, "uname"). The residual is a handle-scoped dlvsym(3) call;
+ *   see the block below on the bootstrap for why dlvsym is not interposed here.
+ *   See docs/VERIFICATION.md for the measured list.
+ *
  * HONEST LIMITS (documented in docs/DECISIONS.md, do NOT remove)
  *   - A STATICALLY-LINKED binary does not run the dynamic loader at all, so it
  *     is not intercepted and sees the real host values.
@@ -29,10 +44,11 @@
  *     musl's own loader, which does not read /etc/ld.so.preload, so it is not
  *     intercepted either.
  *   - A direct syscall (syscall(2) with a raw uname/sysinfo) bypasses libc.
- *   These are properties of preload-based interposition, not bugs; the masking
- *   layer is a defense-in-depth measure, not a security boundary. The /proc and
- *   /sys filesystem views remain hidden by the mount namespace, and those are
- *   what the acceptance suite asserts are unreadable.
+ *   The first two are properties of preload-based interposition; the raw syscall
+ *   is a property of the kernel ABI. The masking layer is defense-in-depth, not
+ *   a security boundary. The /proc and /sys filesystem views remain hidden by
+ *   the mount namespace, and those are what the acceptance suite asserts are
+ *   unreadable.
  *
  * CONFIGURATION
  *   The shim reads its answers from the environment:
@@ -60,6 +76,94 @@
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+
+/* Forward declarations of every function this shim interposes. They are needed
+ * before the dlsym interposer, which hands their addresses back to a caller. */
+int uname(struct utsname *buf);
+long sysconf(int name);
+int sysinfo(struct sysinfo *si);
+int sched_getaffinity(pid_t pid, size_t size, cpu_set_t *set);
+unsigned long getauxval(unsigned long type);
+size_t confstr(int name, char *buf, size_t len);
+const char *gnu_get_libc_version(void);
+
+/*
+ * THE dlopen-SCOPED dlsym BYPASS, AND WHY IT IS CLOSED BY dlsym INTERPOSITION.
+ *
+ * `dlopen("libc.so.6")` returns a SPECIFIC object handle. `dlsym(handle, ...)`
+ * on it searches libc's own local scope and deliberately SKIPS this preload
+ * shim, so `ctypes.CDLL("libc.so.6", use_errno=True).uname(buf)` returned the
+ * REAL host kernel with no raw syscall at all. That is a gap in the shim, not
+ * an inherent limit of preload interposition.
+ *
+ * The shim therefore interposes `dlsym` itself: a request for one of the
+ * masked symbols is answered with the shim's own function, exactly the value
+ * the RTLD_DEFAULT path already returns, for ANY handle. Every other lookup
+ * passes straight through, so no program is disturbed. Measured to close
+ * CDLL("libc.so.6"), CDLL("/lib/.../libc.so.6"), libc.dlopen+dlsym,
+ * dlsym(RTLD_NEXT,...) and the default handle (docs/VERIFICATION.md).
+ *
+ * BOOTSTRAP. The shim's OWN lookups must reach real libc without re-entering
+ * this interposer. They use `dlvsym(RTLD_NEXT, ...)`, and this shim deliberately
+ * does NOT interpose `dlvsym` -- interposing both `dlsym` and `dlvsym` on this
+ * glibc makes the loader's own bootstrap mutually recursive (a versioned
+ * reference can bind back to this object's unversioned definition), which
+ * crashes at process start. The RESIDUAL is therefore a handle-scoped
+ * `dlvsym(handle, "uname", "GLIBC_2.2.5")` lookup, which requires compiled code
+ * (ctypes does not expose dlvsym) and is documented honestly in ADR 72.
+ */
+typedef void *(*dlsym_fn)(void *, const char *);
+static dlsym_fn real_dlsym;
+
+static void *shim_next(const char *sym) {
+  if (!real_dlsym)
+    real_dlsym = (dlsym_fn)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+  return real_dlsym(RTLD_NEXT, sym);
+}
+
+/*
+ * is_masked_symbol reports whether a looked-up symbol is one whose answer the
+ * shim controls. It includes `dlsym` itself so a handle-scoped lookup of the
+ * loader API also resolves to the shim rather than stepping behind it.
+ */
+static int is_masked_symbol(const char *s) {
+  return s && (!strcmp(s, "uname") || !strcmp(s, "sysconf") ||
+               !strcmp(s, "sysinfo") || !strcmp(s, "sched_getaffinity") ||
+               !strcmp(s, "getauxval") || !strcmp(s, "confstr") ||
+               !strcmp(s, "gnu_get_libc_version") || !strcmp(s, "dlsym"));
+}
+
+/*
+ * dlsym interposes the symbol it is itself asked to resolve. A handle-scoped
+ * lookup of a masked symbol -- e.g. ctypes.CDLL("libc.so.6").uname, which
+ * resolves `uname` from the libc handle -- is answered with the shim's own
+ * function, exactly what the RTLD_DEFAULT path already returns. Every other
+ * lookup passes straight through to the real dlsym, so this cannot disturb a
+ * program. This closes a bypass that is NOT a raw syscall and therefore NOT an
+ * inherent limit of preload interposition (see docs/DECISIONS.md ADR 72).
+ */
+void *dlsym(void *handle, const char *symbol) {
+  if (is_masked_symbol(symbol)) {
+    if (!strcmp(symbol, "uname"))
+      return (void *)&uname;
+    if (!strcmp(symbol, "sysconf"))
+      return (void *)&sysconf;
+    if (!strcmp(symbol, "sysinfo"))
+      return (void *)&sysinfo;
+    if (!strcmp(symbol, "sched_getaffinity"))
+      return (void *)&sched_getaffinity;
+    if (!strcmp(symbol, "getauxval"))
+      return (void *)&getauxval;
+    if (!strcmp(symbol, "confstr"))
+      return (void *)&confstr;
+    if (!strcmp(symbol, "gnu_get_libc_version"))
+      return (void *)&gnu_get_libc_version;
+    return (void *)&dlsym;
+  }
+  if (!real_dlsym)
+    real_dlsym = (dlsym_fn)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+  return real_dlsym(handle, symbol);
+}
 
 #define SANDBOXD_FALLBACK_CPUS 1L
 #define SANDBOXD_FALLBACK_MEM (256L * 1024 * 1024)
@@ -91,7 +195,7 @@ typedef int (*uname_fn)(struct utsname *);
 int uname(struct utsname *buf) {
   static uname_fn real;
   if (!real)
-    real = (uname_fn)dlsym(RTLD_NEXT, "uname");
+    real = (uname_fn)shim_next("uname");
   int r = real(buf);
   if (r == 0) {
     copy_field(buf->release, sizeof(buf->release),
@@ -109,7 +213,7 @@ typedef long (*sysconf_fn)(int);
 long sysconf(int name) {
   static sysconf_fn real;
   if (!real)
-    real = (sysconf_fn)dlsym(RTLD_NEXT, "sysconf");
+    real = (sysconf_fn)shim_next("sysconf");
   switch (name) {
   case _SC_NPROCESSORS_ONLN:
   case _SC_NPROCESSORS_CONF:
@@ -131,7 +235,7 @@ typedef int (*sysinfo_fn)(struct sysinfo *);
 int sysinfo(struct sysinfo *si) {
   static sysinfo_fn real;
   if (!real)
-    real = (sysinfo_fn)dlsym(RTLD_NEXT, "sysinfo");
+    real = (sysinfo_fn)shim_next("sysinfo");
   int r = real(si);
   if (r == 0) {
     long mem = env_long("SANDBOXD_MASK_MEM_BYTES", SANDBOXD_FALLBACK_MEM);
@@ -161,7 +265,7 @@ typedef int (*affinity_fn)(pid_t, size_t, cpu_set_t *);
 int sched_getaffinity(pid_t pid, size_t size, cpu_set_t *set) {
   static affinity_fn real;
   if (!real)
-    real = (affinity_fn)dlsym(RTLD_NEXT, "sched_getaffinity");
+    real = (affinity_fn)shim_next("sched_getaffinity");
   int r = real(pid, size, set);
   if (r != 0)
     return r;
@@ -184,7 +288,7 @@ typedef unsigned long (*getauxval_fn)(unsigned long);
 unsigned long getauxval(unsigned long type) {
   static getauxval_fn real;
   if (!real)
-    real = (getauxval_fn)dlsym(RTLD_NEXT, "getauxval");
+    real = (getauxval_fn)shim_next("getauxval");
   /* CPU capability bits are a host fingerprint; report none of them. */
   if (type == AT_HWCAP || type == AT_HWCAP2)
     return 0;
@@ -214,7 +318,7 @@ typedef size_t (*confstr_fn)(int, char *, size_t);
 size_t confstr(int name, char *buf, size_t len) {
   static confstr_fn real;
   if (!real)
-    real = (confstr_fn)dlsym(RTLD_NEXT, "confstr");
+    real = (confstr_fn)shim_next("confstr");
   if (name == _CS_GNU_LIBC_VERSION) {
     char tmp[64];
     /* Ask the real confstr for the full string, then trim the suffix. A
@@ -241,7 +345,7 @@ size_t confstr(int name, char *buf, size_t len) {
 const char *gnu_get_libc_version(void) {
   static const char *(*real)(void);
   if (!real)
-    real = (const char *(*)(void))dlsym(RTLD_NEXT, "gnu_get_libc_version");
+    real = (const char *(*)(void))shim_next("gnu_get_libc_version");
   static char trimmed[64];
   strip_distro_suffix(trimmed, real(), sizeof(trimmed));
   return trimmed;
