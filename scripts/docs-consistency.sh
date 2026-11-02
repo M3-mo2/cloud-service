@@ -105,6 +105,8 @@ NEW_PATHS=(
   "/v1/workspaces/{id}/sessions/{sessionID}/output"
   "/v1/workspaces/{id}/processes"
   "/v1/workspaces/{id}/processes/{processID}/stop"
+  "/v1/workspaces/{id}/tunnels"
+  "/v1/workspaces/{id}/tunnels/{tunnelID}"
 )
 for p in "${NEW_PATHS[@]}"; do
   # SPEC.md uses the {id} spelling; accept the {workspaceID} spelling too.
@@ -185,6 +187,55 @@ else
   fail "process-harness.documented" "docs/VERIFICATION.md does not mention scripts/process-stop-check.sh"
 fi
 
+# --- 4d. the egress/tunnel acceptance harness exists and is documented -------
+# tunnel-check.sh is the only check that measures the live chained-slirp4netns
+# egress and a real cloudflared quick tunnel, and that the host topology is left
+# untouched, so it must exist, be executable, and be named in VERIFICATION.md.
+# It may legitimately report skipped-environment assertions on a Cloudflare 429.
+
+if [ -f scripts/tunnel-check.sh ]; then
+  ok "tunnel-harness.exists"
+else
+  fail "tunnel-harness.exists" "scripts/tunnel-check.sh is missing"
+fi
+if [ -x scripts/tunnel-check.sh ]; then
+  ok "tunnel-harness.executable"
+else
+  fail "tunnel-harness.executable" "scripts/tunnel-check.sh is not executable"
+fi
+if grep -qF 'tunnel-check.sh' docs/VERIFICATION.md; then
+  ok "tunnel-harness.documented"
+else
+  fail "tunnel-harness.documented" "docs/VERIFICATION.md does not mention scripts/tunnel-check.sh"
+fi
+
+# --- 4e. the Makefile wires every acceptance harness it names ---------------
+# The Makefile is the entry point operators use; a harness with no target is one
+# nobody runs. Assert the three sudo-style host suites have targets and appear
+# in .PHONY (the established pattern), pinned to the code's script names.
+
+for tgt_script in "session-check:session-nsjail-check.sh" \
+                  "process-check:process-stop-check.sh" \
+                  "tunnel-check:tunnel-check.sh"; do
+  tgt="${tgt_script%%:*}"
+  scr="${tgt_script##*:}"
+  if grep -qE "^$tgt:" Makefile; then
+    ok "makefile.target.$tgt"
+  else
+    fail "makefile.target.$tgt" "Makefile has no '$tgt:' target"
+  fi
+  if grep -qE "sudo -E bash scripts/$scr" Makefile; then
+    ok "makefile.sudo.$tgt"
+  else
+    fail "makefile.sudo.$tgt" "Makefile's '$tgt' target does not run 'sudo -E bash scripts/$scr'"
+  fi
+  if grep -qE "^\.PHONY:.*\b$tgt\b" Makefile; then
+    ok "makefile.phony.$tgt"
+  else
+    fail "makefile.phony.$tgt" "'$tgt' is not in .PHONY"
+  fi
+done
+
 # --- 5. stated test count equals the real test count -----------------------
 
 STATED="$(grep -oE 'Test functions:[^0-9]*[0-9]+' docs/VERIFICATION.md | grep -oE '[0-9]+' | head -1)"
@@ -262,6 +313,32 @@ else
   fail "go.test" "go test ./... failed (see /tmp/docs-test.$$)"
 fi
 rm -f /tmp/docs-build.$$ /tmp/docs-test.$$
+
+# --- 9. the documented service version equals the code's model.Version ------
+# model.Version is the single source of truth; every human-facing doc that
+# states a concrete version must state that same one. Version strings that are
+# clearly the decision-log history ("v0.0.6 … v0.0.15", a superseded rationale)
+# are out of scope; this pins the current string.
+
+MODEL_VERSION="$(grep -oE 'const Version = "[0-9.]+"' internal/model/types.go | sed -E 's/.*"([0-9.]+)"/\1/')"
+if [ -z "$MODEL_VERSION" ]; then
+  fail "version.model" "could not read model.Version from internal/model/types.go"
+else
+  ok "version.model $MODEL_VERSION"
+  for doc in README.md docs/SPEC.md docs/VERIFICATION.md docs/ARCHITECTURE.md docs/API.md api/openapi.yaml; do
+    if grep -qF -- "$MODEL_VERSION" "$doc"; then
+      ok "version.doc.$doc"
+    else
+      fail "version.doc.$doc" "$doc does not mention the current service version $MODEL_VERSION"
+    fi
+  done
+  if grep -qE "^  version: $MODEL_VERSION$" api/openapi.yaml && \
+     grep -qF -- "examples: [\"$MODEL_VERSION\"]" api/openapi.yaml; then
+    ok "version.openapi"
+  else
+    fail "version.openapi" "api/openapi.yaml does not carry $MODEL_VERSION in both its info.version and Meta examples"
+  fi
+fi
 
 # --- tally ------------------------------------------------------------------
 
