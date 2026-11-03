@@ -47,12 +47,17 @@ func (s *Server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeErrorWithCode(w, err)
 		return
 	}
-	ws, err := s.svc.CreateWorkspace(pid, req.Name, req.Profile, req.toLimits())
+	sub, err := req.Subscription.toSubscriptionRequest()
 	if err != nil {
 		writeErrorWithCode(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"workspace": toWorkspaceJSON(ws)})
+	ws, err := s.svc.CreateWorkspaceWithSubscription(pid, req.Name, req.Profile, req.toLimits(), sub)
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"workspace": s.toWorkspaceJSON(ws)})
 }
 
 func (s *Server) handleListWorkspaces(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +72,7 @@ func (s *Server) handleListWorkspaces(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]workspaceJSON, 0, len(list))
 	for _, ws := range list {
-		out = append(out, toWorkspaceJSON(ws))
+		out = append(out, s.toWorkspaceJSON(ws))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"workspaces": out})
 }
@@ -77,7 +82,7 @@ func (s *Server) handleGetWorkspace(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"workspace": toWorkspaceJSON(ws)})
+	writeJSON(w, http.StatusOK, map[string]any{"workspace": s.toWorkspaceJSON(ws)})
 }
 
 func (s *Server) handleDeleteWorkspace(w http.ResponseWriter, r *http.Request) {
@@ -107,7 +112,7 @@ func (s *Server) handlePatchWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeErrorWithCode(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"workspace": toWorkspaceJSON(updated)})
+	writeJSON(w, http.StatusOK, map[string]any{"workspace": s.toWorkspaceJSON(updated)})
 }
 
 func (s *Server) handleSuspendWorkspace(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +126,7 @@ func (s *Server) handleSuspendWorkspace(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"workspace":         toWorkspaceJSON(updated),
+		"workspace":         s.toWorkspaceJSON(updated),
 		"changed":           changed,
 		"stopped_run_ids":   stopped,
 		"stopped_run_count": len(stopped),
@@ -139,7 +144,7 @@ func (s *Server) handleResumeWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"workspace": toWorkspaceJSON(updated),
+		"workspace": s.toWorkspaceJSON(updated),
 		"changed":   changed,
 	})
 }
@@ -161,7 +166,7 @@ func (s *Server) handleStopWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"workspace":             toWorkspaceJSON(updated),
+		"workspace":             s.toWorkspaceJSON(updated),
 		"stopped_run_ids":       summary.RunIDs,
 		"stopped_run_count":     len(summary.RunIDs),
 		"stopped_session_ids":   summary.SessionIDs,
@@ -169,6 +174,33 @@ func (s *Server) handleStopWorkspace(w http.ResponseWriter, r *http.Request) {
 		"stopped_process_ids":   summary.ProcessIDs,
 		"stopped_process_count": len(summary.ProcessIDs),
 	})
+}
+
+// handleExtendSubscription implements POST
+// /v1/workspaces/{id}/subscription/extend: the renewal path. While the term is
+// live it ADDS to the expiry (an early renewer is not penalised); after it has
+// lapsed it starts from now AND unlocks the workspace, restoring service.
+func (s *Server) handleExtendSubscription(w http.ResponseWriter, r *http.Request) {
+	ws, ok := s.ownedWorkspace(w, r)
+	if !ok {
+		return
+	}
+	var req subscriptionRequestJSON
+	if err := decodeJSON(w, r, s.cfg.Caps.JSONBodyBytes(), &req); err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	sub, err := req.toSubscriptionRequest()
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	updated, err := s.svc.ExtendSubscription(ws.ID, sub)
+	if err != nil {
+		writeErrorWithCode(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"workspace": s.toWorkspaceJSON(updated)})
 }
 
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {

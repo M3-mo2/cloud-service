@@ -7,24 +7,99 @@ import (
 	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/providers/rawbytes"
 	"github.com/knadh/koanf/v2"
+
+	"sandboxd/internal/subscription"
 )
 
 // Config is the top-level service configuration loaded from YAML.
 type Config struct {
-	Server    ServerConfig   `koanf:"server"`
-	Storage   StorageConfig  `koanf:"storage"`
-	Sandbox   SandboxConfig  `koanf:"sandbox"`
-	Limits    LimitsConfig   `koanf:"limits"`
-	MaxLimits LimitsConfig   `koanf:"max_limits"`
-	Caps      CapsConfig     `koanf:"caps"`
-	Packages  PackagesConfig `koanf:"packages"`
-	Sessions  SessionsConfig `koanf:"sessions"`
-	Network   NetworkConfig  `koanf:"network"`
-	Tunnels   TunnelsConfig  `koanf:"tunnels"`
-	Identity  IdentityConfig `koanf:"identity"`
-	Profiles  ProfilesConfig `koanf:"profiles"`
-	Disk      DiskConfig     `koanf:"disk"`
-	Keys      []KeyConfig    `koanf:"keys"`
+	Server       ServerConfig       `koanf:"server"`
+	Storage      StorageConfig      `koanf:"storage"`
+	Sandbox      SandboxConfig      `koanf:"sandbox"`
+	Limits       LimitsConfig       `koanf:"limits"`
+	MaxLimits    LimitsConfig       `koanf:"max_limits"`
+	Caps         CapsConfig         `koanf:"caps"`
+	Packages     PackagesConfig     `koanf:"packages"`
+	Sessions     SessionsConfig     `koanf:"sessions"`
+	Network      NetworkConfig      `koanf:"network"`
+	Tunnels      TunnelsConfig      `koanf:"tunnels"`
+	Identity     IdentityConfig     `koanf:"identity"`
+	Profiles     ProfilesConfig     `koanf:"profiles"`
+	Disk         DiskConfig         `koanf:"disk"`
+	Subscription SubscriptionConfig `koanf:"subscription"`
+	Keys         []KeyConfig        `koanf:"keys"`
+}
+
+// SubscriptionConfig controls workspace subscription terms (a running term with
+// an absolute expiry) and the reaper that enforces them.
+//
+// DEFAULTS DO NOT CHANGE THE BEHAVIOUR of any existing workspace or gate:
+// default_duration is EMPTY, which means a workspace that does not ask for a
+// term gets NO expiry and is never touched by the reaper. The reaper is a no-op
+// for a workspace without an expiry even when enabled. The engine owns the
+// clock and the enforcement; it stores ABSOLUTE instants, so state is
+// recomputed after a restart and never held in memory (docs/DECISIONS.md ADR 87).
+type SubscriptionConfig struct {
+	// Enabled is the reaper switch. false = the periodic loop does not run, so
+	// nothing is ever locked or deleted automatically. Per-request terms are
+	// still accepted and still enforced on read (a lapsed workspace reads
+	// `locked`), but no resource teardown happens. Default true.
+	Enabled bool `koanf:"enabled"`
+	// DefaultDuration is the term a create request gets when it names no
+	// subscription. EMPTY (the default) means NO expiry: behaviour is unchanged
+	// for a workspace that does not ask. A non-empty value (e.g. "30d") makes
+	// every new workspace get that term unless the request overrides it with a
+	// duration or an absolute expires_at.
+	DefaultDuration string `koanf:"default_duration"`
+	// MaxDuration is the server-side ceiling on a term, measured from now. A
+	// create/extend whose expiry would land more than MaxDuration in the future
+	// is refused with 422 max_duration_exceeded. Default "365d".
+	MaxDuration string `koanf:"max_duration"`
+	// GracePeriod is how long a lapsed workspace stays LOCKED (service stopped,
+	// data intact) before the reaper deletes it. Default 168h (7 days).
+	GracePeriod string `koanf:"grace_period"`
+	// ReapInterval is how often the reaper tick runs. Default "60s".
+	ReapInterval string `koanf:"reap_interval"`
+}
+
+// EnabledOrDefault reports whether the reaper should run. The reaper only runs
+// when the section is enabled; it is a no-op for workspaces without a term.
+func (c SubscriptionConfig) ReaperEnabled() bool { return c.Enabled }
+
+// DefaultDurationValue parses default_duration; empty is (0, false).
+func (c SubscriptionConfig) DefaultDurationValue() (time.Duration, bool, error) {
+	if c.DefaultDuration == "" {
+		return 0, false, nil
+	}
+	d, err := subscription.ParseDuration(c.DefaultDuration)
+	if err != nil {
+		return 0, false, err
+	}
+	return d, true, nil
+}
+
+// MaxDurationValue parses max_duration, defaulting to 365d when empty.
+func (c SubscriptionConfig) MaxDurationValue() (time.Duration, error) {
+	if c.MaxDuration == "" {
+		return 365 * 24 * time.Hour, nil
+	}
+	return subscription.ParseDuration(c.MaxDuration)
+}
+
+// GracePeriodValue parses grace_period, defaulting to 168h (7 days) when empty.
+func (c SubscriptionConfig) GracePeriodValue() (time.Duration, error) {
+	if c.GracePeriod == "" {
+		return 168 * time.Hour, nil
+	}
+	return subscription.ParseDuration(c.GracePeriod)
+}
+
+// ReapIntervalValue parses reap_interval, defaulting to 60s when empty.
+func (c SubscriptionConfig) ReapIntervalValue() (time.Duration, error) {
+	if c.ReapInterval == "" {
+		return 60 * time.Second, nil
+	}
+	return subscription.ParseDuration(c.ReapInterval)
 }
 
 // DiskConfig controls how each workspace's disk allowance is ENFORCED and
@@ -588,6 +663,13 @@ func Default() Config {
 			CounterPollMS: 500,
 			ProcEnabled:   true,
 		},
+		Subscription: SubscriptionConfig{
+			Enabled:         true,
+			DefaultDuration: "",
+			MaxDuration:     "365d",
+			GracePeriod:     "168h",
+			ReapInterval:    "60s",
+		},
 		Keys: []KeyConfig{},
 	}
 }
@@ -807,6 +889,18 @@ func (c *Config) applyDefaults() {
 	if c.Disk.CounterPollMS <= 0 {
 		c.Disk.CounterPollMS = d.Disk.CounterPollMS
 	}
+	// Subscription strings default when empty. Enabled is deliberately NOT
+	// defaulted here: its default lives in rawDefaults so an explicit
+	// `subscription.enabled: false` survives (the reaper stays opt-out).
+	if c.Subscription.MaxDuration == "" {
+		c.Subscription.MaxDuration = d.Subscription.MaxDuration
+	}
+	if c.Subscription.GracePeriod == "" {
+		c.Subscription.GracePeriod = d.Subscription.GracePeriod
+	}
+	if c.Subscription.ReapInterval == "" {
+		c.Subscription.ReapInterval = d.Subscription.ReapInterval
+	}
 }
 
 func rawDefaults() []byte {
@@ -907,5 +1001,11 @@ disk:
   fusermount_path: ""
   counter_poll_ms: 500
   proc_enabled: true
+subscription:
+  enabled: true
+  default_duration: ""
+  max_duration: "365d"
+  grace_period: "168h"
+  reap_interval: "60s"
 `)
 }

@@ -39,6 +39,17 @@ type Service struct {
 	diskWatchdogOnce bool
 	diskDone         chan struct{}
 
+	// Subscription reaper. It copies the disk watchdog's shape: one goroutine,
+	// one ticker, one done channel. The decision is a pure function of stored
+	// instants, so no term state is held here.
+	reaperOnce bool
+	reaperDone chan struct{}
+
+	// now is the service clock. It is time.Now in production and is overridden
+	// in tests so a whole subscription lifecycle can be asserted without
+	// sleeping. Every subscription decision reads it, so tests are deterministic.
+	now func() time.Time
+
 	mu       sync.Mutex
 	runs     map[string]*runningRun
 	sessions map[string]*liveSession
@@ -54,13 +65,15 @@ type runningRun struct {
 // New constructs a Service.
 func New(cfg config.Config, store *storage.Store, runner executor.Runner, logger *slog.Logger) *Service {
 	s := &Service{
-		cfg:      cfg,
-		store:    store,
-		runner:   runner,
-		logger:   logger,
-		runs:     make(map[string]*runningRun),
-		sessions: make(map[string]*liveSession),
-		diskDone: make(chan struct{}),
+		cfg:        cfg,
+		store:      store,
+		runner:     runner,
+		logger:     logger,
+		runs:       make(map[string]*runningRun),
+		sessions:   make(map[string]*liveSession),
+		diskDone:   make(chan struct{}),
+		reaperDone: make(chan struct{}),
+		now:        time.Now,
 	}
 	if cfg.Disk.Enabled {
 		id := executor.ResolveIdentity(cfg)
@@ -146,6 +159,15 @@ func (s *Service) WorkspaceFs(w *model.Workspace) (*workspace.Fs, error) {
 // resolved name is stamped on the record so GET /v1/workspaces/{id} says which
 // profile the workspace got, including when the default was applied.
 func (s *Service) CreateWorkspace(principalID, name, profileName string, limits *model.Limits) (*model.Workspace, error) {
+	return s.CreateWorkspaceWithSubscription(principalID, name, profileName, limits, SubscriptionRequest{})
+}
+
+// CreateWorkspaceWithSubscription creates a workspace, optionally with a
+// subscription term. An empty request falls back to the configured
+// subscription.default_duration; when that is also empty the workspace gets NO
+// expiry (nil subscription), which is the unchanged behaviour. A nil
+// subscription is the default and is never touched by the reaper.
+func (s *Service) CreateWorkspaceWithSubscription(principalID, name, profileName string, limits *model.Limits, req SubscriptionRequest) (*model.Workspace, error) {
 	profileName, err := s.resolveProfile(profileName)
 	if err != nil {
 		return nil, err
@@ -157,7 +179,11 @@ func (s *Service) CreateWorkspace(principalID, name, profileName string, limits 
 			return nil, err
 		}
 	}
-	now := time.Now().UTC()
+	now := s.now().UTC()
+	sub, err := s.grantSubscription(now, req)
+	if err != nil {
+		return nil, err
+	}
 	w := &model.Workspace{
 		ID:             model.NewWorkspaceID(),
 		OwnerID:        principalID,
@@ -167,6 +193,7 @@ func (s *Service) CreateWorkspace(principalID, name, profileName string, limits 
 		Limits:         lim,
 		Profile:        profileName,
 		LastActivityAt: now,
+		Subscription:   sub,
 	}
 	if err := s.store.CreateWorkspace(w); err != nil {
 		return nil, err
@@ -351,25 +378,13 @@ func (s *Service) ListWorkspaces(principalID string) ([]*model.Workspace, error)
 }
 
 // DeleteWorkspace stops all runs and sessions and removes the workspace tree.
+// It works on a locked workspace (removing it early is allowed while locked) and
+// shares the exact teardown order with the reaper via deleteWorkspaceFully:
+// stop compute, unmount, purge, then release the network.
 func (s *Service) DeleteWorkspace(id, principalID string) error {
 	w, err := s.GetOwnedWorkspace(id, principalID)
 	if err != nil {
 		return err
 	}
-	s.StopAllRuns(w.ID)
-	s.StopWorkspaceSessions(w.ID, model.SessionReasonWorkspaceDeleted)
-	// A detached process started from a session must not outlive the workspace.
-	s.StopDetachedProcesses(w)
-	// Tunnels die with the workspace: stop every cloudflared process and drop
-	// the records before the tree is removed.
-	s.ReleaseWorkspaceTunnels(w)
-	// Unmount and delete the workspace's per-workspace disk image before the
-	// tree is removed, so no FUSE mount and no image file is left behind.
-	s.removeWorkspaceDisk(w.ID)
-	if err := s.store.DeleteWorkspace(w.ID); err != nil {
-		return err
-	}
-	// Tear the private network down last, once no process can still reference it.
-	s.ReleaseWorkspaceNetwork(w.ID)
-	return nil
+	return s.deleteWorkspaceFully(w)
 }

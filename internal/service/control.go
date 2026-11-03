@@ -19,6 +19,16 @@ func WorkspaceSuspendedError() error {
 	return model.New(409, model.CodeWorkspaceSuspended, "workspace is suspended")
 }
 
+// SubscriptionExpiredError is returned (403) when work is requested for a
+// workspace whose subscription term has lapsed. It is deliberately distinct
+// from the 409 workspace_suspended refusal: a lock is the automatic result of a
+// lapsed term and the way out is a renewal (POST .../subscription/extend), not
+// resume. Reads, the summary, usage, file reads and manual delete stay allowed.
+func SubscriptionExpiredError() error {
+	return model.New(403, model.CodeSubscriptionExpired,
+		"workspace subscription has lapsed (locked); renew to restore service")
+}
+
 // LimitUpdate is a partial update of a workspace's limits. A nil field keeps
 // the current value; this is why every field is a pointer (so an omitted JSON
 // field and an explicit null both leave the value untouched).
@@ -292,10 +302,17 @@ func (s *Service) touchActivity(id string) {
 	}
 }
 
-// ensureActive refuses work for a suspended workspace.
+// ensureActive refuses work for a suspended OR subscription-locked workspace.
+// The refusal order is deliberate: suspension (a manual operator action, 409)
+// is reported before a lock (a lapsed term, 403) so a client can tell the two
+// causes apart. The lock is DERIVED from the stored instants (now >= expires_at,
+// or a recorded LockedAt), so it holds even before the reaper has run.
 func (s *Service) ensureActive(w *model.Workspace) error {
 	if w.Status == model.WorkspaceSuspended {
 		return WorkspaceSuspendedError()
+	}
+	if w.EffectiveStatus(s.now().UTC()) == model.WorkspaceLocked {
+		return SubscriptionExpiredError()
 	}
 	return nil
 }

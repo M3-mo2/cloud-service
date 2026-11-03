@@ -37,3 +37,25 @@ func mountedFuse(path string) bool {
 	}
 	return int64(st.Type) == fuseSuperMagic
 }
+
+// MountedDiskUsed returns the used bytes (total minus free) of the filesystem
+// mounted at root. It is CHEAP: one statfs call, no directory walk. It returns
+// ok=false when root is not a live FUSE mount (so the derived summary falls back
+// to 0 rather than reporting the host filesystem's usage as the workspace's).
+func MountedDiskUsed(root string) (used int64, ok bool) {
+	if !mountedFuse(root) {
+		return 0, false
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(root, &st); err != nil {
+		return 0, false
+	}
+	bsize := int64(st.Bsize)
+	total := bsize * int64(st.Blocks)
+	free := bsize * int64(st.Bavail)
+	used = total - free
+	if used < 0 {
+		used = 0
+	}
+	return used, true
+}

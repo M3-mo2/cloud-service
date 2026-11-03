@@ -8,9 +8,9 @@ import (
 )
 
 // Version is the service version string. It tracks the highest feature group
-// implemented in docs/DECISIONS.md (v0.0.18); it is independent of APIVersion,
+// implemented in docs/DECISIONS.md (v0.0.19); it is independent of APIVersion,
 // which is the HTTP contract prefix and changes only on a breaking API change.
-const Version = "0.0.18"
+const Version = "0.0.19"
 
 // APIVersion is the HTTP API version prefix.
 const APIVersion = "v1"
@@ -63,11 +63,52 @@ type Limits struct {
 }
 
 // Workspace statuses.
+//
+// Active and suspended are the manual, operator-driven states. Deleted is the
+// terminal tombstone. Locked is DISTINCT from suspended: it is the automatic
+// consequence of a lapsed subscription term (the reaper sets it), and the way
+// out of it is a renewal (an extension), not resume. It exists so a client can
+// tell "the operator paused this" from "the term ran out". See
+// docs/DECISIONS.md (ADR 87).
 const (
 	WorkspaceActive    = "active"
 	WorkspaceSuspended = "suspended"
+	WorkspaceLocked    = "locked"
 	WorkspaceDeleted   = "deleted"
 )
+
+// Subscription is a workspace's running term. It stores ABSOLUTE instants, never
+// a "days remaining" counter: the engine owns the clock and the enforcement, the
+// client owns why a term is what it is (billing lives in a separate product).
+// Because every field is absolute, state is recomputed from stored times after a
+// restart and is never carried in memory.
+//
+// A zero ExpiresAt means NO subscription: the workspace never expires. This is
+// the DEFAULT for a workspace that does not ask for a term, so adding the field
+// changes the behaviour of no existing workspace.
+type Subscription struct {
+	// GrantedAt is when the current term began (the first grant, not the last
+	// extension).
+	GrantedAt time.Time `json:"granted_at"`
+	// ExpiresAt is the absolute enforcement point. Zero = no expiry (unlimited).
+	ExpiresAt time.Time `json:"expires_at"`
+	// RenewedAt is the last time the term was extended (zero = never).
+	RenewedAt time.Time `json:"renewed_at,omitempty"`
+	// LockedAt is when the reaper locked the workspace because the term lapsed
+	// (zero = never locked). Cleared by a renewal that restores service.
+	LockedAt time.Time `json:"locked_at,omitempty"`
+	// GraceEndsAt is ExpiresAt + the configured grace period; the moment the
+	// reaper deletes the workspace. Zero when there is no expiry.
+	GraceEndsAt time.Time `json:"grace_ends_at,omitempty"`
+	// Extensions counts how many times the term has been extended, for audit.
+	Extensions int `json:"extensions"`
+}
+
+// HasExpiry reports whether the subscription enforces a term. The zero value
+// (and any subscription whose ExpiresAt is the zero time) is "no expiry".
+func (s *Subscription) HasExpiry() bool {
+	return s != nil && !s.ExpiresAt.IsZero()
+}
 
 // Workspace is a named, owned container of files and runs.
 type Workspace struct {
@@ -85,7 +126,47 @@ type Workspace struct {
 	// and is read as the server's configured default profile.
 	Profile        string    `json:"profile"`
 	LastActivityAt time.Time `json:"last_activity_at"`
+	// Subscription is the workspace's term, or nil for a workspace with no
+	// expiry (the default). It is stored as absolute instants so the state is
+	// recomputed after a restart and never held in memory (see docs/DECISIONS.md
+	// ADR 87). omitted when nil so existing records are byte-identical.
+	Subscription *Subscription `json:"subscription,omitempty"`
 }
+
+// DeriveStatus returns the status a workspace must show for now. The persisted
+// Status is the manual/terminal lifecycle (active, suspended, deleted); `locked`
+// is a DERIVED consequence of a lapsed term, so a workspace is locked if the
+// reaper has recorded LockedAt OR the term lapsed (now >= expires_at) while it
+// is not suspended and not deleted. This is a pure function of stored instants,
+// so it agrees with enforcement without the reaper having to have run.
+//
+// It never overrides suspended or deleted; a suspended workspace with a lapsed
+// term stays suspended until the reaper records the lock (the reaper skips a
+// suspended workspace, see docs/DECISIONS.md).
+func (w *Workspace) DeriveStatus(now time.Time) string {
+	if w.Status == WorkspaceDeleted || w.Status == WorkspaceSuspended {
+		return w.Status
+	}
+	if w.Status == WorkspaceLocked {
+		return WorkspaceLocked
+	}
+	if w.Subscription.HasExpiry() {
+		s := w.Subscription
+		if !s.LockedAt.IsZero() {
+			return WorkspaceLocked
+		}
+		if !now.Before(s.ExpiresAt) {
+			return WorkspaceLocked
+		}
+	}
+	return WorkspaceActive
+}
+
+// EffectiveStatus renders the status string that belongs in an API response: the
+// derived status (so a lapsed-but-not-yet-reaped workspace already reads
+// `locked`, and its summary cannot contradict enforcement). The persisted Status
+// is left untouched; only the derived labels are written by the reaper.
+func (w *Workspace) EffectiveStatus(now time.Time) string { return w.DeriveStatus(now) }
 
 // RunKind describes how a run's command was specified.
 type RunKind string
@@ -230,6 +311,7 @@ const (
 	SessionReasonServiceShutdown    = "service_shutdown"
 	SessionReasonInterrupted        = "interrupted"
 	SessionReasonWorkspaceSuspended = "workspace_suspended"
+	SessionReasonWorkspaceLocked    = "workspace_locked"
 	SessionReasonWorkspaceStopped   = "workspace_stopped"
 	SessionReasonSandboxUnavailable = "sandbox_unavailable"
 )

@@ -69,6 +69,29 @@ const (
 	// The engine never fabricates a URL, so the create fails with this
 	// machine-readable reason instead of returning a URL it did not observe.
 	CodeTunnelURLUnavailable = "tunnel_url_unavailable"
+
+	// CodeSubscriptionExpired is returned (HTTP 403) when work is requested
+	// for a workspace whose subscription term has lapsed and the reaper has
+	// locked it. It is DISTINCT from workspace_suspended (409): suspension is a
+	// manual, resume-able operator action; a lock is the automatic consequence
+	// of a lapsed term and the way out is a renewal (extend). Reads, the
+	// summary, usage, file reads and manual delete remain allowed while locked.
+	CodeSubscriptionExpired = "subscription_expired"
+
+	// CodeSubscriptionInvalid is returned (HTTP 422) when a create/extend names
+	// a subscription that cannot be parsed or applied: an unparseable, zero or
+	// negative duration, a non-future expires_at, or neither/both of
+	// duration and expires_at. The details name the offending field.
+	CodeSubscriptionInvalid = "subscription_invalid"
+
+	// CodeMaxDurationExceeded is returned (HTTP 422) when a create/extend would
+	// put the expiry further than subscription.max_duration in the future.
+	CodeMaxDurationExceeded = "max_duration_exceeded"
+
+	// CodeSubscriptionWouldShorten is returned (HTTP 422) when an extension
+	// supplies an absolute expires_at EARLIER than a still-live term. The engine
+	// never silently shortens a paid term.
+	CodeSubscriptionWouldShorten = "subscription_would_shorten"
 )
 
 // Error is the canonical API error, carrying an HTTP mapping and a code.

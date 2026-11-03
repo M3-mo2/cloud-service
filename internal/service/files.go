@@ -132,7 +132,12 @@ func (s *Service) StatFile(w *model.Workspace, path string) (workspace.FileInfo,
 }
 
 // WriteFile writes a file enforcing the configured write cap and the disk quota.
+// It is a MUTATING operation, so a locked workspace refuses it (subscription_
+// expired) while file READS remain allowed.
 func (s *Service) WriteFile(w *model.Workspace, path string, data []byte, encoding string) error {
+	if err := s.ensureActive(w); err != nil {
+		return err
+	}
 	fs, err := s.WorkspaceFs(w)
 	if err != nil {
 		return err
@@ -140,8 +145,12 @@ func (s *Service) WriteFile(w *model.Workspace, path string, data []byte, encodi
 	return fs.Write(path, data, false, workspace.WriteOptions{MaxBytes: s.cfg.Caps.FileWriteBytes()})
 }
 
-// DeleteFile removes a file or directory.
+// DeleteFile removes a file or directory. A mutating operation: refused while
+// locked (manual workspace DELETE is still allowed at the workspace level).
 func (s *Service) DeleteFile(w *model.Workspace, path string) error {
+	if err := s.ensureActive(w); err != nil {
+		return err
+	}
 	fs, err := s.WorkspaceFs(w)
 	if err != nil {
 		return err
@@ -149,8 +158,11 @@ func (s *Service) DeleteFile(w *model.Workspace, path string) error {
 	return fs.Remove(path)
 }
 
-// Mkdir creates a directory.
+// Mkdir creates a directory. A mutating operation: refused while locked.
 func (s *Service) Mkdir(w *model.Workspace, path string) error {
+	if err := s.ensureActive(w); err != nil {
+		return err
+	}
 	fs, err := s.WorkspaceFs(w)
 	if err != nil {
 		return err
@@ -158,8 +170,11 @@ func (s *Service) Mkdir(w *model.Workspace, path string) error {
 	return fs.Mkdir(path)
 }
 
-// Rename moves a file or directory.
+// Rename moves a file or directory. A mutating operation: refused while locked.
 func (s *Service) Rename(w *model.Workspace, from, to string) error {
+	if err := s.ensureActive(w); err != nil {
+		return err
+	}
 	fs, err := s.WorkspaceFs(w)
 	if err != nil {
 		return err
@@ -168,8 +183,11 @@ func (s *Service) Rename(w *model.Workspace, from, to string) error {
 }
 
 // UploadFile writes uploaded bytes as a file, enforcing the upload cap and
-// the workspace disk quota.
+// the workspace disk quota. A mutating operation: refused while locked.
 func (s *Service) UploadFile(w *model.Workspace, path string, data []byte) error {
+	if err := s.ensureActive(w); err != nil {
+		return err
+	}
 	fs, err := s.WorkspaceFs(w)
 	if err != nil {
 		return err

@@ -146,6 +146,12 @@ func main() {
 	if n := svc.ReapWorkspaceTunnels(); n > 0 {
 		logger.Info("reaped orphaned tunnels", "count", n)
 	}
+	// The subscription reaper enforces workspace terms. It copies the disk
+	// watchdog's shape (one goroutine, one ticker) and its decision is a PURE
+	// function of the stored absolute instants, so a restart recomputes state
+	// with no in-memory counters. It is a no-op when subscription.enabled is
+	// false; a workspace without a subscription is never touched.
+	svc.StartReaper()
 	authn := auth.New(cfg.Keys)
 	server := api.NewServer(svc, authn, logger)
 

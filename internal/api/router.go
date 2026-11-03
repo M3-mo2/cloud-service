@@ -64,6 +64,7 @@ func (s *Server) Router() http.Handler {
 				r.Post("/suspend", s.handleSuspendWorkspace)
 				r.Post("/resume", s.handleResumeWorkspace)
 				r.Post("/stop", s.handleStopWorkspace)
+				r.Post("/subscription/extend", s.handleExtendSubscription)
 				r.Get("/usage", s.handleUsage)
 
 				r.Get("/processes", s.handleListProcesses)
@@ -342,11 +343,30 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	if diskNote != "" {
 		diskCap["reason"] = diskNote
 	}
+	// Workspace subscriptions: the engine owns the clock and enforcement, stores
+	// an absolute expiry, and locks a lapsed term (distinct from suspension); the
+	// way out is a renewal. Advertised truthfully: enabled is whether the reaper
+	// runs; grace_period and the duration grammar are exposed so a client can
+	// render a term without guessing. A workspace with no term is unlimited.
+	maxDur, _ := s.cfg.Subscription.MaxDurationValue()
+	graceDur, _ := s.cfg.Subscription.GracePeriodValue()
+	subCap := map[string]any{
+		"enabled":            s.cfg.Subscription.Enabled,
+		"default_duration":   s.cfg.Subscription.DefaultDuration,
+		"max_duration":       maxDur.String(),
+		"grace_period":       graceDur.String(),
+		"reap_interval":      s.cfg.Subscription.ReapInterval,
+		"duration_grammar":   "s m h d w mo y (summed, e.g. 1d12h); mo=30d and y=365d are FIXED-LENGTH approximations, never calendar-exact",
+		"expiry_semantics":   "absolute instants; extend adds while live, restarts from now when lapsed and unlocks; a live term is never shortened",
+		"locked_status":      "locked (automatic, lapsed term) is distinct from suspended (manual); refused work is 403 subscription_expired, reads/usage/delete stay allowed",
+		"summary_present_on": []string{"GET /v1/workspaces/{id}", "GET /v1/workspaces"},
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":     model.Version,
-		"api_version": model.APIVersion,
-		"runtimes":    []string{"python3"},
-		"profiles":    profileCap,
+		"version":       model.Version,
+		"api_version":   model.APIVersion,
+		"runtimes":      []string{"python3"},
+		"profiles":      profileCap,
+		"subscriptions": subCap,
 		"limits_defaults": map[string]any{
 			"cpu_cores":            l.CPUCores,
 			"memory_mb":            l.MemoryMB,
