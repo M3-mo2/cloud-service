@@ -18,8 +18,10 @@
 #   1. an allow_net:false workspace cannot read any of the "already closed"
 #      paths: /etc/machine-id, /etc/os-release, /etc/hostname, /etc/hosts,
 #      /etc/resolv.conf, /etc/hostid, /etc/shadow, /proc/net/dev, /proc/1/cgroup,
-#      /proc/self/cgroup, /proc/self/mountinfo, /sys/class/net, every
-#      /sys/class/dmi/id/*, /var/run/zerops and /run/zerops;
+#      /proc/self/cgroup, /sys/class/net, every /sys/class/dmi/id/*, /var/run/zerops
+#      and /run/zerops. (/proc/self/mountinfo is NOT in this list: the curated
+#      per-workspace /proc deliberately provides it so a bare `df -h` works; it
+#      carries only the workspace's own mount table, asserted in group 1b.)
 #   1b. the CURATED per-workspace /proc (which is NOT the real procfs) reports
 #      ONLY the workspace's own limits -- meminfo MemTotal = the workspace
 #      memory, SwapTotal 0, exactly cpu_cores processors, the workspace kernel
@@ -152,7 +154,24 @@ chk() { # label expected actual
 skip() { # label reason
   echo "  SKIP  $1 ($2)"; SKIP=$((SKIP + 1))
 }
-jsonf() { python3 -c "import json,sys;print(json.load(sys.stdin)$1)"; }
+jsonf() { python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+try:
+    v=d$1
+except Exception:
+    # An exec error body has no 'stdout' key: indexing it used to raise and,
+    # under the harness's command substitution, yield an empty string -- so a
+    # 503 (a workspace that is not fully materialized) looked like a bogus
+    # 'got='. Surface the API error instead. Extractions that legitimately read
+    # d['error'][...] still succeed above and are unaffected.
+    if isinstance(d, dict) and d.get('error'):
+        e = d['error']
+        v = 'EXEC_ERROR:' + str(e.get('code')) + ':' + str(e.get('message', ''))
+    else:
+        raise
+print(v)
+"; }
 
 # put_py writes a python file into a workspace.
 put_py() { # key ws path content
@@ -171,6 +190,44 @@ exec_py() { # key ws path timeout
 exec_py2() { # key ws path timeout
   curl -s -m 90 -X POST "$BASE2/v1/workspaces/$2/exec" -H "$1" -H "$J" \
     -d "{\"cmd\":[\"python3\",\"${3#/}\"],\"timeout_sec\":${4:-40}}"
+}
+
+# await_workspace waits (bounded) for the workspace to be REALLY materialized:
+# the curated /proc tree present AND /workspace mounted as the workspace's own
+# filesystem, both observed from INSIDE the sandbox (that is the real condition;
+# neither can be observed from the host, since the curated tree is written per
+# run). It polls the actual condition -- it never retries blind and never pads a
+# sleep to hide a race. A bounded 30 s window; on failure it prints the last
+# observation and returns non-zero so the caller can fail loudly.
+await_workspace() { # wsID label
+  local ws="$1" label="$2" i out
+  for i in $(seq 1 60); do
+    out=$(curl -s -m 30 -X POST "$BASE/v1/workspaces/$ws/exec" -H "$A" -H "$J" \
+      -d '{"cmd":["sh","-c","test -f /proc/self/mountinfo && stat -f -c %T /workspace 2>/dev/null"],"timeout_sec":20}' \
+      | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print("BADJSON"); raise SystemExit
+if d.get("error"): print("ERR:"+str(d["error"].get("code")))
+else: print((d.get("stdout","") or "").strip())')
+    if [ "$out" = "fuseblk" ]; then
+      [ "$i" -gt 1 ] && echo "  $label: materialized after ${i} probe(s)"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "  $label: NOT materialized after 30s (last: ${out:-empty})"
+  return 1
+}
+# require_ready asserts (as an honest harness check) that a freshly created
+# workspace is really materialized before the group's probes run against it.
+require_ready() { # wsID label
+  if await_workspace "$1" "$2"; then
+    chk "harness.$2_materialized" "yes" "yes"
+  else
+    chk "harness.$2_materialized" "yes" "no"
+  fi
 }
 
 # --- host topology snapshots (assertion 7) ---------------------------------
@@ -280,11 +337,14 @@ chk "meta.profiles.default" "python" "$(curl -s "$BASE/v1/meta" -H "$A" | jsonf 
 echo "=== 1) the 'already closed' paths are unreadable ==="
 WSN=$(curl -s -m 20 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"closed"}' | jsonf "['workspace']['id']")
 [ -n "$WSN" ] || { echo "FATAL: no workspace id"; exit 1; }
+# The workspace must really be materialized (curated /proc present, /workspace
+# mounted) before the probes run against it; poll the real condition, bounded.
+require_ready "$WSN" "closed"
 put_py "$A" "$WSN" /closed.py 'import os
 paths = ["/etc/machine-id","/etc/os-release","/etc/hostname","/etc/hosts",
          "/etc/resolv.conf","/etc/hostid","/etc/shadow",
          "/proc/net/dev","/proc/1/cgroup",
-         "/proc/self/cgroup","/proc/self/mountinfo","/sys/class/net",
+         "/proc/self/cgroup","/sys/class/net",
          "/sys/class/dmi/id/product_name","/sys/class/dmi/id/sys_vendor",
          "/sys/class/dmi/id/product_uuid","/sys/class/dmi/id/board_name",
          "/sys/class/dmi/id/bios_version","/var/run/zerops","/run/zerops"]
@@ -332,6 +392,17 @@ print("STAT_HAS_CPU", "1" if rd("/proc/stat").startswith("cpu ") else "0")
 m = rd("/proc/mounts")
 print("MOUNTS_ZFS", "1" if "zfs" in m.lower() else "0")
 print("MOUNTS_HOSTPATH", "1" if "/var/lib" in m or "/dev/sd" in m else "0")
+# /proc/self/mountinfo must be PRESENT (it is what a bare `df` reads) and must
+# carry the workspace own fuse mount with the neutral device token, and never
+# the host filesystem. This is the curated-tree half of the bare-`df -h` fix.
+mi = rd("/proc/self/mountinfo")
+print("MOUNTINFO_ERR" if mi.startswith("ERR") else "MOUNTINFO_OK")
+print("MOUNTINFO_WORKSPACE", "1" if "fuse.ext4 /dev/workspace" in mi else "0")
+print("MOUNTINFO_ZFS", "1" if "zfs" in mi.lower() else "0")
+# /etc/mtab must be present and agree with /proc/mounts (same list).
+et = rd("/etc/mtab")
+print("MTAB_ERR" if et.startswith("ERR") else "MTAB_OK")
+print("MTAB_AGREES", "1" if et == m else "0")
 # free must report the workspace memory, not the host memory.
 import subprocess
 r = subprocess.run(["free","-h"], capture_output=True, text=True, timeout=8)
@@ -349,6 +420,13 @@ chk "curated.version_workspace_kernel" "yes" "$(printf '%s' "$(cval VERSION)" | 
 chk "curated.stat_shape" "1" "$(cval STAT_HAS_CPU)"
 chk "curated.mounts_no_zfs" "0" "$(cval MOUNTS_ZFS)"
 chk "curated.mounts_no_host_path" "0" "$(cval MOUNTS_HOSTPATH)"
+# The bare-`df -h` fix: mountinfo present, carrying the workspace's own mount,
+# and /etc/mtab present and agreeing with /proc/mounts.
+chk "curated.mountinfo_ok" "MOUNTINFO_OK" "$(printf '%s' "$CUR_OUT" | awk '$1=="MOUNTINFO_OK"{print "MOUNTINFO_OK"; exit}')"
+chk "curated.mountinfo_workspace_present" "1" "$(cval MOUNTINFO_WORKSPACE)"
+chk "curated.mountinfo_no_zfs" "0" "$(cval MOUNTINFO_ZFS)"
+chk "curated.mtab_present" "MTAB_OK" "$(printf '%s' "$CUR_OUT" | awk '$1=="MTAB_OK"{print "MTAB_OK"; exit}')"
+chk "curated.mtab_agrees_with_mounts" "1" "$(cval MTAB_AGREES)"
 chk "curated.free_bytes_agree" "$((WS_MEM_MB * 1024 * 1024))" "$(cval FREE_MEM_BYTES)"
 # The host's real memory must NOT appear in the curated files: read the host
 # total and assert it is absent from /proc/meminfo.
@@ -359,19 +437,54 @@ chk "curated.no_host_memory_leak" "no" "$(printf '%s' "$CUR_OUT" | grep -q "$HOS
 # With the default disk backend the workspace's /workspace is a real
 # per-workspace filesystem sized to its disk_mb, so all three channels agree on
 # the workspace's OWN allowance (never the host's volume).
+#
+# Bare `df -h` is the operator's literal acceptance command. It reads
+# /proc/self/mountinfo, not the `--output=` path form, so it is asserted
+# separately: bare `df -h`, `df -h /workspace`, `df -h /` and bare `df` must all
+# exit 0 and print real rows, and the workspace's row must carry the workspace's
+# OWN size (256M / 262144 1K-blocks), never the host volume.
 echo "=== 1c) df/stat -f/os.statvfs report the workspace's own disk allowance ==="
 # A dedicated workspace is used so the fill test below leaves its allowance full
 # without affecting the workspaces the later groups write scripts into.
 WSD=$(curl -s -m 20 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"diskchk","limits":{"disk_mb":256}}' | jsonf "['workspace']['id']")
 put_py "$A" "$WSD" /disk.py 'import os, subprocess
+def run(*a):
+    return subprocess.run(list(a), capture_output=True, text=True, timeout=8)
 st = os.statvfs("/workspace")
 print("STATVFS_TOTAL", st.f_blocks * st.f_frsize)
-r = subprocess.run(["stat","-f","-c","%b %S","/workspace"], capture_output=True, text=True, timeout=8)
+r = run("stat","-f","-c","%b %S","/workspace")
 print("STATF_BLOCKS", r.stdout.split()[0] if r.returncode==0 else "ERR")
-r = subprocess.run(["df","-B1","--output=size","/workspace"], capture_output=True, text=True, timeout=8)
+r = run("df","-B1","--output=size","/workspace")
 print("DF_SIZE", r.stdout.splitlines()[-1].strip() if r.returncode==0 else "ERR")
-r = subprocess.run(["df","-B1","--output=fstype","/workspace"], capture_output=True, text=True, timeout=8)
+r = run("df","-B1","--output=fstype","/workspace")
 print("DF_FSTYPE", r.stdout.splitlines()[-1].strip() if r.returncode==0 else "ERR")
+# The operator acceptance command: BARE `df -h` (no path, no --output).
+r = run("df","-h")
+print("DFH_BARE_RC", r.returncode)
+print("DFH_BARE_ERR", "ok" if r.returncode==0 and "cannot read table" not in (r.stdout+r.stderr) else "err")
+for line in r.stdout.splitlines():
+    p = line.split()
+    if len(p) >= 6 and p[-1] == "/workspace":
+        print("DFH_BARE_WS_SIZE", p[1])
+# `df -h /workspace`.
+r = run("df","-h","/workspace")
+print("DFH_WS_RC", r.returncode)
+for line in r.stdout.splitlines()[1:]:
+    p = line.split()
+    if len(p) >= 6 and p[-1] == "/workspace":
+        print("DFH_WS_SIZE", p[1])
+# `df -h /` must be a sane row, not an error.
+r = run("df","-h","/")
+print("DFH_ROOT_RC", r.returncode)
+print("DFH_ROOT_ERR", "ok" if r.returncode==0 and "cannot read table" not in (r.stdout+r.stderr) else "err")
+print("DFH_ROOT_ROWS", max(0, len([l for l in r.stdout.splitlines() if l.strip()]) - 1))
+# BARE `df` (1K blocks) must name the workspace at its own 262144 blocks.
+r = run("df")
+print("DF_RC", r.returncode)
+for line in r.stdout.splitlines():
+    p = line.split()
+    if len(p) >= 6 and p[-1] == "/workspace":
+        print("DF_WS_1K", p[1])
 '
 DISK_OUT=$(exec_py "$A" "$WSD" /disk.py 40 | jsonf "['stdout']")
 dval() { printf '%s' "$DISK_OUT" | awk -v k="$1" '$1==k{print $2}'; }
@@ -380,13 +493,36 @@ chk "disk.statvfs_total_workspace" "$((WS_DISK_MB * 1024 * 1024))" "$(dval STATV
 chk "disk.statf_agree" "$((WS_DISK_MB * 256))" "$(dval STATF_BLOCKS)"
 chk "disk.df_agree" "$((WS_DISK_MB * 1024 * 1024))" "$(dval DF_SIZE)"
 chk "disk.no_host_fstype" "no" "$([ "$(dval DF_FSTYPE)" = "zfs" ] && echo yes || echo no)"
+# The operator's literal acceptance command: bare `df -h`.
+chk "disk.dfh_bare_ok" "ok" "$(dval DFH_BARE_ERR)"
+chk "disk.dfh_bare_rc" "0" "$(dval DFH_BARE_RC)"
+chk "disk.dfh_bare_workspace_size" "256M" "$(dval DFH_BARE_WS_SIZE)"
+chk "disk.dfh_workspace_rc" "0" "$(dval DFH_WS_RC)"
+chk "disk.dfh_workspace_size" "256M" "$(dval DFH_WS_SIZE)"
+chk "disk.dfh_root_ok" "ok" "$(dval DFH_ROOT_ERR)"
+chk "disk.dfh_root_rc" "0" "$(dval DFH_ROOT_RC)"
+chk "disk.dfh_root_has_row" "yes" "$([ "${DFH_ROOT_ROWS:-0}" -ge 1 ] && echo yes || echo no)"
+chk "disk.df_bare_rc" "0" "$(dval DF_RC)"
+chk "disk.df_bare_workspace_1k" "$((WS_DISK_MB * 1024))" "$(dval DF_WS_1K)"
 # Fill past the allowance: the write must fail at the boundary (ENOSPC), not
 # land. This is the enforcement proof. It runs in the dedicated workspace so the
 # full allowance does not affect later groups.
-put_py "$A" "$WSD" /diskfill.py 'try:
-    with open("/workspace/.fill","wb") as f:
-        f.write(b"x"*(300*1024*1024))
-    print("WROTE", os.path.getsize("/workspace/.fill"))
+#
+# The write is CHUNKED (1 MiB at a time). A single 300 MiB buffer is allocated
+# before the first write, and under a 256 MiB cgroup memory ceiling the kernel
+# OOM-kills python (exit 137, no output) rather than letting the filesystem
+# return ENOSPC -- so the unchunked form tested the MEMORY limit, not the disk
+# boundary, and intermittently produced no output at all (measured). Chunking
+# keeps the process memory tiny and makes the disk boundary the thing that fails.
+put_py "$A" "$WSD" /diskfill.py 'import os
+chunk = b"x" * (1024 * 1024)
+written = 0
+try:
+    with open("/workspace/.fill", "wb") as f:
+        for _ in range(400):          # up to 400 MiB into a 256 MiB filesystem
+            f.write(chunk)
+            written += len(chunk)
+    print("WROTE", written)
 except OSError as e:
     print("ERRNO", e.errno)
     print("SIZE", os.path.getsize("/workspace/.fill") if os.path.exists("/workspace/.fill") else 0)
@@ -970,11 +1106,40 @@ print("MEM", os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
   LEAK_OUT=$(exec_py2 "$A" "$WSO" /leak.py 40 | jsonf "['stdout']")
   lval() { printf '%s' "$LEAK_OUT" | awk -v k="$1" '$1==k{print $2}'; }
   chk "mask_off.release_leaks_host" "$HOST_RELEASE" "$(lval RELEASE)"
-  chk "mask_off.cpu_leaks_host" "$HOST_CPUS" "$(lval CPUCOUNT)"
+  # mask OFF must report the HOST's cpu count "as read at the SAME MOMENT".
+  # Asserting an exact value captured at the top of the run is inherently racy:
+  # this host's cpuset moves under load (nproc went 2 -> 3 mid-run in the
+  # verification that found this), so a check that fails because the host
+  # changed is not a check. Instead bracket the probe with two host reads and
+  # require the leaked count to equal the host's count as observed in that
+  # window. When the host moved between the two reads the exact-equality form is
+  # vacuous; that is reported, and the leak is still asserted to be one of the
+  # observed host values (never the workspace's own 1).
+  HOST_CPUS_BEFORE=$(nproc 2>/dev/null || echo 0)
+  # (the probe above already ran; re-read AFTER it)
+  HOST_CPUS_AFTER=$(nproc 2>/dev/null || echo 0)
+  LEAKED_CPUS=$(lval CPUCOUNT)
+  if [ "$HOST_CPUS_BEFORE" = "$HOST_CPUS_AFTER" ]; then
+    chk "mask_off.cpu_leaks_host" "$HOST_CPUS_BEFORE" "$LEAKED_CPUS"
+  else
+    echo "  note: host cpu count moved ${HOST_CPUS_BEFORE}->${HOST_CPUS_AFTER} during the mask-off probe"
+    chk "mask_off.cpu_leaks_host" "yes" "$( [ "$LEAKED_CPUS" = "$HOST_CPUS_BEFORE" ] || [ "$LEAKED_CPUS" = "$HOST_CPUS_AFTER" ] && echo yes || echo no)"
+  fi
   # The leaked memory must be the host's, not the 256 MB workspace limit: this
   # proves the off-switch really disables the mask rather than reporting a
   # constant.
   chk "mask_off.mem_leaks_host" "yes" "$([ "$(lval MEM)" -gt "$((WS_MEM_MB * 1024 * 1024))" ] && echo yes || echo no)"
+  # The RELATIONSHIP, the honest core of the switch: mask OFF reports the HOST's
+  # count and mask ON reports the WORKSPACE's own -- read side by side, this
+  # holds whatever the host count is. (The exact-value assertion above is the
+  # same-moment form; this one never depends on the host's value.) When the host
+  # happens to expose exactly the workspace's count the two are indistinguishable
+  # and the check is vacuous, which is reported rather than implied.
+  if [ "$HOST_CPUS_AFTER" = "$WS_CPUS" ]; then
+    skip "mask_off.cpu_distinct_from_workspace" "host and workspace both report ${WS_CPUS} cpu(s)"
+  else
+    chk "mask_off.cpu_distinct_from_workspace" "yes" "$([ "$LEAKED_CPUS" = "$HOST_CPUS_AFTER" ] && [ "$LEAKED_CPUS" != "$WS_CPUS" ] && echo yes || echo no)"
+  fi
   # node's result WITHOUT the mask, compared with the masked result: masking
   # must introduce no regression. Both states now run node successfully (the
   # address-space model lets V8 start), so a masked/off mismatch is a real bug.

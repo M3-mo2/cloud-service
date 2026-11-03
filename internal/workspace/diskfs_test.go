@@ -3,6 +3,7 @@ package workspace
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -93,3 +94,49 @@ func TestDiskManagerDistinctPerWorkspace(t *testing.T) {
 }
 
 func isENOSPC(err error) bool { return errors.Is(err, syscall.ENOSPC) }
+
+// TestDiskManagerResizeRepairsDirtyImage proves the self-healing path: an image
+// left with a dirty ext4 superblock (which makes resize2fs refuse with "Please
+// run 'e2fsck -f' first") is repaired with e2fsck and the resize retried, rather
+// than bricking the workspace with a permanent provisioning failure. This is the
+// defense-in-depth half of the fit race fix; the read-only probe is the primary
+// fix (tested implicitly by Ensure succeeding).
+func TestDiskManagerResizeRepairsDirtyImage(t *testing.T) {
+	dm := NewDiskManager(DiskManagerConfig{})
+	if ok, reason := dm.Available(); !ok {
+		t.Skipf("fuse backend unavailable: %s", reason)
+	}
+	if _, err := exec.LookPath("debugfs"); err != nil {
+		t.Skip("debugfs not available to dirty the image")
+	}
+	if _, err := exec.LookPath("e2fsck"); err != nil {
+		t.Skip("e2fsck not available")
+	}
+	root := filepath.Join(t.TempDir(), "files")
+	if err := dm.Ensure(root, 64); err != nil {
+		t.Skipf("fuse mount not permitted here: %v", err)
+	}
+	img := imagePath(root)
+	// Unmount but keep the image, so we can dirty it offline.
+	if err := dm.Release(root); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	// Mark the superblock not-clean, exactly the state an interrupted metadata
+	// write leaves behind.
+	out, err := exec.Command("debugfs", "-w", "-R", "ssv state 0", img).CombinedOutput()
+	if err != nil {
+		t.Fatalf("debugfs dirty: %v: %s", err, out)
+	}
+	// A resize of a differently-sized allowance must repair and succeed.
+	if err := dm.Ensure(root, 96); err != nil {
+		t.Fatalf("Ensure on a dirty image did not self-heal: %v", err)
+	}
+	defer func() { _ = dm.Remove(root) }()
+	total, _, err := statvfs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != int64(96)*1024*1024 {
+		t.Fatalf("statvfs total after repair = %d, want 96 MiB", total)
+	}
+}

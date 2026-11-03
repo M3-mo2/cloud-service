@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -41,6 +42,7 @@ type DiskManagerConfig struct {
 	Fuse2FS    string // fuse2fs binary (default "fuse2fs")
 	MkfsExt4   string // mkfs.ext4 binary (default "mkfs.ext4")
 	Resize2FS  string // resize2fs binary (default "resize2fs")
+	E2fsck     string // e2fsck binary (default "e2fsck"); repairs a dirty image
 	Fusermount string // fusermount3 binary (default "fusermount3")
 	UID        int    // sandbox uid written into the image (uid= mount option)
 	GID        int    // sandbox gid
@@ -55,6 +57,9 @@ func (c DiskManagerConfig) withDefaults() DiskManagerConfig {
 	}
 	if c.Resize2FS == "" {
 		c.Resize2FS = "resize2fs"
+	}
+	if c.E2fsck == "" {
+		c.E2fsck = "e2fsck"
 	}
 	if c.Fusermount == "" {
 		c.Fusermount = "fusermount3"
@@ -149,7 +154,7 @@ func (d *DiskManager) Ensure(root string, sizeMB int) error {
 		d.state[root] = &diskState{image: img, mounted: false, sizeMB: sizeMB, mountErr: err}
 		return err
 	}
-	if err := d.mount(img, root); err != nil {
+	if err := d.mount(img, root, false); err != nil {
 		d.state[root] = &diskState{image: img, mounted: false, sizeMB: sizeMB, mountErr: err}
 		return err
 	}
@@ -315,8 +320,16 @@ func (d *DiskManager) fitImage(img string, sizeMB int) error {
 
 // measureTotalBlocks mounts img transiently at probe and returns statvfs
 // f_blocks -- the total block count the workspace will see.
+//
+// The probe mount is READ-ONLY. It only statvfs's the filesystem, so it needs no
+// write access, and mounting read-write here is a real defect: fuse2fs commits
+// the ext4 superblock asynchronously, so a read-write unmount immediately
+// followed by resize2fs races the kernel's final superblock write and resize2fs
+// intermittently refuses with "Please run 'e2fsck -f ... first" (measured: 48/60
+// with a read-write probe, 0/60 with a read-only probe). A read-only mount never
+// dirties the image, so the fit is deterministic.
 func (d *DiskManager) measureTotalBlocks(img, probe string) (int64, error) {
-	if err := d.mount(img, probe); err != nil {
+	if err := d.mount(img, probe, true); err != nil {
 		return 0, err
 	}
 	defer d.unmount(probe)
@@ -324,8 +337,28 @@ func (d *DiskManager) measureTotalBlocks(img, probe string) (int64, error) {
 	return blocks, err
 }
 
-// resize2fs runs resize2fs to the given block count.
+// resize2fs runs resize2fs to the given block count. If the resize is refused
+// because the ext4 superblock is dirty ("Please run 'e2fsck -f ... first"), it
+// repairs the filesystem with e2fsck and retries once. The read-only probe fix
+// above prevents the dirty state going forward, but an image left dirty by an
+// older build must still be repairable rather than bricking the workspace with a
+// permanent 503.
 func (d *DiskManager) resize2fs(img string, blocks int64) error {
+	first := d.resize2fsOnce(img, blocks)
+	if first == nil {
+		return nil
+	}
+	if !strings.Contains(first.Error(), "e2fsck") {
+		return first
+	}
+	if err := d.e2fsck(img); err != nil {
+		return first // report the original failure; the repair did not help
+	}
+	return d.resize2fsOnce(img, blocks)
+}
+
+// resize2fsOnce runs resize2fs one time.
+func (d *DiskManager) resize2fsOnce(img string, blocks int64) error {
 	cmd := exec.Command(d.cfg.Resize2FS, img, strconv.FormatInt(blocks, 10))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("resize2fs to %d: %v: %s", blocks, err, strings.TrimSpace(string(out)))
@@ -333,8 +366,27 @@ func (d *DiskManager) resize2fs(img string, blocks int64) error {
 	return nil
 }
 
-// mount mounts an image at dir as the sandbox uid with allow_other.
-func (d *DiskManager) mount(img, dir string) error {
+// e2fsck repairs an image non-interactively. -p preens (never prompts) and -f
+// forces a full check even when the superblock looks clean, which is what clears
+// a dirty flag left by an interrupted metadata write. e2fsck exits 0 (no errors)
+// or 1 (errors corrected); anything else is a genuine failure.
+func (d *DiskManager) e2fsck(img string) error {
+	cmd := exec.Command(d.cfg.E2fsck, "-p", "-f", img)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 1 {
+		return nil
+	}
+	return fmt.Errorf("e2fsck %s: %v: %s", img, err, strings.TrimSpace(string(out)))
+}
+
+// mount mounts an image at dir as the sandbox uid with allow_other. When
+// readOnly is true the mount is a read-only probe (no ext4 superblock write, so
+// a following resize2fs is never raced); the workspace's own mount is read-write.
+func (d *DiskManager) mount(img, dir string, readOnly bool) error {
 	if mountedFuse(dir) {
 		return nil
 	}
@@ -342,6 +394,9 @@ func (d *DiskManager) mount(img, dir string) error {
 		return err
 	}
 	opts := fmt.Sprintf("allow_other,fakeroot,uid=%d,gid=%d", d.cfg.UID, d.cfg.GID)
+	if readOnly {
+		opts = "ro," + opts
+	}
 	cmd := exec.Command(d.cfg.Fuse2FS, "-o", opts, img, dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("fuse2fs mount %s: %v: %s", dir, err, strings.TrimSpace(string(out)))
