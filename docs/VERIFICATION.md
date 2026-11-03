@@ -107,7 +107,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **465** (461 unit + 4 `integration`-tagged), including regression
+Test functions: **488** (484 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -2259,9 +2259,82 @@ writes through a `Sink` backed by the workspace `Fs`, whose `reserve()` refuses
 when `used+delta > diskLimit` with a `QuotaError`; `statvfs`/`Bavail` is not on
 that path at all. The disk mechanism is left unchanged (see ADR 94).
 
+## 9p. Per-workspace write-RATE ceiling (this revision)
+
+DISK TOTAL, RAM and CPU each have a real per-workspace ceiling; write RATE did
+not, so one workspace running `dd`/`git clone`/a build can starve every other
+workspace's IO. A kernel throttle is **not available here** (measured: `io.max`
+does not account the write at all because the image is on ZFS and the bio is
+generated outside the cgroup; ADR 95), and a token bucket in the engine's own
+write path only covers API uploads/archives. This revision adds a **SAMPLED**
+write-rate ceiling: the workspace's real disk growth is measured every metrics
+tick (one `statfs`, which the sampler already takes), and a run whose **sustained**
+rate exceeds its ceiling is stopped with the distinct `rate_limited` status. It
+is **DEFAULT OFF**.
+
+### 9p.1 The mechanism (measured)
+
+- `io.max` cannot limit this (measured): a writer started with
+  `CLONE_INTO_CGROUP` writing 64 MB with `oflag=direct,conv=fsync` ran at
+  **3.7 GB/s** uncapped and **3.6 GB/s** with `io.max wbps=5242880`, and the
+  cgroup's `io.stat` stayed at **0 bytes** in both runs — the controller never
+  accounted the write (ZFS generates the bio outside our cgroup). The earlier
+  invalid attempt is recorded in ADR 95: the writer's pid must be asserted in
+  `/proc/<pid>/cgroup` before any conclusion.
+- The ceiling rides the metrics sampler's tick (no second timer): per workspace
+  it computes `delta = used_now − used_prev` over a **monotonic** elapsed time.
+- A rate-kill ends the run as **`rate_limited`** (distinct from `exited`,
+  `failed`, `killed`, `oom`); the engine's own write path (API write/upload,
+  archive extraction) is refused with **429 `write_rate_exceeded`** while over
+  the ceiling.
+- `N` **consecutive** over-limit samples (`disk.write_rate_samples`, default 3)
+  are required, so a single burst is not killed.
+- The overshoot is stated as a number and is never a kernel boundary: with the
+  shipped defaults (`N = 3`, interval `3 s`) it is **9 × `write_rate_mb_s` MiB**
+  (ADR 95).
+- A rate ceiling above the workspace's own `disk_mb` is refused at config load
+  and on create/PATCH.
+
+### 9p.2 The real-nsjail acceptance
+
+`scripts/write-rate-check.sh` drives the REAL service, real nsjail and a real
+FUSE disk (bounded: at most two workspaces over the run, torn down in phases,
+with small paced writers, and a full leak check; this check writes data fast so
+it must not hammer the host). It asserts:
+
+- **DEFAULT OFF**: with `disk.write_rate_enabled` omitted, a tenant writer runs
+  undisturbed (`exited`), the enforced limit advertises `0`, and `/v1/meta`
+  reports `write_rate.enabled: false`;
+- **THE COVERAGE ASSERTION**: with it enabled and low, a **tenant's own** writer
+  started through the **runs API** (NOT an API upload) ends with the **distinct**
+  `rate_limited` outcome — not `exited`, not a generic failure;
+- the disk really grew before the stop, and the offender was stopped **before**
+  it filled its disk (the rate ceiling, not ENOSPC, ended it);
+- a **single burst** above the ceiling does **not** kill (the N-consecutive
+  rule), while a sustained rate does;
+- a run **under** the ceiling is untouched over the same window (no false
+  positives);
+- a **DELETE** inside the workspace (usage falling) is not a rate violation;
+- an **idle** workspace costs nothing extra: zero tree walks, zero extra cgroup
+  reads, exactly one `statfs` per candidate per tick (measured from the
+  sampler's own stream frames, so the measurement adds no reads);
+- the engine's **own** write path is covered too: a sustained series of API
+  uploads is refused **429 `write_rate_exceeded`**, so the two paths are
+  consistent;
+- the **advertised** limit equals the **enforced** one (`/v1/meta`, the
+  workspace limits and the metrics snapshot all name the tripped number);
+- the measured bytes written before the kill is inside the documented overshoot
+  window (`free_rate × (N+3) × interval`);
+- a `write_rate_mb_s` above `disk_mb` is **refused** (422); and
+- nothing is leaked (no mount, no cgroup, no `fuse2fs`, no orphan `disk.img`).
+
+Measured **29 passed / 0 failed**. The gate's own daemon-exe hash equals the
+built binary's; writers are explicitly bounded and cleaned, and the leak phase
+waits (bounded) for the `fuse2fs` helper to exit as the mount goes away.
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **94** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **95** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -2308,7 +2381,16 @@ measured absence of a usable RAR tool here), the `rardecode/v2` dependency
 (pure Go, MIT, no cgo) and read-only RAR, the content-based detection, the
 never-trust-the-headers rule and the streaming budget, the name/link/mode
 policy, the collision policy and `dry_run`, the export safety, and the full
-stable refusal-code table (see §9m).
+stable refusal-code table (see §9m). **#93** records the per-workspace resource
+stream (one lazy service-wide sampler, statfs disk, summed cgroups), **#94**
+records one cgroup per WORKSPACE (the advertised ceiling is the enforced
+ceiling), and **#95** records the per-workspace write-RATE ceiling: the measured
+`io.max` negative result (with the valid `CLONE_INTO_CGROUP` test and the
+invalid-attempt caveat), why a Go-side bucket covers only the API path, why the
+sampled-growth mechanism is the one chosen, the overshoot NUMBER, the
+sustained-vs-instantaneous rule, the default-OFF decision, the distinct
+`rate_limited` outcome, and the note that DISK/RAM/CPU are kernel-enforced while
+this is sampled (see §9p).
 
 ## 11. OpenAPI
 

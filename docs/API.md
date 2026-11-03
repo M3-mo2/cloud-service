@@ -97,6 +97,7 @@ additional code the router emits:
 | `not_directory` | 422 | Wrong node type for the operation | Listing a path that is a file, reading/writing/downloading a directory as a file, writing over a directory. The path exists, so this is never 404 (see discrepancies 9). |
 | `payload_too_large` | 413 | Body or file over a hard cap | JSON body > `json_body_mb`, upload > `upload_mb`, file write > `file_write_mb`, a `GET /files/content` `limit` above `file_read_mb`. |
 | `insufficient_storage` | 507 | Workspace disk quota exceeded | Write/upload/rename past `limits.disk_mb`. |
+| `write_rate_exceeded` | 429 | The workspace's sustained write rate exceeds its ceiling | The engine's **own** write path (`PUT /files/content`, `POST /files/upload`, `POST /files/archive`, `POST /files/extract`) on a workspace whose disk has grown faster than `limits.write_rate_mb_s` for N consecutive samples, while `disk.write_rate_enabled` is true. Distinct from `insufficient_storage` (the disk is not full). The SAMPLED ceiling; a tenant's own process is stopped with the `rate_limited` run status instead (see [Write rate](#write-rate)). |
 | `timeout` | 504 | Timeout | **Defined but never emitted** (see discrepancies). |
 | `tunnel_url_unavailable` | 504 | No public URL was observed in time | `POST .../tunnels` when cloudflared did not print a `trycloudflare.com` URL within `tunnels.url_timeout_sec`, including when Cloudflare's rate-limited quick-tunnel provisioning returns `429` (cloudflared's own text is in `details.reason`). The engine never fabricates a URL. |
 | `unavailable` | 503 | Sandbox backend unavailable | nsjail binary missing, or nsjail could not set up/launch the sandbox (`details.nsjail`); also when the network/tunnel layer is not configured. |
@@ -403,6 +404,7 @@ Create a workspace owned by the authenticated principal.
   | `allow_net` | `bool` | `allow_net` | `false` (own empty namespace, no egress) or `true` (egress via chained slirp4netns) |
   | `allow_unlimited_runs` | `bool` | `allow_unlimited_runs` | workspace opt-in for wall-clock-unbounded runs; `false` by default; a `true` value is rejected with `422` unless the server `max_limits.allow_unlimited_runs` is also `true` |
   | `allow_tunnels` | `bool` | `allow_tunnels` | workspace opt-in for quick tunnels; `false` by default; a `true` value is rejected with `422` unless the server `tunnels.enabled` is also `true` |
+  | `write_rate_mb_s` | `int` | `write_rate_mb_s` | per-workspace write-RATE ceiling (MiB/s), `0` by default (no rate ceiling). A SAMPLED ceiling enforced by stopping a run whose sustained disk growth exceeds it; meaningful only when the server `disk.write_rate_enabled` is true. A value above the workspace's own `disk_mb` is rejected with `422` (a workspace cannot write its whole disk in under a second). See [Write rate](#write-rate). |
 
   Unknown JSON fields are rejected (`400 validation`, `details.error`).
 - **Response 201:**
@@ -2736,6 +2738,7 @@ queued ──► running ──┬──► exited       (process returned; exit
                      ├──► timeout      (wall-clock limit; exit_code 124)
                      ├──► killed       (stop / workspace delete; exit_code 137)
                      ├──► oom          (kernel OOM at the workspace ceiling; exit_code 137)
+                     ├──► rate_limited (write rate over the ceiling; exit_code 137)
                      └──► failed       (executor error; exit_code null)
 queued | running ────────► interrupted  (recovered after a restart)
 ```
@@ -2758,6 +2761,12 @@ queued | running ────────► interrupted  (recovered after a res
 - `failed` — the executor itself returned an error (e.g. nsjail missing or a
   launch failure); `exit_code` is null and the diagnostic is not exposed on the
   run object.
+- `rate_limited` — the engine's **write-RATE** watchdog stopped the run because
+  the workspace's disk grew faster than its `write_rate_mb_s` ceiling for N
+  consecutive samples. It is distinct from `exited` (it was stopped), from
+  `failed` (nothing was wrong with the program), from `killed` (nothing was
+  requested) and from `oom` (the memory ceiling). It is only ever produced when
+  `disk.write_rate_enabled` is true (see [Write rate](#write-rate)).
 - `interrupted` — the process did not survive a service restart; startup
   recovery moves any still-`queued`/`running` run to this terminal state.
 - All terminal states are final. A stop only changes a live run to `killed`.
@@ -2777,6 +2786,7 @@ Per-workspace limits (`limits:` config; overridable at creation and via
 | Network | `limits.allow_net` | false | true | private namespace connected to the internet via chained slirp4netns (never the host network) |
 | Unbounded runs | `limits.allow_unlimited_runs` | false | false | workspace opt-in for `no_timeout:true`; **both** levels must be true |
 | Tunnels | `limits.allow_tunnels` | false | server switch `tunnels.enabled` | workspace opt-in for quick tunnels; **both** this and `tunnels.enabled` must be true, and `allow_net` must also be true |
+| Write rate | `limits.write_rate_mb_s` | 0 (off) | `max_limits.write_rate_mb_s` | per-workspace write-RATE ceiling (MiB/s); a **SAMPLED** cap enforced by stopping the offending run with the distinct `rate_limited` outcome. Meaningful only when `disk.write_rate_enabled` is true. **Both** the value and the server switch are required; a value above the workspace `disk_mb` is `422 unprocessable`. |
 
 The memory, CPU and pids ceilings all live on **one cgroup per workspace** (a
 parent cgroup named `ws-<id>`), so the advertised number is the number the kernel
@@ -2789,6 +2799,40 @@ loaded from config and always at least the defaults. `allow_unlimited_runs` and
 `allow_tunnels` are the two non-numeric ceilings: each is a switch, and the
 workspace value can only be `true` when the server switch is `true` (see
 [Unbounded runs](#unbounded-runs) and [Quick tunnels](#quick-tunnels-and-egress)).
+
+### Write rate
+
+A workspace's write RATE can be capped so one workspace running `dd`/`git
+clone`/a build cannot starve every other workspace's IO. Unlike the disk TOTAL,
+RAM and CPU (which are kernel-enforced), this ceiling is **SAMPLED**: the
+workspace's real disk growth is measured once per metrics tick (one `statfs`)
+and a run whose **sustained** rate exceeds the ceiling is stopped with the
+distinct `rate_limited` status.
+
+- **Default OFF.** It changes nothing unless an operator turns it on:
+  `disk: { write_rate_enabled: true }` plus a per-workspace
+  `limits.write_rate_mb_s` (or the `limits.write_rate_mb_s` server default).
+- **The ceiling** is `limits.write_rate_mb_s` (MiB/s), bounded by the server
+  `max_limits.write_rate_mb_s`; a value above the workspace's own `disk_mb` is
+  rejected with `422 unprocessable` (a workspace cannot write its whole disk in
+  under a second). `0` means no rate ceiling.
+- **Sustained, not instantaneous.** `N` (`disk.write_rate_samples`, default 3)
+  **consecutive** over-limit samples are required; a single burst is not killed
+  and any under-limit sample resets the counter.
+- **A rate-kill is a distinct outcome**: the offending run ends `rate_limited`
+  (never `exited`, never a generic failure). The engine's **own** write path
+  (an API write/upload or an archive extraction) has no run to stop, so it is
+  refused with `429 write_rate_exceeded` while the workspace is over its
+  ceiling; both paths enforce the **same** sampled ceiling.
+- **The overshoot is a number, not a kernel boundary.** With the shipped
+  defaults (`N = 3`, interval `3 s`) a workspace can write up to
+  `9 × write_rate_mb_s` MiB above the line before the kill. This is stated and
+  measured (see [docs/DECISIONS.md](DECISIONS.md) ADR 95); it is never presented
+  as equivalent to the disk filesystem boundary.
+- **The advertised limit is the enforced one**: `GET /v1/meta` reports
+  `write_rate` (enabled, samples, server max, the distinct outcome and refusal
+  code), and the per-workspace metrics snapshot reports `write_rate_limit_mb_s`
+  (0 when the feature is off).
 
 Process-level hard caps (`caps:` config; **not** overridable per request):
 `exec_stdout_kb` 256, `exec_stderr_kb` 256, `run_log_mb` 10, `json_body_mb` 1,

@@ -54,7 +54,7 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 
 - `GET /healthz` → 200 `{"status":"ok"}`
 - `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str},"workspace_limits":{"enabled":bool,"mechanism":str,"proc":bool,"proc_files":[str],"reason":str},"egress_decoy":{"enabled":bool,"ready":bool,"reason":str}}`
-- `GET /v1/meta` → `{"version":"0.0.19","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"workspace_limits":{"enabled":bool,"mechanism":str,"reporting":str,"enforcement":str,"limits":str},"egress_decoy":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"archives":{"enabled":bool,"formats":[str],"read_only":[str],"limits":{...},"routes":[str],"refusal_codes":[str],"semantics":str}}`
+- `GET /v1/meta` → `{"version":"0.0.19","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"workspace_limits":{"enabled":bool,"mechanism":str,"reporting":str,"enforcement":str,"limits":str},"egress_decoy":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"write_rate":{"enabled":bool,"server_max_mb_s":int,"default_mb_s":int,"samples":int,"outcome":str,"refusal_code":str,"mechanism":str,"limits":str},"archives":{"enabled":bool,"formats":[str],"read_only":[str],"limits":{...},"routes":[str],"refusal_codes":[str],"semantics":str}}`
 - `GET /metrics` → Prometheus text
 
 #### What a workspace can and cannot observe
@@ -122,11 +122,15 @@ Workspace JSON:
 ```
 
 `limits` is `{cpu_cores, memory_mb, disk_mb, max_wall_time_sec, max_runs,
-allow_net, allow_unlimited_runs, allow_tunnels}`; `allow_unlimited_runs` and
-`allow_tunnels` are boolean switches (default false) that must each be true
-(along with the matching server switch — `max_limits.allow_unlimited_runs` and
-`tunnels.enabled` respectively) before a workspace may request `no_timeout:true`
-runs or quick tunnels.
+allow_net, allow_unlimited_runs, allow_tunnels, write_rate_mb_s}`;
+`allow_unlimited_runs` and `allow_tunnels` are boolean switches (default false)
+that must each be true (along with the matching server switch —
+`max_limits.allow_unlimited_runs` and `tunnels.enabled` respectively) before a
+workspace may request `no_timeout:true` runs or quick tunnels. `write_rate_mb_s`
+(default 0 = no ceiling) is a per-workspace write-RATE ceiling in MiB/s; it is a
+**SAMPLED** cap (not a kernel boundary), enforced only when the server
+`disk.write_rate_enabled` is true, and a value above the workspace's own
+`disk_mb` is refused with 422 (see §2.2a and [DECISIONS.md](DECISIONS.md) ADR 95).
 
 `status` is `active`, `suspended` or `locked` (`deleted` exists in the type
 vocabulary but is never persisted: a deleted workspace is removed outright). The
@@ -279,6 +283,35 @@ live cgroup) costs **zero** cgroup reads and reports RAM 0; each stream holds at
 most **one pending frame** (coalesce, never queue; drops are counted); and
 `?interval=` is clamped to a configured **floor** (below it → `422`). The whole
 feature is gated on `metrics.enabled` and advertised in `GET /v1/meta`.
+
+### 2.2a Write-rate ceiling (SAMPLED, default off)
+
+A workspace's write RATE can be capped so one workspace running `dd`/`git
+clone`/a build cannot starve every other workspace's IO. Unlike the disk TOTAL,
+RAM and CPU — which are kernel-enforced (the per-workspace filesystem and the
+per-workspace cgroup) — this ceiling is **SAMPLED**: the workspace's real disk
+growth is measured once per metrics tick (one `statfs`) and a run whose
+**sustained** rate exceeds the ceiling is stopped with the distinct
+`rate_limited` status. `io.max` cannot limit this on the host (the image is on
+ZFS and the bio is generated outside the cgroup), and a byte-bucket in the
+engine's own write path would cover only API uploads, not a tenant's own
+process — hence the sampled growth, which sees every byte.
+
+- **DEFAULT OFF.** Enable with `disk: { write_rate_enabled: true }` plus a
+  per-workspace `limits.write_rate_mb_s` (or the server default). `0` = no
+  ceiling. A value above the workspace's own `disk_mb` is `422` (a workspace
+  cannot write its whole disk in under a second). The feature rides the metrics
+  sampler and needs `metrics.enabled`.
+- **Sustained, not instantaneous.** `disk.write_rate_samples` (default 3)
+  **consecutive** over-limit samples are required; a single burst is not killed
+  and any under-limit sample resets the counter.
+- **A rate-kill is distinct**: a tenant's own process ends `rate_limited`; the
+  engine's own write path (an API write/upload or an archive extraction) has no
+  run to stop, so it is refused `429 write_rate_exceeded`. Both paths enforce the
+  same sampled ceiling.
+- **The overshoot is a number, not a kernel boundary.** For the shipped defaults
+  (`N = 3`, interval `3 s`) a workspace can write up to `9 × write_rate_mb_s`
+  MiB above the line before the kill. See [DECISIONS.md](DECISIONS.md) ADR 95.
 
 ### 2.3 Files (per workspace)
 
@@ -457,13 +490,16 @@ its `output` readable.
 Run JSON:
 
 ```json
-{"id":"run_...","workspace_id":"ws_...","kind":"file|command","argv":[...],"cwd":"/","status":"queued|running|exited|killed|timeout|failed|interrupted|oom","exit_code":0,"timeout_sec":300,"unlimited":false,"interpreter":"python3","started_at":"...","ended_at":"...","logs":{"stdout_bytes":0,"stderr_bytes":0,"truncated":false}}
+{"id":"run_...","workspace_id":"ws_...","kind":"file|command","argv":[...],"cwd":"/","status":"queued|running|exited|killed|timeout|failed|interrupted|oom|rate_limited","exit_code":0,"timeout_sec":300,"unlimited":false,"interpreter":"python3","started_at":"...","ended_at":"...","logs":{"stdout_bytes":0,"stderr_bytes":0,"truncated":false}}
 ```
 
 `cwd` is always present. `timeout_sec` is `null` exactly when `unlimited` is
 `true`. `interpreter` is present for a `kind=file` run and omitted otherwise.
 `status: "oom"` marks a run the kernel's OOM killer ended at the workspace's
 memory ceiling — distinct from a clean `exited` and from an explicit `killed`.
+`status: "rate_limited"` marks a run the engine's write-RATE watchdog stopped
+because the workspace's sustained disk growth exceeded its `write_rate_mb_s`
+ceiling (see §2.2a) — distinct from `exited`, `failed`, `killed` and `oom`.
 
 **`POST /exec` does not create a run record.** Only the asynchronous
 `POST .../runs` persists a `Run`; `exec` returns its output inline and leaves no
@@ -472,7 +508,7 @@ auditable record must use `runs`.
 
 **Listing is filtered and paginated.** `GET .../runs` accepts `status`
 (repeatable or comma-separated; each value must be one of
-`queued,running,exited,killed,timeout,failed,interrupted,oom`, else `400`), `kind`
+`queued,running,exited,killed,timeout,failed,interrupted,oom,rate_limited`, else `400`), `kind`
 (`file` or `command`, else `400`), `limit` (`0`/absent means all remaining) and
 `offset` (default 0). It returns newest-first and includes `total` (the count of
 runs matching the filter **before** pagination) so offset pagination is

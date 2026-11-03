@@ -586,6 +586,33 @@ The four routes and the frame shape are in
 ADR 93; and `scripts/metrics-check.sh` asserts the whole contract against real
 nsjail and a real FUSE disk.
 
+### 4.8a The per-workspace write-RATE ceiling (sampled, default off)
+
+DISK TOTAL, RAM and CPU each have a real per-workspace ceiling; write RATE now
+has a **SAMPLED** one. A kernel throttle is unavailable (`io.max` does not
+account the write on ZFS; ADR 95), and a byte-bucket in the engine's own write
+path would miss a tenant's own `dd`. Instead the write-rate watchdog rides the
+resource stream's tick (it starts **no timer of its own**): per workspace it
+computes `delta = used_now − used_prev` over a monotonic interval and, after
+`N` (`disk.write_rate_samples`, default 3) **consecutive** over-limit samples,
+stops the offending run with the distinct `rate_limited` outcome. The engine's
+own write path (an API write/upload, an archive extraction) is refused with
+`429 write_rate_exceeded` while over the ceiling, so both sources are covered.
+It is **default off** (`disk.write_rate_enabled`), the overshoot is stated as a
+number and is not a kernel boundary, and `write_rate_mb_s > disk_mb` is refused.
+See ADR 95 and `scripts/write-rate-check.sh`.
+
+```mermaid
+flowchart TD
+    TICK["metrics tick (ONE sampler)"] --> OBS["write-rate observer<br/>(per candidate, no extra read)"]
+    OBS --> LIVE{"disk_complete<br/>AND below disk ceiling?"}
+    LIVE -->|no| RESET["reset baseline<br/>(no rate)"]
+    LIVE -->|yes| DELTA["delta = used_now - used_prev<br/>over MONOTONIC dt"]
+    DELTA --> RATE{"rate > ceiling<br/>for N consecutive ticks?"}
+    RATE -->|no| RESET
+    RATE -->|yes| KILL["stop the run(s): status rate_limited<br/>AND flag the engine's own write path<br/>(429 write_rate_exceeded)"]
+```
+
 ---
 
 ## 5. The isolation model (the heart of the project)
@@ -606,6 +633,7 @@ fly (`configs/nsjail_python.cfg.tmpl`). The rendered sandbox has:
 | `/proc` | `mount_proc: false`; a CURATED per-workspace `/proc` payload (meminfo/cpuinfo/stat/uptime/loadavg/version/vmstat/mounts) is bound RO over it | Host process/network/kernel view not visible; the workspace sees only its OWN resource facts (`free -h`, `vmstat`, a bare `df` work) | `disk.proc_enabled` (default on) **and** `identity.enabled` |
 | `/workspace` | a real per-workspace ext4 image (fuse2fs, host-side mount) sized to `disk_mb` | `df`/`stat -f`/`os.statvfs()` report the workspace's own allowance; a write past it fails `ENOSPC` (kernel boundary, no overshoot) | `disk.enabled` (default on); falls back to a sampled used-bytes watchdog |
 | cgroup v2 | ONE parent cgroup per workspace (`ws-<id>`) carries `memory.max` (bytes), `pids.max`, `cpu.max`; nsjail is pointed at it via `cgroupv2_mount`, so every run's leaf cgroup is created **inside** it | Per-WORKSPACE memory / process-count / CPU throttling, enforced as the SUM across concurrent runs (ADR 94) | **only with `--cgroupns=host`** |
+| Resource stream | the workspace's real disk growth (`statfs`), sampled once per metrics tick | Per-WORKSPACE write-RATE ceiling, **SAMPLED** (stops the run with `rate_limited` after N over-limit samples; not a kernel boundary) | `disk.write_rate_enabled` (default **off**) + `limits.write_rate_mb_s` (ADR 95) |
 | rlimits | `as` (MB), `fsize` (MB), `nofile`, `nproc`, `core=0` | Kernel-enforced ceilings | always |
 | seccomp | default-allow, KILL a dangerous denylist | `mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`, modules, keyctl, … | always |
 | identity | uid/gid map + `--user sandbox` | Runs as the unprivileged `sandbox` user | always |

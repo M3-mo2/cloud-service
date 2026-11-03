@@ -1631,6 +1631,29 @@ components:
             reporting: { type: string }
             enforcement: { type: string }
             limits: { type: string }
+        write_rate:
+          type: object
+          description: >-
+            Per-workspace write-RATE ceiling capability, reported truthfully.
+            `enabled` is the server switch (disk.write_rate_enabled, default
+            false); `samples` is N, the number of consecutive over-limit samples
+            before a run is stopped; `server_max_mb_s`/`default_mb_s` are the
+            server maximum and the per-workspace default; `outcome` is the
+            distinct run status a rate-kill produces (rate_limited) and
+            `refusal_code` is the code the engine's own write path returns
+            (write_rate_exceeded). This ceiling is SAMPLED, never a kernel
+            boundary: the worst-case overshoot is N x interval_seconds x
+            write_rate_mb_s.
+          properties:
+            enabled: { type: boolean }
+            server_max_mb_s: { type: integer }
+            default_mb_s: { type: integer }
+            samples: { type: integer }
+            outcome: { type: string, examples: [rate_limited] }
+            refusal_code: { type: string, examples: [write_rate_exceeded] }
+            mechanism: { type: string }
+            limits: { type: string }
+            one_line_enable: { type: string }
         subscriptions:
           type: object
           description: >-
@@ -1754,6 +1777,10 @@ components:
         allow_tunnels:
           type: boolean
           description: "Workspace opt-in for quick Cloudflare tunnels. A true value is rejected with 422 unless tunnels.enabled is also true; a tunnel additionally requires allow_net."
+        write_rate_mb_s:
+          type: integer
+          description: "Per-workspace write-RATE ceiling in MiB/s; 0 (the default) means no rate ceiling. A SAMPLED cap enforced by stopping a run whose sustained disk growth exceeds it (disk.write_rate_enabled must be true). A value above the workspace disk_mb is rejected with 422."
+          examples: [0]
     Workspace:
       type: object
       required: [id, owner_id, name, profile, created_at, status, limits]
@@ -1863,6 +1890,7 @@ components:
         allow_net: { type: [boolean, "null"] }
         allow_unlimited_runs: { type: [boolean, "null"] }
         allow_tunnels: { type: [boolean, "null"] }
+        write_rate_mb_s: { type: [integer, "null"] }
     PatchWorkspaceRequest:
       type: object
       description: "Partial workspace update; absent fields keep their current value."
@@ -1956,6 +1984,9 @@ components:
         disk_complete:
           type: boolean
           description: "false when the workspace root is not a live mount."
+        write_rate_limit_mb_s:
+          type: integer
+          description: "The workspace's ENFORCED write-RATE ceiling in MiB/s, or 0 when no rate ceiling is in force (disk.write_rate_enabled off, or the workspace's write_rate_mb_s is 0). A SAMPLED ceiling: the reported limit is the number the watchdog enforces."
         live_runs: { type: integer }
         live_cgroups: { type: integer }
         cpu_usage_usec:
@@ -2243,8 +2274,8 @@ components:
         unlimited: { type: boolean, description: "True when the run has no wall-clock limit." }
         status:
           type: string
-          enum: [queued, running, exited, killed, timeout, failed, interrupted, oom]
-          description: "`oom` is a run the kernel's OOM killer ended at the workspace's memory ceiling; it is distinct from a clean `exited` and from an explicit `killed`."
+          enum: [queued, running, exited, killed, timeout, failed, interrupted, oom, rate_limited]
+          description: "`oom` is a run the kernel's OOM killer ended at the workspace's memory ceiling; `rate_limited` is a run the write-RATE watchdog stopped because the workspace's sustained write rate exceeded its write_rate_mb_s ceiling. Both are distinct from a clean `exited` and from an explicit `killed`."
         exit_code: { type: [integer, "null"] }
         started_at: { type: string, format: date-time }
         ended_at: { type: string, format: date-time }

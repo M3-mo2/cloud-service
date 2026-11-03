@@ -42,6 +42,14 @@ limits:
   # tunnels.enabled are true; a tunnel also needs allow_net (cloudflared must
   # reach Cloudflare). Default false (deny).
   allow_tunnels: false
+  # Per-workspace write-RATE ceiling (MiB/s). DEFAULT 0 (no rate ceiling), and
+  # the whole feature is OFF unless the server switch disk.write_rate_enabled is
+  # true. Unlike disk/RAM/CPU it is SAMPLED: the workspace's real disk growth is
+  # measured once per metrics tick and a run whose SUSTAINED rate exceeds the
+  # ceiling is stopped with the distinct `rate_limited` outcome (the engine's own
+  # write path is refused with 429 write_rate_exceeded). A value above this
+  # workspace's own disk_mb is refused (422). See docs/DECISIONS.md ADR 95.
+  write_rate_mb_s: 0
 
 # Server-level maxima. No workspace may exceed these at creation or via PATCH;
 # a request above a maximum is rejected with 422 (never silently clamped).
@@ -57,6 +65,10 @@ max_limits:
   # true, an individual workspace still has to opt in via its own
   # limits.allow_unlimited_runs (or a PATCH). Default false (deny).
   allow_unlimited_runs: false
+  # Server maximum for the per-workspace write-RATE ceiling (MiB/s). 0 means no
+  # workspace may set one; a value can only be a rate the server is willing to
+  # enforce. See limits.write_rate_mb_s and docs/DECISIONS.md ADR 95.
+  write_rate_mb_s: 0
 
 # Output and body caps (bytes / sizes). These are hard ceilings.
 caps:
@@ -308,6 +320,20 @@ disk:
   # bare df report the workspace's own resources. It is mounted only when
   # host-identity masking is also on, so the two channels can never disagree.
   proc_enabled: true
+  # Per-workspace write-RATE ceiling switch. DEFAULT false, so this new behaviour
+  # changes no existing deployment. The one-line enable is
+  # `disk: { write_rate_enabled: true }` together with a per-workspace
+  # limits.write_rate_mb_s. The ceiling is SAMPLED (the workspace's real disk
+  # growth, one statfs per metrics tick) and enforced by stopping the offending
+  # run with the distinct `rate_limited` outcome; it needs the metrics sampler
+  # (metrics.enabled) because it rides that tick and starts no timer of its own.
+  # See docs/DECISIONS.md ADR 95.
+  write_rate_enabled: false
+  # N: how many CONSECUTIVE over-limit samples stop an offending run. Default 3.
+  # A single burst above the ceiling is legitimate and must not kill a run; only
+  # a sustained rate does. Exposed so an operator can trade responsiveness for
+  # tolerance.
+  write_rate_samples: 3
 
 # Workspace subscriptions: a running term with an ABSOLUTE expiry instant.
 #
