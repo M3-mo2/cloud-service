@@ -352,6 +352,108 @@ else
   fail "subscription.pure-functions" "internal/subscription is missing the pure Decide or ParseDuration function"
 fi
 
+# --- 4d-quinquies. the archive acceptance harness exists and is documented -----
+# archive-check.sh is the only check that drives the REAL extraction boundary
+# against real nsjail and a real FUSE disk, so it must exist, be executable, be
+# named in VERIFICATION.md and be wired into the Makefile -- it cannot silently
+# rot. It reads fixtures only from the COMMITTED internal/archive/testdata tree.
+
+if [ -f scripts/archive-check.sh ]; then
+  ok "archive-harness.exists"
+else
+  fail "archive-harness.exists" "scripts/archive-check.sh is missing"
+fi
+if [ -x scripts/archive-check.sh ]; then
+  ok "archive-harness.executable"
+else
+  fail "archive-harness.executable" "scripts/archive-check.sh is not executable"
+fi
+if grep -qF 'archive-check.sh' docs/VERIFICATION.md; then
+  ok "archive-harness.documented"
+else
+  fail "archive-harness.documented" "docs/VERIFICATION.md does not mention scripts/archive-check.sh"
+fi
+if grep -qE '^archive-check:' Makefile; then
+  ok "makefile.target.archive-check"
+else
+  fail "makefile.target.archive-check" "Makefile has no 'archive-check:' target"
+fi
+if grep -qE 'bash scripts/archive-check.sh' Makefile; then
+  ok "makefile.sudo.archive-check"
+else
+  fail "makefile.sudo.archive-check" "Makefile's 'archive-check' target does not run scripts/archive-check.sh"
+fi
+if grep -qE '^\.PHONY:.*\barchive-check\b' Makefile; then
+  ok "makefile.phony.archive-check"
+else
+  fail "makefile.phony.archive-check" "'archive-check' is not in .PHONY"
+fi
+
+# The archive feature (this iteration): the config section, the ADR, the
+# in-engine extraction, the streaming budget, the read-only-RAR asymmetry, the
+# committed fixtures, the export and the meta capability must all be documented
+# and wired, so they cannot silently regress.
+if grep -qF 'archives:' configs/config.example.yaml && grep -qF 'ArchivesConfig struct' internal/config/config.go; then
+  ok "archive.config"
+else
+  fail "archive.config" "the archives section is missing from configs/config.example.yaml or internal/config/config.go"
+fi
+if grep -qF 'max_total_mb: 2048' configs/config.example.yaml && grep -qF 'formats: ["zip", "rar"]' configs/config.example.yaml; then
+  ok "archive.config-defaults"
+else
+  fail "archive.config-defaults" "configs/config.example.yaml must show the real archive defaults (max_total_mb: 2048, formats: [\"zip\", \"rar\"])"
+fi
+if grep -qF 'ADR 92' docs/DECISIONS.md; then
+  ok "archive.adr"
+else
+  fail "archive.adr" "docs/DECISIONS.md is missing ADR 92 (native archives)"
+fi
+if grep -qiF 'rardecode' docs/DECISIONS.md && grep -qiF 'read-only' docs/DECISIONS.md; then
+  ok "archive.adr-rardecode-readonly"
+else
+  fail "archive.adr-rardecode-readonly" "ADR 92 must record the rardecode/v2 dependency and that RAR is read-only"
+fi
+if grep -qiF 'streaming budget' docs/DECISIONS.md; then
+  ok "archive.adr-streaming-budget"
+else
+  fail "archive.adr-streaming-budget" "ADR 92 must record the streaming budget (validate/write before trusting headers)"
+fi
+if grep -qiF 'rar3-' docs/DECISIONS.md; then
+  ok "archive.adr-rar3-naming-note"
+else
+  fail "archive.adr-rar3-naming-note" "ADR 92 must note the rar3-* / RAR4 naming (RAR3.x == RAR4 generation)"
+fi
+if [ -d internal/archive/testdata/zip ] && [ -f internal/archive/testdata/rar4/subdirs.rar ] && [ -f internal/archive/testdata/rar5/subdirs.rar ]; then
+  ok "archive.fixtures-committed"
+else
+  fail "archive.fixtures-committed" "the committed internal/archive/testdata fixtures are missing"
+fi
+if grep -qF 'internal/archive/testdata' scripts/archive-check.sh && ! grep -qF '/tmp/fixtures' scripts/archive-check.sh; then
+  ok "archive.harness-reads-committed-fixtures"
+else
+  fail "archive.harness-reads-committed-fixtures" "scripts/archive-check.sh must read fixtures from internal/archive/testdata, never /tmp"
+fi
+if grep -qi 'archives' internal/api/router.go && grep -qF 'refusal_codes' internal/api/router.go; then
+  ok "archive.meta-advertised"
+else
+  fail "archive.meta-advertised" "GET /v1/meta does not advertise the archives capability"
+fi
+if grep -qF 'POST /v1/workspaces/{workspaceID}/files/archive' docs/API.md && grep -qF 'GET /v1/workspaces/{workspaceID}/files/archive' docs/API.md && grep -qF 'POST /v1/workspaces/{workspaceID}/files/extract' docs/API.md; then
+  ok "archive.routes-documented"
+else
+  fail "archive.routes-documented" "the three archive routes are not all documented in docs/API.md"
+fi
+if grep -qF 'files/archive' api/openapi.yaml && grep -qF 'files/extract' api/openapi.yaml && grep -qF 'ArchiveResult' api/openapi.yaml; then
+  ok "archive.openapi"
+else
+  fail "archive.openapi" "the archive routes/schema are missing from api/openapi.yaml"
+fi
+if grep -qF 'archive.BuildMarker' cmd/sandboxd/main.go && grep -qF 'BuildMarker' internal/archive/format.go; then
+  ok "archive.build-marker"
+else
+  fail "archive.build-marker" "the archive build marker is not logged at startup / defined"
+fi
+
 # The masking shim source and the embedded artifact must both be present, so a
 # stale or missing .so cannot silently disable the mask.
 if [ -f internal/executor/hostmask/hostmask.c ]; then
