@@ -3,7 +3,7 @@ PKG := ./...
 GO ?= go
 CC ?= cc
 
-.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check spread-check tunnel-check identity-check egress-decoy-check subscription-check archive-check metrics-check docs-check
+.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check spread-check tunnel-check identity-check egress-decoy-check subscription-check archive-check metrics-check write-rate-check docs-check
 
 all: fmt vet shim build test
 
@@ -164,6 +164,18 @@ archive-check:
 # the host).
 metrics-check:
 	sudo -E bash scripts/metrics-check.sh
+
+# Per-workspace write-RATE ceiling acceptance against REAL nsjail and a REAL
+# FUSE disk on the host (needs root, no container). It asserts the SAMPLED
+# ceiling that stops a workspace starving others: DEFAULT OFF changes nothing;
+# a tenant's OWN writer (a runs-API process, NOT an API upload) trips a
+# distinct rate_limited outcome; a single burst does not kill; a run under the
+# ceiling is untouched; a DELETE is not a violation; idle costs nothing; the
+# engine's own write path is refused with 429 write_rate_exceeded too; the
+# advertised limit equals the enforced one; the overshoot is inside the
+# documented window; and nothing is leaked.
+write-rate-check:
+	sudo -E bash scripts/write-rate-check.sh
 
 # Documentation-consistency gate. It derives its assertions from the code
 # (router, error constants, test count) rather than the prose, so it fails when

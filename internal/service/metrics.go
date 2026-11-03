@@ -149,14 +149,24 @@ func (p *metricsProvider) Candidates() []metrics.WorkspaceInfo {
 	p.svc.mu.Unlock()
 
 	out := make([]metrics.WorkspaceInfo, 0, len(inv))
+	rateOn := p.svc.WriteRateEnabled()
 	for id, c := range inv {
+		// The advertised write-rate ceiling is the ENFORCED one: it is reported
+		// only while the server switch is on, so the snapshot never advertises a
+		// limit that is not in force (the per-workspace value stays visible in
+		// the workspace's own limits, with meta.write_rate.enabled explaining
+		// whether it is enforced).
+		rateLimit := int64(0)
+		if rateOn {
+			rateLimit = c.rateLimit
+		}
 		out = append(out, metrics.WorkspaceInfo{
 			ID:                id,
 			OwnerID:           c.ownerID,
 			DiskRoot:          p.svc.store.WorkspaceRoot(id),
 			DiskLimitBytes:    c.diskLimit,
 			MemoryLimitBytes:  c.memoryLimit,
-			WriteRateLimitMBs: c.rateLimit,
+			WriteRateLimitMBs: rateLimit,
 			// The parent cgroup's memory.max is the ENFORCED ceiling. The
 			// sampler reads it only while a run/session is live, so an idle
 			// workspace still costs zero cgroup reads.

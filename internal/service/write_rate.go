@@ -240,6 +240,7 @@ func (s *Service) observeWriteRates(snap metrics.Snapshot) {
 			s.rateState[w.WorkspaceID] = st
 		}
 		dt := time.Duration(0)
+		prevUsed := st.prevUsed
 		if st.hasBaseline {
 			dt = now.Sub(st.prevMono)
 		}
@@ -255,8 +256,8 @@ func (s *Service) observeWriteRates(snap metrics.Snapshot) {
 		}
 		s.rateState[w.WorkspaceID] = &next
 		rateBps := float64(0)
-		if dt > 0 {
-			rateBps = float64(w.DiskUsedBytes-next.prevUsed) / dt.Seconds()
+		if st.hasBaseline && dt > 0 && w.DiskUsedBytes >= prevUsed {
+			rateBps = float64(w.DiskUsedBytes-prevUsed) / dt.Seconds()
 		}
 		s.rateMu.Unlock()
 

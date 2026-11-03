@@ -620,6 +620,79 @@ else
   fail "makefile.phony.spread-check" "'spread-check' is not in .PHONY"
 fi
 
+# --- 4d-octies. the write-RATE ceiling and its harness ------------------------
+# The per-workspace write-RATE ceiling is SAMPLED and default OFF. It must be
+# documented (the measured io.max negative result, the coverage claim, the
+# overshoot number, the sustained-vs-instantaneous rule) and its artifact and
+# harness must not silently regress out of the tree.
+if [ -f scripts/write-rate-check.sh ]; then
+  ok "write-rate-harness.exists"
+else
+  fail "write-rate-harness.exists" "scripts/write-rate-check.sh is missing"
+fi
+if [ -x scripts/write-rate-check.sh ]; then
+  ok "write-rate-harness.executable"
+else
+  fail "write-rate-harness.executable" "scripts/write-rate-check.sh is not executable"
+fi
+if grep -qF 'write-rate-check.sh' docs/VERIFICATION.md; then
+  ok "write-rate-harness.documented"
+else
+  fail "write-rate-harness.documented" "docs/VERIFICATION.md does not mention scripts/write-rate-check.sh"
+fi
+if grep -qE '^write-rate-check:' Makefile; then
+  ok "makefile.target.write-rate-check"
+else
+  fail "makefile.target.write-rate-check" "Makefile has no 'write-rate-check:' target"
+fi
+if grep -qE 'bash scripts/write-rate-check.sh' Makefile; then
+  ok "makefile.sudo.write-rate-check"
+else
+  fail "makefile.sudo.write-rate-check" "Makefile's 'write-rate-check' target does not run scripts/write-rate-check.sh"
+fi
+if grep -qE '^\.PHONY:.*\bwrite-rate-check\b' Makefile; then
+  ok "makefile.phony.write-rate-check"
+else
+  fail "makefile.phony.write-rate-check" "'write-rate-check' is not in .PHONY"
+fi
+# The feature: the config keys, the ADR, the distinct status, the pure
+# arithmetic and the sampled (never kernel) framing must all be documented.
+if grep -qF 'write_rate_enabled' internal/config/config.go && grep -qF 'write_rate_mb_s' internal/config/config.go; then
+  ok "write-rate.config"
+else
+  fail "write-rate.config" "the write-rate config keys are missing from internal/config/config.go"
+fi
+if grep -qF 'ADR 95' docs/DECISIONS.md; then
+  ok "write-rate.adr"
+else
+  fail "write-rate.adr" "docs/DECISIONS.md is missing ADR 95 (write-rate ceiling)"
+fi
+if grep -qF 'RunRateLimited' internal/model/types.go && grep -qF 'rate_limited' docs/DECISIONS.md; then
+  ok "write-rate.status"
+else
+  fail "write-rate.status" "the distinct rate_limited run status is missing from the model or ADR 95"
+fi
+if grep -qF 'advanceRate' internal/service/write_rate.go; then
+  ok "write-rate.arithmetic"
+else
+  fail "write-rate.arithmetic" "the pure advanceRate arithmetic is missing from internal/service/write_rate.go"
+fi
+if grep -qiF 'io.max' docs/DECISIONS.md && grep -qiF 'ZFS' docs/DECISIONS.md; then
+  ok "write-rate.adr-iomax-negative"
+else
+  fail "write-rate.adr-iomax-negative" "ADR 95 must record the measured io.max/ZFS negative result"
+fi
+if grep -qiF 'overshoot' docs/DECISIONS.md && grep -qF 'write_rate' api/openapi.yaml; then
+  ok "write-rate.documented"
+else
+  fail "write-rate.documented" "the write-rate capability is not documented in docs/DECISIONS.md and api/openapi.yaml"
+fi
+if grep -qF 'write_rate_mb_s' docs/API.md && grep -qF 'write_rate_exceeded' docs/API.md; then
+  ok "write-rate.api-documented"
+else
+  fail "write-rate.api-documented" "write_rate_mb_s / write_rate_exceeded are not documented in docs/API.md"
+fi
+
 # The masking shim source and the embedded artifact must both be present, so a
 # stale or missing .so cannot silently disable the mask.
 if [ -f internal/executor/hostmask/hostmask.c ]; then
