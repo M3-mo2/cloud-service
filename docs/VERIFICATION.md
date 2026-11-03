@@ -43,7 +43,8 @@ reports `"cgroups":true`.
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `131 passed / 0 failed / 2 skipped`
 > - `BASE=http://127.0.0.1:8099 KEY=… OTHER_KEY=… DATA_DIR=… NSJAIL=/usr/local/bin/nsjail sudo -n bash scripts/acceptance.sh` → `113 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/subscription-check.sh` → `61 passed / 0 failed`
-> - `bash scripts/docs-consistency.sh` → `193 passed / 0 failed`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/archive-check.sh` → `101 passed / 0 failed`
+> - `bash scripts/docs-consistency.sh` → `222 passed / 0 failed`
 >
 > The unprivileged suites (`gofmt`, `go build`, `go vet`, `go test ./...`, the
 > handler-level assertions and the sandbox-config render tests) were re-run and
@@ -2276,23 +2277,39 @@ identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/
       disk.dfh_root_ok ok ; disk.dfh_root_has_row yes
       disk.df_bare_workspace_1k 262144
       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
-docs-consistency.sh             193 passed / 0 failed
-go test ./...                  442 test functions (from 353)
+docs-consistency.sh             222 passed / 0 failed
+ go test ./...                  442 test functions (from 353)
 ```
 
 The full gate set re-run for this revision, one gate at a time (concurrent runs
 corrupt the `docs-consistency` tally), all green:
 
 ```
-scripts/docs-consistency.sh     193 passed / 0 failed
+scripts/docs-consistency.sh     222 passed / 0 failed   (193 before the archive additions)
 scripts/acceptance.sh           113 passed / 0 failed
 scripts/process-stop-check.sh    25 passed / 0 failed
 scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped   (real quick tunnel)
-scripts/identity-check.sh       131 passed / 0 failed / 2 skipped
+scripts/identity-check.sh       131 passed / 0 failed / 2 skipped   (run 3x: 131/0/2 each)
 scripts/egress-decoy-check.sh    58 passed / 0 failed / 0 skipped
 scripts/subscription-check.sh    61 passed / 0 failed             (compressed clock; see §9l)
+scripts/archive-check.sh        101 passed / 0 failed             (native archives; see §9m)
 go test ./...                    442 test functions; go vet ./... clean
 ```
+
+`scripts/archive-check.sh` is the new gate for this revision: it extracts the
+COMMITTED `internal/archive/testdata` fixtures through the real API under real
+nsjail, so it cannot pass without them. Measured `101 passed / 0 failed`: a
+normal zip (nested dirs, empty file, unicode name) extracts; a `../` traversal,
+an absolute path, a hostile RAR symlink and hardlink are all refused with `422
+archive_unsafe_entry` and **nothing is written outside** (the would-be escape
+paths are asserted absent); a setuid entry lands `0755` not `4755`; a zip bomb
+and a ratio bomb are refused without the workspace disk growing; an encrypted
+ZIP/RAR and a multi-volume RAR are refused; random bytes, an empty file and a
+truncated zip are refused with the daemon still alive; `dry_run` writes nothing
+and reports the entries; `overwrite:false` refuses a collision with `409
+archive_entry_exists` and preserves the content while `overwrite:true` replaces
+it; `POST /files/extract` works on an uploaded archive; and `GET /files/archive`
+streams a valid zip containing the tree. No fuse2fs, mount or cgroup is left.
 
 `identity-check.sh` §1b and §1c are the new assertions: the curated `/proc`
 reports only the workspace's own limits (with the host memory asserted ABSENT),
