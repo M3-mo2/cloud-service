@@ -10,6 +10,7 @@ import (
 
 	"sandboxd/internal/config"
 	"sandboxd/internal/executor"
+	"sandboxd/internal/metrics"
 	"sandboxd/internal/model"
 	"sandboxd/internal/storage"
 	"sandboxd/internal/workspace"
@@ -45,6 +46,15 @@ type Service struct {
 	reaperOnce bool
 	reaperDone chan struct{}
 
+	// Per-workspace resource stream (RAM + disk). metrics is nil when the
+	// feature is disabled. The sampler starts lazily on the first subscriber and
+	// stops on the last, so an unwatched service costs exactly zero; the
+	// reconcile loop only refreshes the inventory on a slower cadence.
+	metrics              *metrics.Sampler
+	metricsProvider      *metricsProvider
+	metricsReconcileOnce bool
+	metricsDone          chan struct{}
+
 	// now is the service clock. It is time.Now in production and is overridden
 	// in tests so a whole subscription lifecycle can be asserted without
 	// sleeping. Every subscription decision reads it, so tests are deterministic.
@@ -65,15 +75,16 @@ type runningRun struct {
 // New constructs a Service.
 func New(cfg config.Config, store *storage.Store, runner executor.Runner, logger *slog.Logger) *Service {
 	s := &Service{
-		cfg:        cfg,
-		store:      store,
-		runner:     runner,
-		logger:     logger,
-		runs:       make(map[string]*runningRun),
-		sessions:   make(map[string]*liveSession),
-		diskDone:   make(chan struct{}),
-		reaperDone: make(chan struct{}),
-		now:        time.Now,
+		cfg:         cfg,
+		store:       store,
+		runner:      runner,
+		logger:      logger,
+		runs:        make(map[string]*runningRun),
+		sessions:    make(map[string]*liveSession),
+		diskDone:    make(chan struct{}),
+		reaperDone:  make(chan struct{}),
+		metricsDone: make(chan struct{}),
+		now:         time.Now,
 	}
 	if cfg.Disk.Enabled {
 		id := executor.ResolveIdentity(cfg)
@@ -91,6 +102,10 @@ func New(cfg config.Config, store *storage.Store, runner executor.Runner, logger
 	// is a no-op otherwise. Starting it here is cheap (one goroutine + a ticker
 	// in counter mode only).
 	s.startDiskWatchdog()
+	// Wire the metrics sampler (it does not start its goroutine here: that is
+	// lazy, on the first subscriber) and the slower inventory reconcile loop.
+	s.initMetrics()
+	s.startMetricsReconcile()
 	return s
 }
 

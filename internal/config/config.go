@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"time"
 
 	"github.com/knadh/koanf/parsers/yaml"
@@ -28,7 +29,80 @@ type Config struct {
 	Disk         DiskConfig         `koanf:"disk"`
 	Subscription SubscriptionConfig `koanf:"subscription"`
 	Archives     ArchivesConfig     `koanf:"archives"`
+	Metrics      MetricsConfig      `koanf:"metrics"`
 	Keys         []KeyConfig        `koanf:"keys"`
+}
+
+// MetricsConfig controls the per-workspace resource stream (RAM + disk), the
+// LIGHT feature described in docs/DECISIONS.md ADR 93. Every key is defaulted so
+// nothing changes unless an operator uses it, and the routes are gated on
+// enabled.
+//
+// The interval is CLAMPED, not merely documented: a client asking for 10ms
+// cannot make the engine sample 100x/s. Below the floor a request is refused
+// (422); above the ceiling it is clamped down. Default 3s, floor 1s.
+type MetricsConfig struct {
+	// Enabled is the server-level switch. false (not the default) refuses every
+	// metrics route with 404. Default true.
+	Enabled bool `koanf:"enabled"`
+	// Interval is the default stream cadence and the floor/ceiling reference.
+	// Default "3s". Clamped into [min_interval, max_interval].
+	Interval string `koanf:"interval"`
+	// MinInterval is the enforced FLOOR: no client may request a faster cadence.
+	// Default "1s".
+	MinInterval string `koanf:"min_interval"`
+	// MaxInterval is the enforced ceiling on the worker's own cadence. Default
+	// "300s".
+	MaxInterval string `koanf:"max_interval"`
+	// IncludeCPU adds the cpu.stat (usage_usec) and pids.current fields. They
+	// are the most expensive files (31 µs and 25 µs) and are OFF by default;
+	// include:=false reads only memory.current and memory.max per live cgroup.
+	IncludeCPU bool `koanf:"include_cpu"`
+	// IdleReconcileInterval is how often the candidate workspace set (its
+	// inventory, owners and limits) is refreshed. It is deliberately slower than
+	// the sample cadence: the live-cgroup set comes from the executor's existing
+	// in-memory tracking every tick, so only the inventory needs reconciling.
+	// Default "15s".
+	IdleReconcileInterval string `koanf:"idle_reconcile_interval"`
+	// MaxSubscribers caps concurrently connected streams. Past it a Subscribe is
+	// refused rather than allowing unbounded goroutines. Default 1024.
+	MaxSubscribers int `koanf:"max_subscribers"`
+}
+
+// EnabledOrDefault reports whether the metrics routes should be served.
+func (m MetricsConfig) EnabledOrDefault() bool { return m.Enabled }
+
+// MetricsInterval parses interval, defaulting to 3s.
+func (m MetricsConfig) MetricsInterval() time.Duration {
+	return parseDurationOr(m.Interval, 3*time.Second)
+}
+
+// MetricsMinInterval parses min_interval, defaulting to 1s.
+func (m MetricsConfig) MetricsMinInterval() time.Duration {
+	return parseDurationOr(m.MinInterval, time.Second)
+}
+
+// MetricsMaxInterval parses max_interval, defaulting to 300s.
+func (m MetricsConfig) MetricsMaxInterval() time.Duration {
+	return parseDurationOr(m.MaxInterval, 300*time.Second)
+}
+
+// MetricsReconcileInterval parses idle_reconcile_interval, defaulting to 15s.
+func (m MetricsConfig) MetricsReconcileInterval() time.Duration {
+	return parseDurationOr(m.IdleReconcileInterval, 15*time.Second)
+}
+
+// parseDurationOr parses a Go duration string, falling back to def on empty or
+// a parse error (an invalid value never disables the clamp).
+func parseDurationOr(s string, def time.Duration) time.Duration {
+	if strings.TrimSpace(s) == "" {
+		return def
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
 }
 
 // SubscriptionConfig controls workspace subscription terms (a running term with
@@ -740,6 +814,15 @@ func Default() Config {
 			SkipJunk:   true,
 			Formats:    []string{"zip", "rar"},
 		},
+		Metrics: MetricsConfig{
+			Enabled:               true,
+			Interval:              "3s",
+			MinInterval:           "1s",
+			MaxInterval:           "300s",
+			IncludeCPU:            false,
+			IdleReconcileInterval: "15s",
+			MaxSubscribers:        1024,
+		},
 		Keys: []KeyConfig{},
 	}
 }
@@ -993,6 +1076,25 @@ func (c *Config) applyDefaults() {
 	if len(arc.Formats) == 0 {
 		arc.Formats = d.Archives.Formats
 	}
+	// Metrics: the numeric/string cadences default when empty. Enabled is
+	// deliberately NOT touched here: its default lives in rawDefaults so an
+	// explicit `metrics.enabled: false` survives.
+	met := &c.Metrics
+	if met.Interval == "" {
+		met.Interval = d.Metrics.Interval
+	}
+	if met.MinInterval == "" {
+		met.MinInterval = d.Metrics.MinInterval
+	}
+	if met.MaxInterval == "" {
+		met.MaxInterval = d.Metrics.MaxInterval
+	}
+	if met.IdleReconcileInterval == "" {
+		met.IdleReconcileInterval = d.Metrics.IdleReconcileInterval
+	}
+	if met.MaxSubscribers <= 0 {
+		met.MaxSubscribers = d.Metrics.MaxSubscribers
+	}
 }
 
 func rawDefaults() []byte {
@@ -1109,5 +1211,13 @@ archives:
   overwrite: false
   skip_junk: true
   formats: ["zip", "rar"]
+metrics:
+  enabled: true
+  interval: "3s"
+  min_interval: "1s"
+  max_interval: "300s"
+  include_cpu: false
+  idle_reconcile_interval: "15s"
+  max_subscribers: 1024
 `)
 }

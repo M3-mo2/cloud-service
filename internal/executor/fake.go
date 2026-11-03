@@ -57,6 +57,10 @@ type FakeRunner struct {
 	KilledProcesses []int
 	killedPids      map[int]bool
 	reaped          int
+
+	// RunCgroups, when set, is returned by RunCgroupDirs so the metrics sampler
+	// can be tested without a real cgroup hierarchy.
+	RunCgroups map[string]string
 }
 
 // fakeLive is an in-memory LiveProcess for tests.
@@ -293,6 +297,17 @@ func (f *FakeRunner) ReapOrphans() int {
 	return n
 }
 
+// RunCgroupDirs returns the fake's configured run -> cgroup map (a copy).
+func (f *FakeRunner) RunCgroupDirs() map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]string, len(f.RunCgroups))
+	for id, dir := range f.RunCgroups {
+		out[id] = dir
+	}
+	return out
+}
+
 // SetOrphans configures how many orphans ReapOrphans reports.
 func (f *FakeRunner) SetOrphans(n int) {
 	f.mu.Lock()
@@ -390,6 +405,10 @@ func (l *fakeLive) Close() error {
 
 // Pid returns the fake process id.
 func (l *fakeLive) Pid() int { return l.pid }
+
+// CgroupDir returns "" (the fake has no cgroup). The service's metrics provider
+// joins a fake session's cgroup and finds none, which is the honest answer.
+func (l *fakeLive) CgroupDir() string { return "" }
 
 // Kill ends the fake process as killed.
 func (l *fakeLive) Kill() bool {

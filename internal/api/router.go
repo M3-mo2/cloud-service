@@ -53,6 +53,13 @@ func (s *Server) Router() http.Handler {
 
 		r.Get("/meta", s.handleMeta)
 
+		// Per-workspace resource stream (RAM + disk). Both the stream (SSE) and
+		// the one-shot snapshot are served service-wide and per workspace. They
+		// are gated on metrics.enabled; a scoped stream carries only the
+		// principal's own workspaces.
+		r.Get("/metrics", s.handleMetricsSnapshot)
+		r.Get("/metrics/stream", s.handleMetricsStream)
+
 		r.Route("/workspaces", func(r chi.Router) {
 			r.Post("/", s.handleCreateWorkspace)
 			r.Get("/", s.handleListWorkspaces)
@@ -67,6 +74,8 @@ func (s *Server) Router() http.Handler {
 				r.Post("/stop", s.handleStopWorkspace)
 				r.Post("/subscription/extend", s.handleExtendSubscription)
 				r.Get("/usage", s.handleUsage)
+				r.Get("/metrics", s.handleWorkspaceMetricsSnapshot)
+				r.Get("/metrics/stream", s.handleWorkspaceMetricsStream)
 
 				r.Get("/processes", s.handleListProcesses)
 				r.Post("/processes/{processID}/stop", s.handleStopProcess)
@@ -404,6 +413,28 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		},
 		"semantics": "extraction validates every entry before writing (a refused archive leaves no partial tree); an entry that escapes the destination, is a symlink/hardlink, or sets a privileged bit is refused, and the bytes written are bounded by a streaming budget so a lying header cannot overshoot; overwrite:false (the default) refuses to clobber an existing file with 409 archive_entry_exists",
 	}
+	// Per-workspace resource stream: RAM + disk, pushed at a configurable
+	// interval. Advertised truthfully: the effective (clamped) cadence, the
+	// enforced floor and ceiling, whether the expensive cpu/pids extras are on,
+	// and the subscriber ceiling. The RAM figure is the SUM over a workspace's
+	// per-run and per-session cgroups; disk is one statfs (never a tree walk).
+	metricsOn, metInterval, metMin, metMax, metCPU, metMaxSubs := s.svc.MetricsStatus()
+	metricsCap := map[string]any{
+		"enabled":          metricsOn,
+		"interval_seconds": metInterval,
+		"min_interval_sec": metMin,
+		"max_interval_sec": metMax,
+		"include_cpu":      metCPU,
+		"max_subscribers":  metMaxSubs,
+		"mechanism":        "one service-wide sampler goroutine (lazily started on the first subscriber, stopped on the last), one sample per tick fanned out to every subscriber; disk from a single statfs (O(1), never a tree walk); RAM summed over the workspace's per-run and per-session cgroups; idle workspaces cost zero cgroup reads",
+		"limits":           "a client may not request a cadence below min_interval_sec (422); a workspace with no live cgroup reports RAM 0; each stream holds at most one pending frame (coalesce, never queue) and drops are counted",
+		"routes": []string{
+			"GET /v1/metrics",
+			"GET /v1/metrics/stream",
+			"GET /v1/workspaces/{id}/metrics",
+			"GET /v1/workspaces/{id}/metrics/stream",
+		},
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":       model.Version,
 		"api_version":   model.APIVersion,
@@ -411,6 +442,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"profiles":      profileCap,
 		"subscriptions": subCap,
 		"archives":      archivesCap,
+		"metrics":       metricsCap,
 		"limits_defaults": map[string]any{
 			"cpu_cores":            l.CPUCores,
 			"memory_mb":            l.MemoryMB,

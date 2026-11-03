@@ -38,10 +38,29 @@ func mountedFuse(path string) bool {
 	return int64(st.Type) == fuseSuperMagic
 }
 
+// diskUsedFromStat computes the used bytes of a filesystem from a statfs
+// result as `df` reports it: total minus the FREE blocks (f_bfree), NOT the
+// AVAILABLE blocks (f_bavail). The distinction is the ext4 reserved-block
+// margin (mkfs.ext4's -m 5 default): f_bavail excludes the ~5% reserved for
+// root, so `total - f_bavail` overstates usage. On an empty 64 MiB workspace
+// that is 7.6 MB (11.9% "full") while the tenant's own `df` says ~0; using
+// f_bfree matches `df` exactly. The operator's rule is that the number the
+// engine reports must equal the number the tenant sees.
+func diskUsedFromStat(bsize, blocks, bfree int64) int64 {
+	used := bsize*blocks - bsize*bfree
+	if used < 0 {
+		used = 0
+	}
+	return used
+}
+
 // MountedDiskUsed returns the used bytes (total minus free) of the filesystem
 // mounted at root. It is CHEAP: one statfs call, no directory walk. It returns
 // ok=false when root is not a live FUSE mount (so the derived summary falls back
 // to 0 rather than reporting the host filesystem's usage as the workspace's).
+//
+// The used figure is `df`'s "used" (total - f_bfree), so it equals what the
+// tenant sees inside the workspace. See diskUsedFromStat.
 func MountedDiskUsed(root string) (used int64, ok bool) {
 	if !mountedFuse(root) {
 		return 0, false
@@ -50,12 +69,10 @@ func MountedDiskUsed(root string) (used int64, ok bool) {
 	if err := syscall.Statfs(root, &st); err != nil {
 		return 0, false
 	}
-	bsize := int64(st.Bsize)
-	total := bsize * int64(st.Blocks)
-	free := bsize * int64(st.Bavail)
-	used = total - free
-	if used < 0 {
-		used = 0
-	}
-	return used, true
+	return diskUsedFromStat(int64(st.Bsize), int64(st.Blocks), int64(st.Bfree)), true
 }
+
+// DiskUsed is the exported form of MountedDiskUsed for callers outside the
+// package (the service's summary and the metrics sampler). It is the same one
+// statfs call and the same `df`-consistent used figure.
+func DiskUsed(root string) (used int64, ok bool) { return MountedDiskUsed(root) }

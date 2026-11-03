@@ -466,6 +466,7 @@ func (s *Service) Shutdown(deadline time.Duration) bool {
 	// Stop the background loops first: neither must act during drain.
 	s.stopDiskWatchdog()
 	s.stopReaper()
+	s.ShutdownMetrics()
 	s.mu.Lock()
 	ids := make([]string, 0, len(s.runs))
 	for id, rr := range s.runs {

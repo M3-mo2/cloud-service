@@ -34,6 +34,10 @@ type LiveProcess interface {
 	Kill() bool
 	// Pid returns the direct child's process id (the nsjail process).
 	Pid() int
+	// CgroupDir returns the session's NSJAIL cgroup directory once resolved, or
+	// "" when it cannot be located. It lets the metrics sampler sum the
+	// session's memory without re-resolving the cgroup every tick.
+	CgroupDir() string
 }
 
 // Start launches an interactive process under nsjail and returns a handle whose
@@ -259,6 +263,11 @@ func (p *liveProcess) cgroup() string {
 	p.cgroupOK = true
 	return p.cgroupDir
 }
+
+// CgroupDir returns the session's resolved NSJAIL cgroup directory, or "" when
+// it cannot be located. The metrics sampler uses it to sum the session's
+// memory.current without re-resolving the cgroup from /proc on every tick.
+func (p *liveProcess) CgroupDir() string { return p.cgroup() }
 
 // Kill terminates the session's process tree. It prefers the session's cgroup
 // (killing every member, including a process that escaped its process group with

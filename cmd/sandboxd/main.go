@@ -161,6 +161,10 @@ func main() {
 		"enabled", cfg.Subscription.Enabled)
 	logger.Info("native archive support configured", "build_marker", archive.BuildMarker,
 		"enabled", cfg.Archives.Enabled, "formats", cfg.Archives.Formats)
+	// The per-workspace resource stream (RAM + disk) embeds its own build marker
+	// so metrics-check can prove the tested binary is a fresh build. The sampler
+	// is lazy: this line configures it, it starts only on the first subscriber.
+	service.MetricsStartupLog(logger, cfg)
 	authn := auth.New(cfg.Keys)
 	server := api.NewServer(svc, authn, logger)
 

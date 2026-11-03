@@ -189,4 +189,9 @@ type Runner interface {
 	// ReapOrphans kills and removes every orphaned sandbox cgroup left by a hard
 	// (SIGKILL) daemon death, and reports how many it reaped.
 	ReapOrphans() int
+	// RunCgroupDirs returns a snapshot of the run ID -> NSJAIL cgroup directory
+	// map the runner already tracks for every live run. It is READ-ONLY and
+	// O(live runs): the metrics sampler joins it against the service's run table
+	// to attribute a cgroup to a workspace, so it never scans /sys/fs/cgroup.
+	RunCgroupDirs() map[string]string
 }

@@ -669,6 +669,21 @@ func (r *NsjailRunner) trackCgroup(runID, dir string) {
 	r.mu.Unlock()
 }
 
+// RunCgroupDirs returns a copy of the live run ID -> NSJAIL cgroup directory
+// map. It is the sampler's O(live runs) source for a workspace's run cgroups:
+// the service joins it against its own run table (run ID -> workspace ID), so a
+// cgroup can be attributed without scanning /sys/fs/cgroup or reading
+// /proc/<pid>/environ.
+func (r *NsjailRunner) RunCgroupDirs() map[string]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]string, len(r.cgroupDirs))
+	for id, dir := range r.cgroupDirs {
+		out[id] = dir
+	}
+	return out
+}
+
 // resolveCgroup resolves the cgroup directory nsjail created for a jail it just
 // launched. It is best-effort: an empty result means the cgroup could not be
 // located (the workload already exited, or /proc is restricted); nsjail still
