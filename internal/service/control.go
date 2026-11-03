@@ -41,6 +41,9 @@ type LimitUpdate struct {
 	AllowNet           *bool
 	AllowUnlimitedRuns *bool
 	AllowTunnels       *bool
+	// WriteRateMBs sets the write-rate ceiling (MiB/s); 0 clears it (no rate
+	// ceiling). Present only when the PATCH carries the field.
+	WriteRateMBs *int
 }
 
 // WorkspaceUpdate is a partial update of a workspace.
@@ -60,6 +63,7 @@ func (s *Service) maxLimits() model.Limits {
 		MaxRuns:            m.MaxRuns,
 		AllowNet:           m.AllowNet,
 		AllowUnlimitedRuns: m.AllowUnlimitedRuns,
+		WriteRateMBs:       m.WriteRateMBs,
 	}
 }
 
@@ -169,6 +173,21 @@ func applyLimitUpdate(cur *model.Limits, upd LimitUpdate, max model.Limits, tunn
 			return TunnelsForbiddenByServer()
 		}
 		cur.AllowTunnels = *upd.AllowTunnels
+	}
+	if upd.WriteRateMBs != nil {
+		v := *upd.WriteRateMBs
+		if v < 0 {
+			return model.Wrap(422, model.CodeUnprocessable, "write_rate_mb_s must be >= 0", map[string]string{"field": "write_rate_mb_s"})
+		}
+		if v > max.WriteRateMBs {
+			return maxExceeded("write_rate_mb_s", v, max.WriteRateMBs)
+		}
+		cur.WriteRateMBs = v
+	}
+	// A rate ceiling may never exceed the workspace's own disk ceiling, whether
+	// it came from this update or was already set while disk_mb was lowered.
+	if err := checkRateWithinDisk(*cur); err != nil {
+		return err
 	}
 	return nil
 }

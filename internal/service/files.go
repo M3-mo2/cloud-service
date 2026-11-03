@@ -138,6 +138,9 @@ func (s *Service) WriteFile(w *model.Workspace, path string, data []byte, encodi
 	if err := s.ensureActive(w); err != nil {
 		return err
 	}
+	if err := s.ensureEngineWriteAllowed(w); err != nil {
+		return err
+	}
 	fs, err := s.WorkspaceFs(w)
 	if err != nil {
 		return err
@@ -186,6 +189,9 @@ func (s *Service) Rename(w *model.Workspace, from, to string) error {
 // the workspace disk quota. A mutating operation: refused while locked.
 func (s *Service) UploadFile(w *model.Workspace, path string, data []byte) error {
 	if err := s.ensureActive(w); err != nil {
+		return err
+	}
+	if err := s.ensureEngineWriteAllowed(w); err != nil {
 		return err
 	}
 	fs, err := s.WorkspaceFs(w)

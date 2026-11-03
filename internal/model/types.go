@@ -60,6 +60,13 @@ type Limits struct {
 	// allow_net, because cloudflared needs egress to reach Cloudflare. It
 	// mirrors the AllowUnlimitedRuns two-key pattern.
 	AllowTunnels bool `json:"allow_tunnels"`
+	// WriteRateMBs is the per-workspace WRITE RATE ceiling in MiB/s, enforced by
+	// a SAMPLED watchdog (never the kernel; see docs/DECISIONS.md ADR 95). It is
+	// 0 by default and 0 means NO rate ceiling. It is meaningful only when the
+	// server-level disk.write_rate_enabled switch is on. It may never exceed the
+	// workspace's own disk_mb (a workspace cannot write its whole disk in under
+	// a second); a create/patch that would is refused with 422.
+	WriteRateMBs int `json:"write_rate_mb_s"`
 }
 
 // Workspace statuses.
@@ -194,6 +201,13 @@ const (
 	// the ceiling must never read as a clean exit. It is distinct from killed,
 	// which is an explicit stop and does not charge the ceiling.
 	RunOOM RunStatus = "oom"
+	// RunRateLimited is a run the engine's write-RATE watchdog stopped because
+	// the workspace's sustained disk growth exceeded its write_rate_mb_s
+	// ceiling. It is DISTINCT from exited (it was stopped) and from failed (it
+	// was not the program's fault), and from killed (an explicit stop) and oom
+	// (the memory ceiling). It is only ever produced when disk.write_rate_enabled
+	// is on; see docs/DECISIONS.md ADR 95.
+	RunRateLimited RunStatus = "rate_limited"
 )
 
 // Log streams.

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -274,6 +275,18 @@ type DiskConfig struct {
 	// usage and stops runs that exceed the allowance. Smaller is a tighter
 	// overshoot bound and more CPU; 0 uses the default (500 ms).
 	CounterPollMS int `koanf:"counter_poll_ms"`
+	// WriteRateEnabled is the server-level switch for the per-workspace write
+	// RATE ceiling (a SAMPLED cap enforced by stopping the offending run, NOT a
+	// kernel boundary — see docs/DECISIONS.md ADR 95). It is DEFAULT OFF so this
+	// new behaviour changes no existing deployment. The one-line enable is
+	// `disk.write_rate_enabled: true`, together with a per-workspace
+	// `limits.write_rate_mb_s`.
+	WriteRateEnabled bool `koanf:"write_rate_enabled"`
+	// WriteRateSamples is N, the number of CONSECUTIVE over-limit samples before
+	// the watchdog stops an offending run. A single burst above the ceiling is
+	// legitimate behaviour and must not kill a run; only a sustained rate does.
+	// Default 3.
+	WriteRateSamples int `koanf:"write_rate_samples"`
 	// ProcEnabled controls the synthetic per-workspace /proc payload (meminfo,
 	// cpuinfo, uptime, loadavg, stat, version and a curated mounts list), so
 	// `free -h`, `uptime` and `vmstat` report the workspace's own memory and
@@ -631,6 +644,14 @@ type LimitsConfig struct {
 	// Both must be true to create a tunnel; otherwise 422 tunnels_disabled.
 	// Default false (deny).
 	AllowTunnels bool `koanf:"allow_tunnels"`
+	// WriteRateMBs is the per-workspace WRITE RATE ceiling in MiB/s. It is
+	// enforced by the SAMPLED watchdog (see disk.write_rate_enabled), never by
+	// the kernel: the workspace's real disk growth is measured per sampler tick
+	// and a run whose sustained rate exceeds the ceiling is stopped. In
+	// `limits:` it is the per-workspace default; in `max_limits:` it is the
+	// server-level maximum a request may not exceed. 0 means NO rate ceiling.
+	// Default 0 (the whole feature is off by default).
+	WriteRateMBs int `koanf:"write_rate_mb_s"`
 }
 
 // CapsConfig holds hard output/body caps. Sizes are expressed in the unit named
@@ -727,6 +748,7 @@ func Default() Config {
 			MaxRuns:            3,
 			AllowNet:           false,
 			AllowUnlimitedRuns: false,
+			WriteRateMBs:       0,
 		},
 		MaxLimits: LimitsConfig{
 			CPUCores:           8,
@@ -736,6 +758,7 @@ func Default() Config {
 			MaxRuns:            64,
 			AllowNet:           true,
 			AllowUnlimitedRuns: false,
+			WriteRateMBs:       0,
 		},
 		Caps: CapsConfig{
 			ExecStdoutKB: 256,
@@ -791,10 +814,12 @@ func Default() Config {
 			Default: "python",
 		},
 		Disk: DiskConfig{
-			Enabled:       true,
-			Backend:       "auto",
-			CounterPollMS: 500,
-			ProcEnabled:   true,
+			Enabled:          true,
+			Backend:          "auto",
+			CounterPollMS:    500,
+			ProcEnabled:      true,
+			WriteRateEnabled: false,
+			WriteRateSamples: 3,
 		},
 		Subscription: SubscriptionConfig{
 			Enabled:         true,
@@ -846,7 +871,40 @@ func Load(path string) (Config, error) {
 		return cfg, err
 	}
 	cfg.applyDefaults()
+	if err := cfg.Validate(); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
+}
+
+// Validate refuses a configuration that is internally nonsensical. It is called
+// on load, so a bad combination is reported at startup rather than silently
+// accepted. The one rule here is the write-rate ceiling: a workspace cannot
+// write faster than its own disk can grow, so a write_rate_mb_s above the
+// matching disk_mb can never be satisfied and is refused (see ADR 95).
+func (c Config) Validate() error {
+	if err := validateRateCeiling("limits", c.Limits.WriteRateMBs, c.Limits.DiskMB); err != nil {
+		return err
+	}
+	if err := validateRateCeiling("max_limits", c.MaxLimits.WriteRateMBs, c.MaxLimits.DiskMB); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateRateCeiling refuses a write-rate ceiling greater than the disk
+// ceiling it must respect. 0 means "no rate ceiling" and is always valid.
+func validateRateCeiling(section string, rateMBs, diskMB int) error {
+	if rateMBs <= 0 {
+		return nil
+	}
+	if diskMB <= 0 {
+		return fmt.Errorf("%s.write_rate_mb_s=%d requires a positive %s.disk_mb", section, rateMBs, section)
+	}
+	if rateMBs > diskMB {
+		return fmt.Errorf("%s.write_rate_mb_s=%d exceeds %s.disk_mb=%d: a workspace cannot write its whole disk in under a second", section, rateMBs, section, diskMB)
+	}
+	return nil
 }
 
 func (c *Config) applyDefaults() {
@@ -1042,6 +1100,13 @@ func (c *Config) applyDefaults() {
 	if c.Disk.CounterPollMS <= 0 {
 		c.Disk.CounterPollMS = d.Disk.CounterPollMS
 	}
+	// Write-rate ceiling: N consecutive over-limit samples defaults to 3 when
+	// unset. WriteRateEnabled is deliberately NOT defaulted here: it lives in
+	// rawDefaults so an explicit `write_rate_enabled: true/false` survives, and
+	// its zero value (off) is the documented default.
+	if c.Disk.WriteRateSamples <= 0 {
+		c.Disk.WriteRateSamples = d.Disk.WriteRateSamples
+	}
 	// Subscription strings default when empty. Enabled is deliberately NOT
 	// defaulted here: its default lives in rawDefaults so an explicit
 	// `subscription.enabled: false` survives (the reaper stays opt-out).
@@ -1117,6 +1182,7 @@ limits:
   allow_net: false
   allow_unlimited_runs: false
   allow_tunnels: false
+  write_rate_mb_s: 0
 max_limits:
   cpu_cores: 8
   memory_mb: 8192
@@ -1125,6 +1191,7 @@ max_limits:
   max_runs: 64
   allow_net: true
   allow_unlimited_runs: false
+  write_rate_mb_s: 0
 caps:
   exec_stdout_kb: 256
   exec_stderr_kb: 256
@@ -1195,6 +1262,8 @@ disk:
   fusermount_path: ""
   counter_poll_ms: 500
   proc_enabled: true
+  write_rate_enabled: false
+  write_rate_samples: 3
 subscription:
   enabled: true
   default_duration: ""

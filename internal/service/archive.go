@@ -67,6 +67,9 @@ func (s *Service) ExtractArchive(w *model.Workspace, data []byte, dest string, o
 	if err := s.ensureActive(w); err != nil {
 		return archive.Result{}, err
 	}
+	if err := s.ensureEngineWriteAllowed(w); err != nil {
+		return archive.Result{}, err
+	}
 	fsys, err := s.WorkspaceFs(w)
 	if err != nil {
 		return archive.Result{}, err
@@ -93,6 +96,9 @@ func (s *Service) ExtractArchiveInPlace(w *model.Workspace, path, dest string, o
 		return archive.Result{}, model.New(422, model.CodeUnprocessable, "archive support is disabled")
 	}
 	if err := s.ensureActive(w); err != nil {
+		return archive.Result{}, err
+	}
+	if err := s.ensureEngineWriteAllowed(w); err != nil {
 		return archive.Result{}, err
 	}
 	fsys, err := s.WorkspaceFs(w)

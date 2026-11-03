@@ -356,3 +356,57 @@ sessions:
 		t.Fatalf("session defaults lost: %+v", cfg.Sessions)
 	}
 }
+
+func TestLoadWriteRate(t *testing.T) {
+	// The default is OFF and the rate ceilings are 0.
+	def := Default()
+	if def.Disk.WriteRateEnabled || def.Limits.WriteRateMBs != 0 || def.MaxLimits.WriteRateMBs != 0 {
+		t.Fatalf("write-rate defaults must be off/0: %+v %+v", def.Disk, def.Limits)
+	}
+	if def.Disk.WriteRateSamples != 3 {
+		t.Fatalf("write_rate_samples default = %d, want 3", def.Disk.WriteRateSamples)
+	}
+	// Enabling it and setting a valid rate loads; the switch survives and N
+	// defaults when only the switch is given.
+	p := writeTemp(t, `
+disk:
+  write_rate_enabled: true
+limits:
+  write_rate_mb_s: 32
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.Disk.WriteRateEnabled {
+		t.Fatal("explicit write_rate_enabled:true must survive")
+	}
+	if cfg.Limits.WriteRateMBs != 32 {
+		t.Fatalf("write_rate_mb_s = %d, want 32", cfg.Limits.WriteRateMBs)
+	}
+	if cfg.Disk.WriteRateSamples != 3 {
+		t.Fatalf("samples default lost: %d", cfg.Disk.WriteRateSamples)
+	}
+}
+
+func TestLoadRefusesRateAboveDisk(t *testing.T) {
+	// A rate ceiling above the workspace's own disk ceiling is nonsensical and
+	// must be refused at load, not silently accepted.
+	p := writeTemp(t, `
+limits:
+  disk_mb: 64
+  write_rate_mb_s: 128
+`)
+	if _, err := Load(p); err == nil {
+		t.Fatal("expected Load to refuse write_rate_mb_s > disk_mb")
+	}
+	// Equal is fine.
+	p2 := writeTemp(t, `
+limits:
+  disk_mb: 64
+  write_rate_mb_s: 64
+`)
+	if _, err := Load(p2); err != nil {
+		t.Fatalf("equal rate/disk must load: %v", err)
+	}
+}

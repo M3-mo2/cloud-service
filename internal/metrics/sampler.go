@@ -90,6 +90,17 @@ type Sampler struct {
 	wakeCh  chan struct{}
 	stopped bool
 
+	// pinned keeps the sample loop alive with zero subscribers. It is used by
+	// the write-rate watchdog, which rides this sampler's tick instead of
+	// starting a second timer. Unpinned (the default) the sampler keeps its
+	// lazy start/stop contract: it runs only while a subscriber is connected.
+	pinned bool
+	// observer, when set, is called once per sample PASS with the snapshot the
+	// tick just built (so an observer costs no extra reads). It is invoked
+	// without s.mu held, so an observer may take its own locks. It is NOT
+	// called for a one-shot SampleScoped (a one-shot is not a tick).
+	observer func(Snapshot)
+
 	c counters
 }
 
@@ -161,6 +172,48 @@ func (s *Sampler) Counters() Counters {
 	}
 }
 
+// SetObserver installs a per-tick observer. It is called once per sample pass
+// with the snapshot that pass already built, so the observer adds no reads of
+// its own. It is not called for a one-shot SampleScoped.
+func (s *Sampler) SetObserver(fn func(Snapshot)) {
+	s.mu.Lock()
+	s.observer = fn
+	s.mu.Unlock()
+}
+
+// Pin keeps the sample loop alive with zero subscribers and starts it at once if
+// needed. The write-rate watchdog pins the sampler so its tick continues with no
+// watcher connected; Unpin restores the lazy stop with the last subscriber.
+func (s *Sampler) Pin() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pinned = true
+	if s.stopped || s.running {
+		return
+	}
+	s.startLocked()
+}
+
+// Unpin releases a Pin. The loop then stops if no subscriber remains.
+func (s *Sampler) Unpin() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pinned = false
+	if s.running && len(s.subs) == 0 {
+		s.stopLocked()
+	}
+}
+
+// notify invokes the per-tick observer, if any, outside s.mu.
+func (s *Sampler) notify(snap Snapshot) {
+	s.mu.Lock()
+	fn := s.observer
+	s.mu.Unlock()
+	if fn != nil {
+		fn(snap)
+	}
+}
+
 // Subscribe registers a scoped stream and lazily starts the sampler. An
 // optional per-request interval override adjusts the ONE service-wide cadence
 // (there is a single ticker and a single cadence for every subscriber); the
@@ -200,7 +253,7 @@ func (s *Sampler) closeSub(sub *subscriber) {
 		delete(s.subs, sub.id)
 		s.c.subscribers.Store(int64(len(s.subs)))
 		sub.closeMu.Do(func() { close(sub.ch) })
-		if len(s.subs) == 0 && s.running {
+		if len(s.subs) == 0 && s.running && !s.pinned {
 			s.stopLocked()
 		}
 	} else {
@@ -307,6 +360,14 @@ func (s *Sampler) run(stop, done, wake chan struct{}) {
 func (s *Sampler) publish() {
 	s.c.ticks.Add(1)
 	snap := s.sampleAll()
+	s.fanOut(snap)
+	s.notify(snap)
+}
+
+// fanOut delivers one snapshot to every subscriber, coalescing (never queueing)
+// per subscriber. It holds s.mu, the same lock closeSub/Shutdown hold when they
+// close a subscriber's channel, so a send can never race a close.
+func (s *Sampler) fanOut(snap Snapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Cache the encoded frame per scope: several subscribers of the same owner
@@ -358,7 +419,9 @@ func marshalScoped(snap Snapshot, scope Scope) []byte {
 // memory.current + one memory.max per live cgroup.
 func (s *Sampler) Sample() Snapshot {
 	s.c.ticks.Add(1)
-	return s.sampleAll()
+	snap := s.sampleAll()
+	s.notify(snap)
+	return snap
 }
 
 // SampleScoped builds one snapshot restricted to a scope for a ONE-SHOT request.
@@ -452,7 +515,7 @@ func (s *Sampler) sampleWorkspace(info WorkspaceInfo) WorkspaceSnapshot {
 		s.c.cgroupReads.Add(1)
 	}
 	return BuildWorkspaceSnapshot(info, used, info.DiskLimitBytes, ok,
-		ramUsed, ramLimit, ramOK, len(info.RunCgroups), live, cpuUsec, pids)
+		ramUsed, ramLimit, ramOK, len(info.RunCgroups), live, cpuUsec, pids, info.WriteRateLimitMBs)
 }
 
 // sseDataFrame encodes one SSE event carrying a JSON payload.

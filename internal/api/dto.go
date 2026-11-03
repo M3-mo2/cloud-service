@@ -124,6 +124,10 @@ type limitsJSON struct {
 	AllowNet           bool    `json:"allow_net"`
 	AllowUnlimitedRuns bool    `json:"allow_unlimited_runs"`
 	AllowTunnels       bool    `json:"allow_tunnels"`
+	// WriteRateMBs is the per-workspace write-rate ceiling in MiB/s, or 0 for no
+	// rate ceiling (the default). It is meaningful only when the server-level
+	// disk.write_rate_enabled switch is on.
+	WriteRateMBs int `json:"write_rate_mb_s"`
 }
 
 // toWorkspaceJSON renders a workspace and its cheap derived summary. It is a
@@ -159,6 +163,7 @@ func toLimitsJSON(l model.Limits) limitsJSON {
 		AllowNet:           l.AllowNet,
 		AllowUnlimitedRuns: l.AllowUnlimitedRuns,
 		AllowTunnels:       l.AllowTunnels,
+		WriteRateMBs:       l.WriteRateMBs,
 	}
 }
 
@@ -227,6 +232,7 @@ func (r *createWorkspaceRequest) toLimits() *model.Limits {
 		AllowNet:           r.Limits.AllowNet,
 		AllowUnlimitedRuns: r.Limits.AllowUnlimitedRuns,
 		AllowTunnels:       r.Limits.AllowTunnels,
+		WriteRateMBs:       r.Limits.WriteRateMBs,
 	}
 }
 
@@ -242,6 +248,7 @@ type patchLimitsJSON struct {
 	AllowNet           *bool    `json:"allow_net"`
 	AllowUnlimitedRuns *bool    `json:"allow_unlimited_runs"`
 	AllowTunnels       *bool    `json:"allow_tunnels"`
+	WriteRateMBs       *int     `json:"write_rate_mb_s"`
 }
 
 // patchWorkspaceRequest is the PATCH /v1/workspaces/{id} body.
@@ -263,6 +270,7 @@ func (r *patchWorkspaceRequest) toUpdate() service.WorkspaceUpdate {
 			AllowNet:           r.Limits.AllowNet,
 			AllowUnlimitedRuns: r.Limits.AllowUnlimitedRuns,
 			AllowTunnels:       r.Limits.AllowTunnels,
+			WriteRateMBs:       r.Limits.WriteRateMBs,
 		}
 	}
 	return upd

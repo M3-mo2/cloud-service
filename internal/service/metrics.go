@@ -39,6 +39,7 @@ type cachedWorkspace struct {
 	ownerID     string
 	diskLimit   int64
 	memoryLimit int64
+	rateLimit   int64
 }
 
 // newMetricsProvider builds the provider and does one synchronous reconcile so
@@ -65,6 +66,7 @@ func (p *metricsProvider) reconcile() {
 			ownerID:     w.OwnerID,
 			diskLimit:   int64(w.Limits.DiskMB) * 1024 * 1024,
 			memoryLimit: int64(w.Limits.MemoryMB) * 1024 * 1024,
+			rateLimit:   int64(w.Limits.WriteRateMBs),
 		}
 	}
 	p.mu.Lock()
@@ -84,6 +86,7 @@ func (p *metricsProvider) upsert(w *model.Workspace) {
 		ownerID:     w.OwnerID,
 		diskLimit:   int64(w.Limits.DiskMB) * 1024 * 1024,
 		memoryLimit: int64(w.Limits.MemoryMB) * 1024 * 1024,
+		rateLimit:   int64(w.Limits.WriteRateMBs),
 	}
 	p.mu.Unlock()
 }
@@ -148,11 +151,12 @@ func (p *metricsProvider) Candidates() []metrics.WorkspaceInfo {
 	out := make([]metrics.WorkspaceInfo, 0, len(inv))
 	for id, c := range inv {
 		out = append(out, metrics.WorkspaceInfo{
-			ID:               id,
-			OwnerID:          c.ownerID,
-			DiskRoot:         p.svc.store.WorkspaceRoot(id),
-			DiskLimitBytes:   c.diskLimit,
-			MemoryLimitBytes: c.memoryLimit,
+			ID:                id,
+			OwnerID:           c.ownerID,
+			DiskRoot:          p.svc.store.WorkspaceRoot(id),
+			DiskLimitBytes:    c.diskLimit,
+			MemoryLimitBytes:  c.memoryLimit,
+			WriteRateLimitMBs: c.rateLimit,
 			// The parent cgroup's memory.max is the ENFORCED ceiling. The
 			// sampler reads it only while a run/session is live, so an idle
 			// workspace still costs zero cgroup reads.

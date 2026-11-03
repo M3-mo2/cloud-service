@@ -337,7 +337,19 @@ func (s *Service) executeRun(ctx context.Context, w *model.Workspace, run *model
 
 	res, err := s.runner.Run(req)
 	run.EndedAt = time.Now().UTC()
-	if err != nil {
+	// The write-rate watchdog sets rateLimited and cancels the run; the outcome
+	// must be the DISTINCT `rate_limited`, never a generic killed/failed and
+	// never a clean exited. It is checked first so the classification is
+	// unambiguous.
+	s.mu.Lock()
+	rateLimited := rr.rateLimited
+	s.mu.Unlock()
+	if rateLimited {
+		run.Status = model.RunRateLimited
+		if err == nil {
+			run.SetExitCode(res.ExitCode)
+		}
+	} else if err != nil {
 		run.Status = model.RunFailed
 		s.logger.Error("run failed", "run_id", run.ID, "error", err)
 	} else if res.TimedOut {

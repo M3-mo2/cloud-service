@@ -129,7 +129,7 @@ func TestBuildSnapshotSumsCgroups(t *testing.T) {
 	info := WorkspaceInfo{ID: "ws_1", MemoryLimitBytes: limit, DiskLimitBytes: 64 * 1024 * 1024}
 	// Two runs: 61 MB and 56 MB (the measured two-run case).
 	var used int64 = 61546496 + 56934400
-	snap := BuildWorkspaceSnapshot(info, 90112, info.DiskLimitBytes, true, used, limit, true, 2, 2, 0, 0)
+	snap := BuildWorkspaceSnapshot(info, 90112, info.DiskLimitBytes, true, used, limit, true, 2, 2, 0, 0, 0)
 	if snap.RAMUsedBytes != used {
 		t.Fatalf("RAMUsedBytes = %d, want sum %d", snap.RAMUsedBytes, used)
 	}
@@ -472,4 +472,108 @@ func TestFrameIsParseableJSON(t *testing.T) {
 		last = snap.Timestamp
 	}
 	s.Close(sub)
+}
+
+// TestPinKeepsSamplerRunningWithNoSubscriber proves the write-rate watchdog's
+// Pin: the loop runs with zero subscribers (the watchdog rides the tick), and
+// Unpin restores the lazy stop.
+func TestPinKeepsSamplerRunningWithNoSubscriber(t *testing.T) {
+	r := newFakeReader()
+	p := &fakeProvider{}
+	p.set([]WorkspaceInfo{{ID: "ws", OwnerID: "u1", DiskRoot: "/none", DiskLimitBytes: 1, MemoryLimitBytes: 1}})
+	r.diskOK["/none"] = true
+	cfg := DefaultConfig()
+	cfg.Interval = 20 * time.Millisecond
+	s := New(cfg, p, r)
+
+	// With no subscriber and no pin, nothing ticks.
+	time.Sleep(50 * time.Millisecond)
+	if s.Counters().Ticks != 0 {
+		t.Fatalf("ticks before pin = %d, want 0", s.Counters().Ticks)
+	}
+	s.Pin()
+	time.Sleep(70 * time.Millisecond)
+	if s.Counters().Ticks == 0 {
+		t.Fatal("Pin must start the sampler with no subscriber")
+	}
+	if s.Counters().Running != 1 {
+		t.Fatal("sampler must be running while pinned")
+	}
+	s.Unpin()
+	if !s.Wait(time.Second) {
+		t.Fatal("Unpin with no subscriber must stop the sampler")
+	}
+	frozen := s.Counters().Ticks
+	time.Sleep(50 * time.Millisecond)
+	if s.Counters().Ticks != frozen {
+		t.Fatal("ticks advanced after Unpin")
+	}
+}
+
+// TestObserverCalledPerTickWithSnapshot proves the per-tick observer is invoked
+// once per sample pass with the snapshot already built (so it costs no reads).
+func TestObserverCalledPerTickWithSnapshot(t *testing.T) {
+	r := newFakeReader()
+	p := &fakeProvider{}
+	p.set([]WorkspaceInfo{{ID: "ws", OwnerID: "u1", DiskRoot: "/none", DiskLimitBytes: 1, MemoryLimitBytes: 1}})
+	r.diskOK["/none"] = true
+	r.diskUsed["/none"] = 42
+	cfg := DefaultConfig()
+	cfg.Interval = 20 * time.Millisecond
+	cfg.MinInterval = time.Millisecond
+	s := New(cfg, p, r)
+
+	var calls atomic.Int64
+	var lastUsed atomic.Int64
+	s.SetObserver(func(snap Snapshot) {
+		calls.Add(1)
+		if len(snap.Workspaces) == 1 {
+			lastUsed.Store(snap.Workspaces[0].DiskUsedBytes)
+		}
+	})
+	s.Pin()
+	time.Sleep(120 * time.Millisecond)
+	s.Unpin()
+	if calls.Load() < 2 {
+		t.Fatalf("observer calls = %d, want >= 2", calls.Load())
+	}
+	if lastUsed.Load() != 42 {
+		t.Fatalf("observer snapshot disk used = %d, want 42", lastUsed.Load())
+	}
+	// The observer added no reads of its own: statfs reads equal ticks.
+	c := s.Counters()
+	if c.StatfsReads != c.Ticks {
+		t.Fatalf("statfs reads (%d) must equal ticks (%d): the observer added reads", c.StatfsReads, c.Ticks)
+	}
+}
+
+// TestPausedStaysPinnedThroughSubscribeClose proves that a pinned sampler is not
+// stopped when a subscriber that was added and removed leaves.
+func TestPausedStaysPinnedThroughSubscribeClose(t *testing.T) {
+	r := newFakeReader()
+	p := &fakeProvider{}
+	p.set([]WorkspaceInfo{{ID: "ws", OwnerID: "u1", DiskRoot: "/none", DiskLimitBytes: 1, MemoryLimitBytes: 1}})
+	r.diskOK["/none"] = true
+	cfg := DefaultConfig()
+	cfg.Interval = 20 * time.Millisecond
+	s := New(cfg, p, r)
+	s.Pin()
+	sub, err := s.Subscribe(Scope{OwnerID: "u1"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sub.Frames():
+	case <-time.After(time.Second):
+		t.Fatal("no frame")
+	}
+	s.Close(sub)
+	time.Sleep(60 * time.Millisecond)
+	if s.Counters().Running != 1 {
+		t.Fatal("a pinned sampler must keep running after its last subscriber leaves")
+	}
+	s.Unpin()
+	if !s.Wait(time.Second) {
+		t.Fatal("sampler did not stop after Unpin")
+	}
 }

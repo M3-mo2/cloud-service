@@ -40,6 +40,14 @@ type Service struct {
 	diskWatchdogOnce bool
 	diskDone         chan struct{}
 
+	// Write-rate watchdog: a SAMPLED per-workspace write-rate ceiling. It rides
+	// the metrics sampler's tick (no timer of its own) and is default OFF. See
+	// write_rate.go.
+	rateWatchdogOnce bool
+	rateWatchdogOn   bool
+	rateMu           sync.Mutex
+	rateState        map[string]*rateState
+
 	// Subscription reaper. It copies the disk watchdog's shape: one goroutine,
 	// one ticker, one done channel. The decision is a pure function of stored
 	// instants, so no term state is held here.
@@ -70,6 +78,11 @@ type runningRun struct {
 	wsID   string
 	cancel func()
 	done   chan struct{}
+	// rateLimited is set by the write-rate watchdog right before it cancels the
+	// run, so executeRun can classify the outcome as the distinct `rate_limited`
+	// rather than a generic kill. It is only ever read by the run's own
+	// goroutine, which is the single writer of the run status.
+	rateLimited bool
 }
 
 // New constructs a Service.
@@ -85,6 +98,7 @@ func New(cfg config.Config, store *storage.Store, runner executor.Runner, logger
 		reaperDone:  make(chan struct{}),
 		metricsDone: make(chan struct{}),
 		now:         time.Now,
+		rateState:   map[string]*rateState{},
 	}
 	if cfg.Disk.Enabled {
 		id := executor.ResolveIdentity(cfg)
@@ -106,6 +120,10 @@ func New(cfg config.Config, store *storage.Store, runner executor.Runner, logger
 	// lazy, on the first subscriber) and the slower inventory reconcile loop.
 	s.initMetrics()
 	s.startMetricsReconcile()
+	// The write-RATE watchdog rides the metrics sampler's tick (no timer of its
+	// own) and is default OFF; it also pins the sampler so the tick continues
+	// with no subscriber when it is on.
+	s.startWriteRateWatchdog()
 	return s
 }
 
@@ -273,6 +291,12 @@ func emptyIfNil(s []string) []string {
 
 // checkMaxima rejects a limits value that exceeds any server-level maximum.
 func checkMaxima(l, max model.Limits, tunnelsEnabled bool) error {
+	// A write-rate ceiling can never exceed the workspace's own disk ceiling: a
+	// workspace cannot write its whole disk in under a second. This is refused
+	// rather than silently accepted (ADR 95).
+	if err := checkRateWithinDisk(l); err != nil {
+		return err
+	}
 	switch {
 	case l.CPUCores > max.CPUCores:
 		return maxExceeded("cpu_cores", l.CPUCores, max.CPUCores)
@@ -284,10 +308,35 @@ func checkMaxima(l, max model.Limits, tunnelsEnabled bool) error {
 		return maxExceeded("max_wall_time_sec", l.MaxWallTimeSec, max.MaxWallTimeSec)
 	case l.MaxRuns > max.MaxRuns:
 		return maxExceeded("max_runs", l.MaxRuns, max.MaxRuns)
+	case l.WriteRateMBs > max.WriteRateMBs:
+		return maxExceeded("write_rate_mb_s", l.WriteRateMBs, max.WriteRateMBs)
 	case l.AllowUnlimitedRuns && !max.AllowUnlimitedRuns:
 		return UnlimitedForbiddenByServer()
 	case l.AllowTunnels && !tunnelsEnabled:
 		return TunnelsForbiddenByServer()
+	}
+	return nil
+}
+
+// checkRateWithinDisk refuses a write-rate ceiling above the workspace's own
+// disk ceiling. 0 (no rate ceiling) is always valid.
+func checkRateWithinDisk(l model.Limits) error {
+	if l.WriteRateMBs <= 0 {
+		return nil
+	}
+	if l.DiskMB <= 0 {
+		return model.Wrap(422, model.CodeUnprocessable,
+			"write_rate_mb_s requires a positive disk_mb",
+			map[string]string{"field": "write_rate_mb_s"})
+	}
+	if l.WriteRateMBs > l.DiskMB {
+		return model.Wrap(422, model.CodeUnprocessable,
+			"write_rate_mb_s exceeds disk_mb: a workspace cannot write its whole disk in under a second",
+			map[string]string{
+				"field":           "write_rate_mb_s",
+				"write_rate_mb_s": itoaInt(l.WriteRateMBs),
+				"disk_mb":         itoaInt(l.DiskMB),
+			})
 	}
 	return nil
 }
@@ -332,6 +381,7 @@ func (s *Service) defaultLimits() model.Limits {
 		AllowNet:           l.AllowNet,
 		AllowUnlimitedRuns: l.AllowUnlimitedRuns,
 		AllowTunnels:       l.AllowTunnels,
+		WriteRateMBs:       l.WriteRateMBs,
 	}
 }
 
@@ -351,6 +401,12 @@ func applyLimits(base, over model.Limits) model.Limits {
 	}
 	if over.MaxRuns > 0 {
 		base.MaxRuns = over.MaxRuns
+	}
+	// write_rate_mb_s is overlaid explicitly when present in the request (a
+	// request may lower or raise it toward the maximum); the API layer passes
+	// only a non-zero value here, and 0 means "no rate ceiling" on the wire.
+	if over.WriteRateMBs > 0 {
+		base.WriteRateMBs = over.WriteRateMBs
 	}
 	base.AllowNet = over.AllowNet
 	base.AllowUnlimitedRuns = over.AllowUnlimitedRuns

@@ -45,6 +45,12 @@ type WorkspaceInfo struct {
 	DiskRoot         string
 	DiskLimitBytes   int64
 	MemoryLimitBytes int64
+	// WriteRateLimitMBs is the workspace's advertised write-RATE ceiling in
+	// MiB/s, or 0 when no rate ceiling is configured (the default). It is a
+	// SAMPLED ceiling enforced by the write-rate watchdog, not by the kernel;
+	// reporting it on the same frame as disk keeps the advertised and the
+	// enforced number the same value (see ADR 95).
+	WriteRateLimitMBs int64
 	// ParentCgroup is the workspace's parent cgroup directory, whose memory.max
 	// is the ENFORCED ceiling. It is read for the reported ram_limit only while
 	// a run or session is live, so an idle workspace still costs zero cgroup
@@ -112,6 +118,11 @@ type WorkspaceSnapshot struct {
 	// DiskComplete is false when the workspace root was not a live mount, so
 	// DiskUsedBytes (0) is unknown rather than measured.
 	DiskComplete bool `json:"disk_complete"`
+	// WriteRateLimitMBs is the workspace's advertised write-RATE ceiling in
+	// MiB/s, or 0 when no rate ceiling is configured. It is a SAMPLED ceiling
+	// (enforced by stopping a run whose sustained disk growth exceeds it), never
+	// a kernel boundary; see ADR 95.
+	WriteRateLimitMBs int64 `json:"write_rate_limit_mb_s"`
 
 	LiveRuns    int `json:"live_runs"`
 	LiveCgroups int `json:"live_cgroups"`
@@ -247,21 +258,22 @@ func parseStatUsec(b []byte) (int64, error) {
 // the percentage arithmetic are unit-testable in isolation. ramLimit is the
 // workspace's ENFORCED ceiling (the parent cgroup's memory.max value, which the
 // engine wrote from memory_mb); it is the denominator for RAMPercent.
-func BuildWorkspaceSnapshot(info WorkspaceInfo, diskUsed, diskLimit int64, diskOK bool, ramUsed, ramLimit int64, ramOK bool, liveRuns, liveCgroups int, cpuUsec, pids int64) WorkspaceSnapshot {
+func BuildWorkspaceSnapshot(info WorkspaceInfo, diskUsed, diskLimit int64, diskOK bool, ramUsed, ramLimit int64, ramOK bool, liveRuns, liveCgroups int, cpuUsec, pids int64, writeRateMBs int64) WorkspaceSnapshot {
 	return WorkspaceSnapshot{
-		WorkspaceID:    info.ID,
-		ownerID:        info.OwnerID,
-		RAMUsedBytes:   ramUsed,
-		RAMLimitBytes:  ramLimit,
-		RAMPercent:     Percent(ramUsed, ramLimit),
-		RAMComplete:    ramOK,
-		DiskUsedBytes:  diskUsed,
-		DiskLimitBytes: diskLimit,
-		DiskPercent:    Percent(diskUsed, diskLimit),
-		DiskComplete:   diskOK,
-		LiveRuns:       liveRuns,
-		LiveCgroups:    liveCgroups,
-		CPUUsageUsec:   cpuUsec,
-		PidsCurrent:    pids,
+		WorkspaceID:       info.ID,
+		ownerID:           info.OwnerID,
+		RAMUsedBytes:      ramUsed,
+		RAMLimitBytes:     ramLimit,
+		RAMPercent:        Percent(ramUsed, ramLimit),
+		RAMComplete:       ramOK,
+		DiskUsedBytes:     diskUsed,
+		DiskLimitBytes:    diskLimit,
+		DiskPercent:       Percent(diskUsed, diskLimit),
+		DiskComplete:      diskOK,
+		WriteRateLimitMBs: writeRateMBs,
+		LiveRuns:          liveRuns,
+		LiveCgroups:       liveCgroups,
+		CPUUsageUsec:      cpuUsec,
+		PidsCurrent:       pids,
 	}
 }

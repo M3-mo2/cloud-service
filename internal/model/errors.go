@@ -129,6 +129,16 @@ const (
 	// CodeArchiveEntryExists is returned (HTTP 409) when an entry would
 	// overwrite an existing file and overwrite is false.
 	CodeArchiveEntryExists = "archive_entry_exists"
+
+	// CodeWriteRateExceeded is returned (HTTP 429) when the engine's own write
+	// path (a file upload/write or an archive extraction) is asked to add bytes
+	// to a workspace whose SUSTAINED disk growth has exceeded its configured
+	// write_rate_mb_s ceiling. It is distinct from a disk-quota refusal (the
+	// disk is not full) and from a validation error (the request is well
+	// formed): the workspace is momentarily writing too fast. It is only ever
+	// produced while disk.write_rate_enabled is on; the ceiling is SAMPLED, so
+	// the write that crosses it is not refused by a kernel boundary (see ADR 95).
+	CodeWriteRateExceeded = "write_rate_exceeded"
 )
 
 // Error is the canonical API error, carrying an HTTP mapping and a code.

@@ -201,7 +201,8 @@ func parseRunFilter(r *http.Request) (service.RunFilter, error) {
 func validRunStatus(s string) bool {
 	switch model.RunStatus(s) {
 	case model.RunQueued, model.RunRunning, model.RunExited, model.RunKilled,
-		model.RunTimeout, model.RunFailed, model.RunInterrupted, model.RunOOM:
+		model.RunTimeout, model.RunFailed, model.RunInterrupted, model.RunOOM,
+		model.RunRateLimited:
 		return true
 	}
 	return false

@@ -356,6 +356,23 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	if diskNote != "" {
 		diskCap["reason"] = diskNote
 	}
+	// Per-workspace write-RATE ceiling: a SAMPLED cap on how fast a workspace's
+	// disk may grow, enforced by stopping the offending run(s) after N
+	// consecutive over-limit samples. Advertised truthfully: the switch, the N
+	// rule, the server maximum, the distinct outcome code and the measured
+	// overshoot bound. It is NEVER a kernel boundary (contrast the disk TOTAL);
+	// see ADR 95.
+	writeRateCap := map[string]any{
+		"enabled":         s.svc.WriteRateEnabled(),
+		"server_max_mb_s": s.cfg.MaxLimits.WriteRateMBs,
+		"default_mb_s":    s.cfg.Limits.WriteRateMBs,
+		"samples":         s.svc.WriteRateSamples(),
+		"outcome":         string(model.RunRateLimited),
+		"refusal_code":    model.CodeWriteRateExceeded,
+		"mechanism":       "sample the workspace's real disk growth (one statfs on the metrics tick) and stop the run(s) after N consecutive over-limit samples; the engine's own write path (API upload/write, archive extraction) is refused with 429 write_rate_exceeded while over the ceiling",
+		"limits":          "SAMPLED, not a kernel boundary: the worst-case overshoot is N x interval_seconds x write_rate_mb_s; a single burst above the ceiling does not kill a run; a workspace already at its disk ceiling is not a rate violation; usage that falls (a delete) resets the baseline. io.max cannot limit this here (measured) because the image is on ZFS and the bio is generated outside the cgroup.",
+		"one_line_enable": "disk: { write_rate_enabled: true }  # plus a per-workspace limits.write_rate_mb_s",
+	}
 	// Workspace subscriptions: the engine owns the clock and enforcement, stores
 	// an absolute expiry, and locks a lapsed term (distinct from suspension); the
 	// way out is a renewal. Advertised truthfully: enabled is whether the reaper
@@ -452,6 +469,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 			"allow_net":            l.AllowNet,
 			"allow_unlimited_runs": l.AllowUnlimitedRuns,
 			"allow_tunnels":        l.AllowTunnels,
+			"write_rate_mb_s":      l.WriteRateMBs,
 		},
 		"limits_maxima": map[string]any{
 			"cpu_cores":            m.CPUCores,
@@ -461,6 +479,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 			"max_runs":             m.MaxRuns,
 			"allow_net":            m.AllowNet,
 			"allow_unlimited_runs": m.AllowUnlimitedRuns,
+			"write_rate_mb_s":      m.WriteRateMBs,
 		},
 		"tunnels":               tunCap,
 		"network":               netCap,
@@ -468,6 +487,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"provider_tools_hidden": overlayCap,
 		"egress_decoy":          decoyCap,
 		"workspace_limits":      diskCap,
+		"write_rate":            writeRateCap,
 		"interpreters":          model.SupportedInterpreters(),
 		"runnable_extensions":   model.SupportedExtensions(),
 	})
