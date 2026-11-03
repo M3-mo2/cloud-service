@@ -182,3 +182,48 @@ func copyTree(src, dst string) error {
 
 // WorkspaceDiskManager exposes the disk manager for tests and diagnostics.
 func (s *Service) WorkspaceDiskManager() *workspace.DiskManager { return s.disk }
+
+// ReapOrphanDisks unmounts every FUSE mount directly under this service's data
+// directory. On the way in, no run or session exists, and the disk manager
+// remounts each workspace lazily on its next use, so a mount left by a hard
+// daemon death (the fuse2fs helper is daemonized and outlives the orchestrator)
+// is cleaned up and its helper process exits as the mount goes away. It returns
+// the number of mounts reaped.
+//
+// It is a no-op when the FUSE backend is not active. It never touches a mount
+// outside the data directory.
+func (s *Service) ReapOrphanDisks() int {
+	if s.disk == nil {
+		return 0
+	}
+	dataPrefix := s.store.DataDir()
+	mounts := workspace.FuseMountsUnder(dataPrefix)
+	n := 0
+	for _, m := range mounts {
+		if err := s.disk.ForceUnmount(m); err != nil {
+			s.logger.Warn("could not reap orphan disk mount", "mount", m, "error", err)
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// ReleaseAllDisks unmounts every active workspace disk mount. It is called on
+// graceful shutdown so the daemon leaves no FUSE mount and no helper process
+// behind; each image file persists and is remounted lazily on restart.
+func (s *Service) ReleaseAllDisks() {
+	if s.disk == nil {
+		return
+	}
+	if workspaces, err := s.store.ListAllWorkspaces(); err == nil {
+		for _, w := range workspaces {
+			_ = s.disk.Release(s.store.WorkspaceRoot(w.ID))
+		}
+	}
+	// A workspace that exists but whose meta failed to load still gets swept by
+	// the mount-table walk.
+	for _, m := range workspace.FuseMountsUnder(s.store.DataDir()) {
+		_ = s.disk.ForceUnmount(m)
+	}
+}

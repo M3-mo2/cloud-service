@@ -463,6 +463,8 @@ func (s *Service) RecoverRuns() (int, error) {
 // Shutdown stops every running run and waits for them to drain, bounded by
 // deadline. It returns false if the deadline elapsed with runs still active.
 func (s *Service) Shutdown(deadline time.Duration) bool {
+	// Stop the disk watchdog first: it must not scan or cancel during drain.
+	s.stopDiskWatchdog()
 	s.mu.Lock()
 	ids := make([]string, 0, len(s.runs))
 	for id, rr := range s.runs {

@@ -34,6 +34,11 @@ type Service struct {
 	// the counter fallback then applies.
 	disk *workspace.DiskManager
 
+	// diskWatchdogOnce guards the counter watchdog goroutine (the SAMPLED
+	// fallback used only when the FUSE boundary is unavailable).
+	diskWatchdogOnce bool
+	diskDone         chan struct{}
+
 	mu       sync.Mutex
 	runs     map[string]*runningRun
 	sessions map[string]*liveSession
@@ -55,6 +60,7 @@ func New(cfg config.Config, store *storage.Store, runner executor.Runner, logger
 		logger:   logger,
 		runs:     make(map[string]*runningRun),
 		sessions: make(map[string]*liveSession),
+		diskDone: make(chan struct{}),
 	}
 	if cfg.Disk.Enabled {
 		id := executor.ResolveIdentity(cfg)
@@ -68,6 +74,10 @@ func New(cfg config.Config, store *storage.Store, runner executor.Runner, logger
 			GID:        id.SandboxGID,
 		})
 	}
+	// The counter watchdog runs only when the FUSE boundary is unavailable; it
+	// is a no-op otherwise. Starting it here is cheap (one goroutine + a ticker
+	// in counter mode only).
+	s.startDiskWatchdog()
 	return s
 }
 

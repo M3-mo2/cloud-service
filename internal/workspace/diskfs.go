@@ -183,6 +183,56 @@ func (d *DiskManager) Remove(root string) error {
 // Mounted reports whether root is currently a fuse mount.
 func (d *DiskManager) Mounted(root string) bool { return mountedFuse(root) }
 
+// ForceUnmount unmounts root regardless of tracked state. It is used by the
+// startup orphan sweep, where the mount exists but this manager has no state.
+func (d *DiskManager) ForceUnmount(root string) error { return d.unmount(root) }
+
+// FuseMountsUnder returns every live FUSE mount point whose path is prefix or a
+// child of prefix, read from /proc/self/mountinfo. It is used to reap mounts
+// left behind by a hard daemon death. A read failure yields no mounts.
+func FuseMountsUnder(prefix string) []string {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var out []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		// mountinfo fields: id parent major:minor root mountpoint options
+		// [optional...] - fstype source superopts
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		target := fields[4]
+		if !pathHasPrefix(target, prefix) {
+			continue
+		}
+		// The fstype follows the "-" separator.
+		for i := 0; i < len(fields); i++ {
+			if fields[i] == "-" && i+1 < len(fields) {
+				if strings.HasPrefix(fields[i+1], "fuse") {
+					out = append(out, target)
+				}
+				break
+			}
+		}
+	}
+	return out
+}
+
+// pathHasPrefix reports whether p is prefix or a child of it.
+func pathHasPrefix(p, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	if !strings.HasPrefix(p, prefix) {
+		return false
+	}
+	return len(p) == len(prefix) || p[len(prefix)] == '/'
+}
+
 // ensureImage creates an ext4 image of about sizeMB if it does not exist, then
 // fits it exactly.
 func (d *DiskManager) ensureImage(img string, sizeMB int) error {

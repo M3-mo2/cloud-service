@@ -129,6 +129,14 @@ func main() {
 	if n := svc.ReapOrphans(); n > 0 {
 		logger.Info("reaped orphaned sandbox cgroups", "count", n)
 	}
+	// Per-workspace disk images are mounted host-side by the orchestrator; the
+	// fuse2fs helper daemonizes and outlives the orchestrator, so a hard death
+	// leaves the mount behind. No run or session exists on the way in, so any
+	// such mount is an orphan and is unmounted here (and remounted lazily on the
+	// workspace's next use).
+	if n := svc.ReapOrphanDisks(); n > 0 {
+		logger.Info("reaped orphaned workspace disk mounts", "count", n)
+	}
 	// The same discipline for the network: no workspace namespace, relay or
 	// slirp process survives a restart, so anything present on the way in is
 	// reaped.
@@ -191,6 +199,10 @@ func main() {
 	// Stop every slirp instance, tunnel and the relay. On the way out, no
 	// engine-owned network process is left running.
 	netMgr.Stop()
+	// Unmount every per-workspace disk image so the daemon leaves no FUSE mount
+	// and no fuse2fs helper behind. Each image file persists and is remounted
+	// lazily on restart.
+	svc.ReleaseAllDisks()
 	logger.Info("stopped")
 }
 
