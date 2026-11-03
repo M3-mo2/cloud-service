@@ -120,6 +120,17 @@ cleanup() {
   for pid in "$SRV" "$SRV2"; do
     [ -n "$pid" ] && wait "$pid" 2>/dev/null
   done
+  # Remove this run's engine-owned workspace parent cgroups (ws-*) and nested
+  # NSJAIL.* leaves; a non-empty cgroup is left alone.
+  for d in $(ls -d /sys/fs/cgroup/ws-*/NSJAIL.* 2>/dev/null); do
+    [ -s "$d/cgroup.procs" ] || rmdir "$d" 2>/dev/null
+  done
+  for d in $(ls -d /sys/fs/cgroup/ws-* 2>/dev/null); do
+    [ -s "$d/cgroup.procs" ] || rmdir "$d" 2>/dev/null
+  done
+  for d in $(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null); do
+    [ -s "$d/cgroup.procs" ] || rmdir "$d" 2>/dev/null
+  done
   rm -rf "$DATA" "$DATA2" "$CFG" "$CFG2" "$BIN" "$LOG" "$LOG2" "$TMPL_DIR2"
 }
 trap cleanup EXIT INT TERM
