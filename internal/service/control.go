@@ -99,6 +99,7 @@ func (s *Service) UpdateWorkspace(id string, upd WorkspaceUpdate) (*model.Worksp
 		}
 		return nil, err
 	}
+	s.metricsTouch(w)
 	return w, nil
 }
 

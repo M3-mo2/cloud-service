@@ -72,6 +72,44 @@ func (p *metricsProvider) reconcile() {
 	p.mu.Unlock()
 }
 
+// upsert inserts or refreshes one workspace in the inventory immediately, so a
+// newly created (or patched) workspace is visible on the very next tick without
+// waiting for the reconcile cadence. It is called on the create/patch path.
+func (p *metricsProvider) upsert(w *model.Workspace) {
+	if w == nil || w.Status == model.WorkspaceDeleted {
+		return
+	}
+	p.mu.Lock()
+	p.cache[w.ID] = cachedWorkspace{
+		ownerID:     w.OwnerID,
+		diskLimit:   int64(w.Limits.DiskMB) * 1024 * 1024,
+		memoryLimit: int64(w.Limits.MemoryMB) * 1024 * 1024,
+	}
+	p.mu.Unlock()
+}
+
+// remove drops a workspace from the inventory immediately (on delete).
+func (p *metricsProvider) remove(id string) {
+	p.mu.Lock()
+	delete(p.cache, id)
+	p.mu.Unlock()
+}
+
+// metricsTouch refreshes the metrics inventory for a workspace after a create,
+// patch or delete. It is a no-op when the feature is disabled.
+func (s *Service) metricsTouch(w *model.Workspace) {
+	if s.metricsProvider != nil {
+		s.metricsProvider.upsert(w)
+	}
+}
+
+// metricsForget drops a deleted workspace from the metrics inventory.
+func (s *Service) metricsForget(id string) {
+	if s.metricsProvider != nil {
+		s.metricsProvider.remove(id)
+	}
+}
+
 // Candidates assembles the per-tick candidate set. The live-cgroup join is
 // fresh every tick; the inventory is read from the reconcile cache.
 func (p *metricsProvider) Candidates() []metrics.WorkspaceInfo {

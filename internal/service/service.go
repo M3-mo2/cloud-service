@@ -213,6 +213,7 @@ func (s *Service) CreateWorkspaceWithSubscription(principalID, name, profileName
 	if err := s.store.CreateWorkspace(w); err != nil {
 		return nil, err
 	}
+	s.metricsTouch(w)
 	return w, nil
 }
 

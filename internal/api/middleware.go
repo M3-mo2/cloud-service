@@ -36,6 +36,20 @@ func (w *respWriter) Write(b []byte) (int, error) {
 
 func (w *respWriter) setErrorCode(code string) { w.errorCode = code }
 
+// Flush forwards a flush to the underlying ResponseWriter when it supports
+// streaming, so an SSE handler behind this middleware can push each frame to the
+// client immediately. Without it the wrapped writer hides the http.Flusher and
+// the stream would buffer -- the classic "client sees nothing" failure.
+func (w *respWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap exposes the underlying ResponseWriter to http.ResponseController, so a
+// handler can reach optional interfaces (Flusher, Hijacker) through it.
+func (w *respWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // auditMiddleware logs one structured line per request.
 func auditMiddleware(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

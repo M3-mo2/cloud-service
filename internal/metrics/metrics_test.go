@@ -286,12 +286,9 @@ func TestFanOutReadsIndependentOfSubscribers(t *testing.T) {
 	}})
 	r.diskOK["/none"] = true
 	cfg := DefaultConfig()
-	cfg.Interval = time.Hour // we drive ticks manually by sampling
+	cfg.Interval = time.Hour // only the explicit publish() calls below tick
 	s := New(cfg, p, r)
 
-	// Baseline: one sample pass with one subscriber's worth of work.
-	base := s.Sample().Sampler.CgroupReads
-	// Now eight subscribers and several explicit sample passes.
 	var subs []*subscriber
 	for i := 0; i < 8; i++ {
 		sub, err := s.Subscribe(Scope{OwnerID: "u1"})
@@ -300,9 +297,39 @@ func TestFanOutReadsIndependentOfSubscribers(t *testing.T) {
 		}
 		subs = append(subs, sub)
 	}
-	after := s.Sample().Sampler.CgroupReads
-	if after-base != 2 { // one pass = 2 reads, regardless of 8 subscribers
-		t.Fatalf("one sample pass read %d cgroups, want 2 (independent of 8 subscribers)", after-base)
+	// Wait for the one initial publish to settle (the interval is 1h, so no
+	// further automatic sample pass will race the measurement below).
+	last := int64(-1)
+	for i := 0; i < 100; i++ {
+		cur := s.Counters().CgroupReads
+		if cur == last {
+			break
+		}
+		last = cur
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Drain the initial publish's frame from each subscriber.
+	for _, sub := range subs {
+		select {
+		case <-sub.Frames():
+		default:
+		}
+	}
+	before := s.Counters().CgroupReads
+	// ONE publish fans out to all 8 subscribers and performs exactly one sample
+	// pass (2 cgroup reads here), so cost is independent of subscriber count.
+	s.publish()
+	after := s.Counters().CgroupReads
+	if after-before != 2 {
+		t.Fatalf("one publish read %d cgroups, want 2 (independent of 8 subscribers)", after-before)
+	}
+	// Every subscriber received the frame (fan-out, not per-subscriber drop).
+	for i, sub := range subs {
+		select {
+		case <-sub.Frames():
+		default:
+			t.Fatalf("subscriber %d did not receive the fanned-out frame", i)
+		}
 	}
 	for _, sub := range subs {
 		s.Close(sub)

@@ -174,16 +174,20 @@ func (s *Sampler) Subscribe(scope Scope) (*subscriber, error) {
 }
 
 // closeSub removes a subscriber from the registry and stops the sampler when it
-// was the last one. It is idempotent.
+// was the last one. It is idempotent. The channel close happens under s.mu, the
+// same lock publish holds for its entire fan-out, so a send can never race a
+// close (the send-on-closed-channel bug).
 func (s *Sampler) closeSub(sub *subscriber) {
-	sub.closeMu.Do(func() { close(sub.ch) })
 	s.mu.Lock()
 	if _, ok := s.subs[sub.id]; ok {
 		delete(s.subs, sub.id)
 		s.c.subscribers.Store(int64(len(s.subs)))
+		sub.closeMu.Do(func() { close(sub.ch) })
 		if len(s.subs) == 0 && s.running {
 			s.stopLocked()
 		}
+	} else {
+		sub.closeMu.Do(func() { close(sub.ch) })
 	}
 	s.mu.Unlock()
 }
@@ -207,7 +211,9 @@ func (s *Sampler) stopLocked() {
 }
 
 // Shutdown stops the sampler and drops every subscriber. Used at server
-// shutdown so no goroutine is left behind.
+// shutdown so no goroutine is left behind. The channel closes happen under s.mu
+// (the same lock publish holds for its fan-out), so a shutdown can never race
+// an in-flight send.
 func (s *Sampler) Shutdown() {
 	s.mu.Lock()
 	if s.stopped {
@@ -215,9 +221,8 @@ func (s *Sampler) Shutdown() {
 		return
 	}
 	s.stopped = true
-	var subs []*subscriber
 	for _, sub := range s.subs {
-		subs = append(subs, sub)
+		sub.closeMu.Do(func() { close(sub.ch) })
 	}
 	s.subs = map[uint64]*subscriber{}
 	s.c.subscribers.Store(0)
@@ -225,9 +230,6 @@ func (s *Sampler) Shutdown() {
 		s.stopLocked()
 	}
 	s.mu.Unlock()
-	for _, sub := range subs {
-		sub.closeMu.Do(func() { close(sub.ch) })
-	}
 }
 
 // Wait blocks until the sample loop has stopped, bounded by d. It is used by a
@@ -277,27 +279,32 @@ func (s *Sampler) run(stop, done, wake chan struct{}) {
 // workspaces) for the whole tick, then fans a scope-filtered copy to every
 // subscriber. The expensive work runs exactly once per tick regardless of how
 // many subscribers are connected -- the property the gate proves.
+//
+// The fan-out (including the chunked channel sends) runs under s.mu, and
+// closeSub/Shutdown close a subscriber's channel under the same lock, so a send
+// can never race a close. The sends are non-blocking (select/default), so
+// holding the lock is brief.
 func (s *Sampler) publish() {
+	s.c.ticks.Add(1)
+	snap := s.sampleAll()
 	s.mu.Lock()
-	subs := make([]*subscriber, 0, len(s.subs))
+	defer s.mu.Unlock()
+	// Cache the encoded frame per scope: several subscribers of the same owner
+	// (or the same workspace) share one marshal, so the per-subscriber work is
+	// just a channel send.
+	cache := make(map[Scope][]byte, len(s.subs))
 	for _, sub := range s.subs {
-		subs = append(subs, sub)
-	}
-	s.mu.Unlock()
-	if len(subs) == 0 {
-		return
-	}
-	snap := s.Sample()
-	for _, sub := range subs {
-		frame := sseDataFrame(marshalScoped(snap, sub.scope))
-		s.mu.Lock()
+		frame, ok := cache[sub.scope]
+		if !ok {
+			frame = sseDataFrame(marshalScoped(snap, sub.scope))
+			cache[sub.scope] = frame
+		}
 		select {
 		case sub.ch <- frame:
 		default:
 			sub.dropped.Add(1)
 			s.c.dropped.Add(1)
 		}
-		s.mu.Unlock()
 	}
 }
 
@@ -324,30 +331,23 @@ func marshalScoped(snap Snapshot, scope Scope) []byte {
 	return b
 }
 
-// Sample builds one snapshot across every candidate workspace. It never walks a
-// directory tree: disk is one statfs, RAM is one memory.current + one
-// memory.max per live cgroup.
+// Sample builds one snapshot across every candidate workspace and advances the
+// tick counter. It is the SAMPLER-LOOP entry point: only a running sampler tick
+// advances Ticks, so a service with no subscriber has a frozen tick counter.
+// It never walks a directory tree: disk is one statfs, RAM is one
+// memory.current + one memory.max per live cgroup.
 func (s *Sampler) Sample() Snapshot {
-	all := s.provider.Candidates()
 	s.c.ticks.Add(1)
-	s.c.candidates.Store(int64(len(all)))
-	out := make([]WorkspaceSnapshot, 0, len(all))
-	for _, info := range all {
-		out = append(out, s.sampleWorkspace(info))
-	}
-	return Snapshot{
-		Timestamp:       time.Now().UTC(),
-		IntervalSeconds: s.IntervalSeconds(),
-		Workspaces:      out,
-		Sampler:         s.Counters(),
-	}
+	return s.sampleAll()
 }
 
-// SampleScoped builds one snapshot restricted to a scope, using the SAME sample
-// pass as the stream (filtering the shared result), so the one-shot route and
-// the stream can never disagree.
+// SampleScoped builds one snapshot restricted to a scope for a ONE-SHOT request.
+// It does NOT advance the tick counter (a one-shot is not a sampler tick), so
+// the lazy-start guarantee ("with zero subscribers the tick counter is frozen")
+// holds even while one-shot clients poll. It uses the exact same sample pass as
+// the stream, so the two can never disagree.
 func (s *Sampler) SampleScoped(scope Scope) Snapshot {
-	full := s.Sample()
+	full := s.sampleAll()
 	if scope == (Scope{}) {
 		return full
 	}
@@ -365,6 +365,23 @@ func (s *Sampler) SampleScoped(scope Scope) Snapshot {
 		out.Workspaces = []WorkspaceSnapshot{}
 	}
 	return out
+}
+
+// sampleAll performs the actual reading (one statfs per candidate, the cgroup
+// files for live workspaces). It advances the read counters but never Ticks.
+func (s *Sampler) sampleAll() Snapshot {
+	all := s.provider.Candidates()
+	s.c.candidates.Store(int64(len(all)))
+	out := make([]WorkspaceSnapshot, 0, len(all))
+	for _, info := range all {
+		out = append(out, s.sampleWorkspace(info))
+	}
+	return Snapshot{
+		Timestamp:       time.Now().UTC(),
+		IntervalSeconds: s.IntervalSeconds(),
+		Workspaces:      out,
+		Sampler:         s.Counters(),
+	}
 }
 
 // sampleWorkspace reads the minimum for one workspace: one statfs for disk, and

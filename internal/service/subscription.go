@@ -240,6 +240,7 @@ func (s *Service) deleteWorkspaceFully(w *model.Workspace) error {
 	if err := s.store.DeleteWorkspace(w.ID); err != nil {
 		return err
 	}
+	s.metricsForget(w.ID)
 	s.ReleaseWorkspaceNetwork(w.ID)
 	return nil
 }
