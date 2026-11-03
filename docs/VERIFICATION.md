@@ -1977,8 +1977,8 @@ result:  {"statvfs_before":268435456,"df_before":268435456,
 That is: the writer landed 239075328 bytes (228 MiB — the ext4 filesystem's
 usable capacity, the rest being its own metadata) and the next chunk failed with
 `OSError: [Errno 28] No space left on device` (ENOSPC). The reported total did
-not move: it was always the allowance. A previous `dd`/`python f.write` probe to
-the same effect is recorded in §14a's history and in
+not move: it was always the allowance. The raw transcript is kept at
+`~/.opencode-tasks/limits-criterion/21-boundary.txt`; the design rationale is in
 [DECISIONS.md](DECISIONS.md) ADR 85.
 
 `/workspace` reports `fuseblk`, never the host's `zfs` type, so the platform's
