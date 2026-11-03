@@ -2641,3 +2641,34 @@ the meta advertisement, and the no-leak check).
   transitive deps) declare a `go 1.23` floor, so `go.mod` requires Go 1.23+.
   _Rationale_: the mandated YAML config dependency cannot build on 1.22 without pinning
   unsupported older versions; 1.23 is the smallest compatible toolchain.
+
+### ADR 97 — a staged-content restore must RECREATE special files, never read them
+
+**Decision.** `copyTree` — the copy that moves a pre-existing workspace's entries into the
+new ext4 image when the FUSE disk backend is first provisioned — handles a **FIFO** by
+recreating the node (`syscall.Mkfifo`) instead of copying bytes, and **refuses** a socket
+or a device node with an error naming the file rather than dropping it silently.
+
+**Why (a real defect, hit in production on the first upgrade).** Provisioning the FUSE
+backend for an already-existing workspace renames its entries into a sibling
+`.disk-stage`, creates the image, mounts it, and copies the entries back. The copy treated
+every non-directory, non-symlink entry as content and called `os.ReadFile` on it. A
+workspace **legitimately contains a FIFO**: the terminal session creates `.term/in`.
+**Opening a FIFO for reading blocks until a writer appears**, so the copy hung on that
+entry. `.disk-stage` is removed only after a successful restore, so the directory
+survived and **every file of that workspace stayed inside it, invisible**: the file
+listing returned nearly empty and `exec` never answered. Staging is one-shot (it only runs
+when `disk.img` is absent), so the migration is the only trigger — but **any workspace with
+a terminal session has a FIFO**, which is exactly the workspace a user cares about.
+
+**Consequences and limits.** A FIFO round-trips with its type and mode preserved. A Unix
+socket or device node fails the migration with an explicit message; neither is expected in
+a user workspace. Reading with `O_NONBLOCK` was rejected: it returns zero bytes and would
+have converted a hang into silent data loss. Operators upgrading a live host should check
+for a surviving `.disk-stage` beside a workspace and restore it, since the pre-fix code
+left the data there.
+
+**Regression cover.** `TestRestoreStagedContentSurvivesAFifo` stages a regular file plus a
+top-level and a nested FIFO, runs the restore on a goroutine with a ten-second deadline,
+then asserts both FIFOs came back as FIFOs and the file's bytes survived. It fails on the
+previous implementation by hanging.

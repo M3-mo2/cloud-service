@@ -2866,3 +2866,28 @@ nature in `.limits`.
   bare-host run fails writing `uid_map`; this is a host restriction, not a bug in
   sandboxd. Verification therefore runs the service in a privileged container
   with `--cgroupns=host`.
+
+## 9s. A staged-content restore must not read a FIFO (defect found in production, fixed)
+
+**The defect.** Provisioning the FUSE disk backend for an already-existing workspace
+renames its entries into `.disk-stage`, creates the ext4 image, mounts it, and copies the
+entries back with a recursive copy that reads every non-directory entry. A workspace
+contains a FIFO — the terminal session creates `.term/in` — and **opening a FIFO for read
+blocks**, so the restore hung at that entry. `.disk-stage` is removed only after a
+successful restore, so the directory survived and **every file of the workspace was
+invisible inside it**: the listing came back nearly empty (only the entries whose names
+sorted before the FIFO) and `exec` did not return at all. Staging runs only when
+`disk.img` is absent, so the migration is the sole trigger — and a workspace with a
+terminal session always has a FIFO.
+
+**The fix.** Special files are recreated rather than read: a FIFO via `syscall.Mkfifo`
+(type and mode preserved), and a socket or device node reported as an explicit error
+instead of being silently dropped.
+
+**Evidence.** `TestRestoreStagedContentSurvivesAFifo` **fails on the previous code by
+hanging** — `--- FAIL: TestRestoreStagedContentSurvivesAFifo (10.01s)`,
+"restoreStagedContent HUNG on a FIFO" — and passes on the fixed code in 0.00s, with both
+the top-level and the nested FIFO asserted to return as FIFOs and the regular file's bytes
+intact. `go test ./...` passes all 15 packages. On the affected live host, after the fix,
+the same workspace's listing returned in under a millisecond and `exec` answered in 0.10 s
+with the user's `main.py` readable inside `/workspace`.
