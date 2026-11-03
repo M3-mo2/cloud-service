@@ -1,8 +1,10 @@
 package service
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"sandboxd/internal/model"
 	"sandboxd/internal/workspace"
@@ -171,6 +173,22 @@ func copyTree(src, dst string) error {
 			}
 		}
 		return nil
+	case fi.Mode()&os.ModeNamedPipe != 0:
+		// A workspace legitimately contains a FIFO: the terminal session
+		// creates `.term/in`. Opening a FIFO for reading BLOCKS until a writer
+		// appears, so reading one here hangs the whole migration and leaves
+		// every file of the workspace staged aside, invisible to the user.
+		// Recreate the node instead of reading it.
+		_ = os.RemoveAll(dst)
+		if err := syscall.Mkfifo(dst, uint32(fi.Mode().Perm())); err != nil {
+			return fmt.Errorf("recreate fifo %s: %w", dst, err)
+		}
+		return nil
+	case fi.Mode()&os.ModeSocket != 0 || fi.Mode()&os.ModeDevice != 0:
+		// A socket or a device node cannot be recreated by a plain copy and
+		// carries no content worth preserving. Report it explicitly rather than
+		// dropping it silently, and rather than blocking on it.
+		return fmt.Errorf("cannot migrate special file %s (%s)", src, fi.Mode().Type())
 	default:
 		data, err := os.ReadFile(src)
 		if err != nil {
