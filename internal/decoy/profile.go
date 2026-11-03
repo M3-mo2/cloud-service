@@ -20,6 +20,12 @@ import (
 	"strings"
 )
 
+// BuildMarker is an opaque marker embedded in the binary so the acceptance
+// harness can prove the running helper is a fresh build of this commit (a
+// positive control against a stale artifact masquerading as the tested one). It
+// names no engine and no mechanism.
+const BuildMarker = "e9c4d1a7"
+
 // Profile is the single decoy identity every covered channel must serve. If
 // ipify answers one address while ipinfo.io/org still names the real provider,
 // the mismatch teaches the tenant more than the truth would, so the whole

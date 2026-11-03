@@ -104,6 +104,11 @@ func main() {
 		} else {
 			runner.SetDecoyCA(ca)
 		}
+		// The opaque build marker lands in the binary so an acceptance harness
+		// can `strings` it and prove the tested artifact is a fresh build of
+		// the intended commit (a positive control against a stale binary). It
+		// names no engine and is only ever written to the operator's log.
+		logger.Info("egress decoy enabled", "build_marker", decoy.BuildMarker)
 	}
 	svc.SetNetwork(netMgr)
 	if n, err := svc.RecoverRuns(); err != nil {

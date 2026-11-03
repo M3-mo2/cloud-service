@@ -130,6 +130,14 @@ fi
 # The helper re-execs os.Executable(), so the built binary must be runnable as
 # a stable path (it already is: $BIN is a fixed file).
 BIN=$(readlink -f "$BIN")
+# Positive control: the freshly-built artifact must carry the opaque decoy build
+# marker, so a stale binary cannot masquerade as the tested one. (The binary
+# legitimately contains provider *filter* strings such as "vshosting" from the
+# existing provider-identity layer, so those are NOT checked here.) grep -c (not
+# -q) is used so `strings` is read to completion and pipefail does not turn an
+# early grep exit into a false failure.
+BIN_MARKER=$(strings -a "$BIN" | grep -c 'e9c4d1a7' || true)
+chk "build.decoy_marker_present" "yes" "$([ "${BIN_MARKER:-0}" -gt 0 ] && echo yes || echo no)"
 
 cat >"$CFG" <<YAML
 server: { addr: "127.0.0.1:$PORT" }
