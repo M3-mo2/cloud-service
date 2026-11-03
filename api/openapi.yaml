@@ -715,6 +715,140 @@ paths:
         "422": { $ref: "#/components/responses/Unprocessable" }
         "507": { $ref: "#/components/responses/InsufficientStorage" }
 
+  /v1/workspaces/{workspaceId}/files/archive:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: postv1_workspaces_workspaceId_files_archive
+      tags: [Files]
+      summary: Upload an archive and extract it (multipart)
+      description: >-
+        Extract an uploaded archive into the workspace in one request. The format
+        is detected from the content (magic bytes), never the filename. The
+        archive is validated in full before a byte is written, so a refusal
+        leaves no partial tree; a traversal/absolute/symlink entry, an encrypted
+        or multi-volume archive, or a cap breach is refused with a stable code.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [archive]
+              properties:
+                archive: { type: string, format: binary }
+                path: { type: string, description: "Destination directory (default /)." }
+                overwrite: { type: boolean, description: "Replace existing files (default false)." }
+                dry_run: { type: boolean, description: "Validate and report, write nothing (default false)." }
+      responses:
+        "200":
+          description: Extraction result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ArchiveResult" }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: "archive_entry_exists: a collision with overwrite=false."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "413":
+          description: "payload_too_large, archive_too_large, archive_too_many_entries or archive_ratio_exceeded."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "415":
+          description: "unsupported_archive: content matches no supported format."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "422":
+          description: "archive_unsafe_entry, archive_encrypted, archive_multivolume, unprocessable or subscription_expired (locked)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "507": { $ref: "#/components/responses/InsufficientStorage" }
+    get:
+      operationId: getv1_workspaces_workspaceId_files_archive
+      tags: [Files]
+      summary: Export a directory tree as a zip
+      description: >-
+        Stream a zip of a workspace directory. The walk never follows a symlink
+        and skips links (and macOS metadata junk when archives.skip_junk is on),
+        so a zip can never smuggle a link out. Only ZIP is written; RAR is
+        read-only.
+      parameters:
+        - name: path
+          in: query
+          description: "Directory to export (default /)."
+          schema: { type: string }
+      responses:
+        "200":
+          description: The zip bytes
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  /v1/workspaces/{workspaceId}/files/extract:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: postv1_workspaces_workspaceId_files_extract
+      tags: [Files]
+      summary: Extract an archive already in the workspace
+      description: >-
+        Extract a workspace file as an archive into a destination directory,
+        using the same engine and the same refusal codes as the upload route.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string, description: "Source archive path." }
+                dest: { type: string, description: "Destination directory (default /)." }
+                overwrite: { type: boolean, description: "Replace existing files (default false)." }
+                dry_run: { type: boolean, description: "Validate and report, write nothing (default false)." }
+      responses:
+        "200":
+          description: Extraction result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ArchiveResult" }
+        "400": { $ref: "#/components/responses/Validation" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "archive_entry_exists: a collision with overwrite=false."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "413":
+          description: "payload_too_large, archive_too_large, archive_too_many_entries or archive_ratio_exceeded."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "415":
+          description: "unsupported_archive: content matches no supported format."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "422":
+          description: "archive_unsafe_entry, archive_encrypted, archive_multivolume, unprocessable or subscription_expired (locked)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "507": { $ref: "#/components/responses/InsufficientStorage" }
+
   /v1/workspaces/{workspaceId}/exec:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -1228,6 +1362,14 @@ components:
         - timeout
         - tunnel_url_unavailable
         - unavailable
+        - unsupported_archive
+        - archive_encrypted
+        - archive_multivolume
+        - archive_too_large
+        - archive_too_many_entries
+        - archive_ratio_exceeded
+        - archive_unsafe_entry
+        - archive_entry_exists
         - internal
     ErrorEnvelope:
       type: object
@@ -1435,6 +1577,69 @@ components:
             summary_present_on:
               type: array
               items: { type: string }
+        archives:
+          type: object
+          description: >-
+            Native-archive capability, reported truthfully. `enabled` is the
+            server switch; `formats` is the content-detected allowlist; `read_only`
+            lists formats that may be read but never written (rar, whose encoder
+            is proprietary); `limits` are the bounds actually in force;
+            `refusal_codes` is the stable set a client can act on; `semantics`
+            states the validate-before-write and overwrite rules.
+          properties:
+            enabled: { type: boolean }
+            formats:
+              type: array
+              items: { type: string }
+            read_only:
+              type: array
+              items: { type: string }
+            limits:
+              type: object
+              properties:
+                max_entries: { type: integer }
+                max_total_mb: { type: integer }
+                max_file_mb: { type: integer }
+                max_ratio: { type: integer }
+                upload_mb: { type: integer }
+                overwrite: { type: boolean }
+                skip_junk: { type: boolean }
+            routes:
+              type: array
+              items: { type: string }
+            refusal_codes:
+              type: array
+              items: { type: string }
+            semantics: { type: string }
+    ArchiveEntry:
+      type: object
+      description: One archive member as reported by an extraction or dry run.
+      properties:
+        name: { type: string, description: "Name as stored in the archive." }
+        path: { type: string, description: "Resolved workspace path." }
+        type: { type: string, enum: [file, dir, symlink, hardlink] }
+        size: { type: integer }
+        compressed_size: { type: integer }
+        mode: { type: string, description: "Mode with privileged bits already stripped." }
+        rejected: { type: boolean }
+        reason: { type: string, description: "Stable refusal code when rejected." }
+        skipped: { type: boolean }
+        skip_reason: { type: string }
+    ArchiveResult:
+      type: object
+      required: [format, destination, entries_total, bytes_written, dry_run]
+      properties:
+        format: { type: string, enum: [zip, rar] }
+        destination: { type: string }
+        entries_total: { type: integer }
+        entries_extracted: { type: integer }
+        entries_skipped: { type: integer }
+        entries_rejected: { type: integer }
+        bytes_written: { type: integer }
+        dry_run: { type: boolean }
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/ArchiveEntry" }
     Limits:
       type: object
       properties:

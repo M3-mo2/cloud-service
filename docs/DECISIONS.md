@@ -1953,6 +1953,130 @@ function (boundary: at exactly `LockedAt` a delete is allowed again) and against
 the real reaper (a workspace whose `LockedAt` is rewritten into the future
 survives ticks).
 
+### ADR 92 — native archives: in-engine extraction, the streaming budget, and the refusal codes
+
+**Decision.** Archive upload/extract, in-place extract and directory export are
+performed **in the engine** (`internal/archive`), never by shelling out to
+`unzip`, `tar`, `unrar` or any host tool. Extraction reads **ZIP** and **RAR**
+(RAR4 and RAR5); export writes **ZIP only**.
+
+**Why in-engine, not a host tool (measured).** This host has **no RAR tool at
+all** — `unrar` is not installed and no equivalent is present — so a shell-out
+design would simply fail for RAR. The one candidate that IS sometimes available,
+`unrar-free`, **cannot read RAR5**, the format modern `rar` produces by default;
+depending on it would silently cap the feature at an obsolete format. More
+fundamentally, the archive is **untrusted input** and the trust boundary must
+live in the engine: a host binary that may be absent, a different version, or
+absent from a future host is not a boundary this service can guarantee. In the
+engine the behavior is identical on every host and every refusal is
+deterministic.
+
+**The dependency choice: `github.com/nwaples/rardecode/v2`.** It is **pure Go,
+MIT-licensed, and requires no cgo**, so it compiles into the single static
+binary with no extra host requirement; it reads both RAR4 (a.k.a. RAR 3.x) and
+RAR5 and reports encryption, multi-volume and link entries through typed
+errors/fields. **RAR is read-only by design**: RAR's encoder is proprietary and
+no permissively-licensed RAR writer exists, so the engine never writes RAR and
+never claims to. Export produces a ZIP; a caller who uploaded a RAR downloads a
+ZIP. This asymmetry is deliberate and documented in the API.
+
+**Format detection is from content, never the filename.** The leading magic
+bytes decide: ZIP local/empty/spanned headers, or the shared `Rar!\x1a\x07`
+prefix for RAR4 (`...\x07\x00`) and RAR5 (`...\x07\x01\x00`). A `.zip` that is
+really a RAR still works, and an unrecognized format is refused naming the
+detected signature. The filename is never trusted.
+
+**Never trust the archive's headers.** An archive is an attacker-controlled
+stream of claims. Two rules follow, and both are load-bearing:
+
+1. **Validate everything before writing a byte.** The full header list is read
+   and every entry decided (path cleaning, kind, caps) *before* the first byte
+   is written, so a refused archive leaves **no partial tree**.
+2. **Budget the bytes actually written, not the bytes promised.** The declared
+   uncompressed sizes are only a cheap pre-check; the real guard is a **streaming
+   budget** (`copyBudgeted`) that counts what it writes against `max_total_mb`
+   and `max_file_mb` and stops at the cap. A header that lies about its size
+   therefore cannot overshoot — the on-disk total can never exceed the budget.
+   (This is also why a RAR header's `UnKnownSize` is handled by counting writes
+   rather than trusting the field.)
+
+**Name safety.** Every entry name is put through the workspace's **own** cleaner
+(`workspace.CleanRelative`), never a second validator, so the archive path model
+and the API path model cannot drift. A name that cleans to an escaping path is
+refused, and an **absolute** name or a **drive letter** is refused **explicitly**
+even though the cleaner would strip a leading slash — the archive must not look
+like it accepted an absolute path. Two entries that normalize to the same path
+(a collision) are refused rather than last-wins: refusing is safer and the
+workspace filesystem is case-sensitive.
+
+**Symlinks and hardlinks are refused, never materialized.** The engine does not
+try to decide whether a link target is safe; it simply never creates one. This
+closes the canonical "a symlink entry whose target is `..`, followed by an entry
+that writes *through* it" escape outright. Devices, FIFOs and sockets are refused
+with the same code.
+
+**Privileged mode bits are stripped.** `SanitizeMode` takes the permission bits
+only, which by definition drops `setuid`, `setgid` and sticky; an archive that
+asks for `4755` lands as `0755`, and an entry with no usable permission bits gets
+a safe default. No archive content can cause a privileged file.
+
+**Collision policy.** The default is `overwrite:false`:
+an entry that would clobber an existing file is refused with **`409
+archive_entry_exists`** and the existing file's **content is preserved** —
+asserted. A request opts in to replacement with `overwrite:true` (or the server
+default `archives.overwrite`). Refusing is the safe default; replacing is an
+explicit choice.
+
+**`dry_run` semantics.** With `dry_run:true` the archive is validated and the
+entries are reported (`entries_total`, each entry's `rejected`/`skipped` and
+`reason`), and **nothing is written** (`bytes_written:0`). A dry run **does not
+fail on a rejected entry**: previewing a hostile archive is exactly its purpose,
+so it reports `entries_rejected` and still returns `200`. A real extraction, by
+contrast, refuses the **whole** archive if any entry is rejected.
+
+**Export safety (the other direction).** `WriteZip` walks with `Lstat` semantics
+(it never follows a symlink) and **skips** links (and `skip_junk` noise), so a
+zip can never smuggle a link out of the workspace; the root itself is never
+emitted. The export is built by the same package as extraction, so "upload a
+project" and "download my project" are symmetrical.
+
+**The stable refusal codes** (one of these for every archive refusal, so a
+client can act and the safety rules stay inspectable):
+
+| Code | HTTP | Condition |
+|------|------|-----------|
+| `unsupported_archive` | 415 | content matches no supported format, or the detected format is disabled by `archives.formats` |
+| `archive_encrypted` | 422 | ZIP (flag bit 0/6) or RAR archive/entry needs a password |
+| `archive_multivolume` | 422 | RAR `partN.rar` continues in another file |
+| `archive_too_large` | 413 | total uncompressed over `max_total_mb`, or one entry over `max_file_mb` |
+| `archive_too_many_entries` | 413 | more entries than `max_entries` |
+| `archive_ratio_exceeded` | 413 | an entry's uncompressed/compressed ratio over `max_ratio` |
+| `archive_unsafe_entry` | 422 | traversal / absolute / drive letter / collision, or a symlink/hardlink entry |
+| `archive_entry_exists` | 409 | entry would clobber an existing file and `overwrite` is false |
+
+A corrupt or truncated archive whose content WAS recognized is reported as `422
+unprocessable` ("corrupt or truncated archive"), distinct from a format mismatch;
+the daemon is unaffected (an ordinary returned error). If a case cannot be made
+safe, it is refused with one of these codes — a refused extraction is always
+better than a compliant-looking escape.
+
+**The `rar3-*` naming trap.** The RAR4 fixtures under
+`internal/archive/testdata/rar4/` were generated from files named `rar3-*`,
+because **RAR3.x and RAR4 are the same format generation** — "RAR 3.0" through
+"RAR 4.x" share one container format, and RAR5 is the next generation. The
+directory is `rar4/` (the generation) while the source files are named `rar3-*`
+(a legacy label); this is not a mismatch and not a mistake. `rar4/` and `rar5/`
+are the two distinct readers exercised.
+
+**Proof.** Pure unit tests in `internal/archive` (23 test functions) cover
+detection, the plan, the budget boundaries, mode stripping, the overwrite policy
+and the RAR refusals; `internal/api/archive_test.go` covers the three endpoints;
+and `scripts/archive-check.sh` drives the REAL service and nsjail against the
+COMMITTED fixtures and asserts the whole boundary, including that nothing is
+written outside the destination, disk usage does not grow on a bomb, an
+encrypted/multi-volume archive is refused, random/empty/truncated input is
+refused with the daemon still alive, and an export is a valid zip.
+
 ### The fast workspace summary (Feature 2)
 
 **Decision.** A `WorkspaceSummary` is computed from stored fields and **cheap**

@@ -54,7 +54,7 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 
 - `GET /healthz` → 200 `{"status":"ok"}`
 - `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str},"workspace_limits":{"enabled":bool,"mechanism":str,"proc":bool,"proc_files":[str],"reason":str},"egress_decoy":{"enabled":bool,"ready":bool,"reason":str}}`
-- `GET /v1/meta` → `{"version":"0.0.19","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"workspace_limits":{"enabled":bool,"mechanism":str,"reporting":str,"enforcement":str,"limits":str},"egress_decoy":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
+- `GET /v1/meta` → `{"version":"0.0.19","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"workspace_limits":{"enabled":bool,"mechanism":str,"reporting":str,"enforcement":str,"limits":str},"egress_decoy":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"archives":{"enabled":bool,"formats":[str],"read_only":[str],"limits":{...},"routes":[str],"refusal_codes":[str],"semantics":str}}`
 - `GET /metrics` → Prometheus text
 
 #### What a workspace can and cannot observe
@@ -263,10 +263,51 @@ endpoints enforce path safety. Browsing and viewing are first-class:
 - `POST /v1/workspaces/{id}/files/mkdir` body `{"path":"/src"}` → 201
 - `POST /v1/workspaces/{id}/files/rename` body `{"from":"/a","to":"/b"}` → 204
 - `POST /v1/workspaces/{id}/files/upload` multipart `file` + `path` → 201
+- `POST /v1/workspaces/{id}/files/archive` multipart `archive` + `path?` +
+  `overwrite?` + `dry_run?` → 200 `archiveResult` (upload-and-extract one step)
+- `POST /v1/workspaces/{id}/files/extract` body
+  `{"path":"/bundle.zip","dest":"/out","overwrite?":false,"dry_run?":false}` → 200
+  `archiveResult` (extract an archive already in the workspace)
+- `GET /v1/workspaces/{id}/files/archive?path=/project` → `application/zip`
+  (export a directory tree; only ZIP is written, RAR is read-only)
 
 Enforce output/body caps (§1.8) and disk quota (§1.5). Operating on the wrong
 node type (a file where a directory is required, or vice versa) is a `422`
 `not_directory`; it is never `404` when the path exists and never `500`.
+
+### 2.3.1 Native archives (upload-and-extract, in-place extract, export)
+
+Archives are handled **in the engine** (Go `archive/zip` and
+`github.com/nwaples/rardecode/v2`); no host `unzip`/`tar`/`unrar` is ever
+invoked, so every refusal is deterministic and identical on every host. Formats
+are detected from **content** (magic bytes), never the filename. ZIP and RAR4/5
+are read; only ZIP is written (**RAR is read-only** — its encoder is
+proprietary). Capability is advertised in `GET /v1/meta` under `archives`.
+
+- `POST /v1/workspaces/{id}/files/archive` multipart `archive` (required) +
+  `path` (dest, default `/`) + `overwrite` + `dry_run` → 200 `archiveResult`
+  `{"format","destination","entries_total","entries_extracted","entries_skipped","entries_rejected","bytes_written","dry_run","entries":[{"name","path","type","size","mode","rejected","reason?","skipped","skip_reason?"}]}`
+- `POST /v1/workspaces/{id}/files/extract` body `{"path","dest?","overwrite?","dry_run?"}` → 200 `archiveResult` (source is a workspace file, read under `archives.upload_mb`).
+- `GET /v1/workspaces/{id}/files/archive?path=/dir` → the zip bytes
+  (`Content-Type: application/zip`); a non-directory is `422 not_directory`.
+
+**Safety (the archive is untrusted input).** Every entry name goes through the
+workspace path cleaner; a traversal, absolute name, drive letter or intra-archive
+collision is refused with `422 archive_unsafe_entry`, and a symlink/hardlink
+entry is refused rather than materialized. Privileged mode bits
+(`setuid`/`setgid`/sticky) are stripped (`4755`→`0755`). The **whole** archive is
+validated before any byte is written, so a refusal leaves **no** partial tree;
+the bytes actually written are bounded by a **streaming** budget, so a lying
+header cannot overshoot `max_total_mb`/`max_file_mb`. A collision with
+`overwrite:false` (the default) is `409 archive_entry_exists` and the existing
+content is preserved. `dry_run:true` validates, reports and writes nothing (and
+does not fail on a rejected entry).
+
+**Stable refusal codes.** `415 unsupported_archive` (unknown content or a format
+disabled by `archives.formats`), `422 archive_encrypted`, `422
+archive_multivolume`, `413 archive_too_large`, `413 archive_too_many_entries`,
+`413 archive_ratio_exceeded`, `422 archive_unsafe_entry`, `409
+archive_entry_exists`. See [DECISIONS.md](DECISIONS.md) ADR 92.
 
 ### 2.4 Exec (sync)
 
@@ -570,6 +611,14 @@ the table) is:
 | `timeout` | 504 | **Defined but never emitted** by any handler (retained in the vocabulary and the OpenAPI enum). |
 | `tunnel_url_unavailable` | 504 | Cloudflared did not print a public URL within `tunnels.url_timeout_sec`; the create fails and leaves no record. |
 | `unavailable` | 503 | nsjail missing, or nsjail could not set up/launch the sandbox; or the network/tunnel layer is not configured. |
+| `unsupported_archive` | 415 | Archive content matches no supported format (or a format disabled by `archives.formats`). |
+| `archive_encrypted` | 422 | Encrypted ZIP or RAR (no password is available). |
+| `archive_multivolume` | 422 | Multi-volume RAR (`partN.rar`). |
+| `archive_too_large` | 413 | Total or single-entry uncompressed size over `archives.max_total_mb`/`max_file_mb`. |
+| `archive_too_many_entries` | 413 | More entries than `archives.max_entries`. |
+| `archive_ratio_exceeded` | 413 | Entry uncompressed/compressed ratio over `archives.max_ratio`. |
+| `archive_unsafe_entry` | 422 | Entry escapes the destination (traversal/absolute/drive/collision) or is a symlink/hardlink. |
+| `archive_entry_exists` | 409 | Entry would clobber an existing file and `overwrite` is false. |
 | `internal` | 500 | Unexpected server error. |
 
 The code is not always a 1:1 mirror of the status: a **405 method not allowed**

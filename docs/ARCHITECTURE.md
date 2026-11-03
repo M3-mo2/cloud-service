@@ -150,6 +150,7 @@ flowchart TD
     SVC --> RUN
     SVC --> WS
     SVC --> SUB["internal/subscription (pure: parser, decision, derivations)"]
+    SVC --> ARC["internal/archive (pure: detection, plan, budgeted extract, export)"]
 
     RUN --> CFGS["configs (embedded template)"]
     RUN --> MODEL
@@ -172,11 +173,12 @@ flowchart TD
 | `internal/api` | `router.go`, `*.go` | chi routes, handlers, DTOs, JSON error envelope, Prometheus metrics, audit log |
 | `internal/service` | `service.go`, `files.go`, `exec.go`, `runs.go`, `control.go`, `packages.go`, `sessions.go`, `subscription.go` | Orchestration, ownership checks, limits, retention, run and session registries, and the subscription lifecycle + reaper loop |
 | `internal/subscription` | `subscription.go` | The PURE subscription parts: the duration-grammar parser, the reaper decision function `Decide(now, sub, grace)`, and the derived summary numbers. No I/O, no daemon |
+| `internal/archive` | `format.go`, `plan.go`, `extract.go`, `export.go`, `engine.go`, `errors.go` | The PURE native-archive engine: content-based format detection, the validated extraction plan, the streaming budget, extraction, and directory export. No shell tool, no direct filesystem access (writes go through a `Sink`) |
 | `internal/workspace` | `fs.go`, `path.go`, `diskfs.go` | Safe rooted filesystem, traversal/symlink defense, disk quota accounting, and the per-workspace fuse2fs ext4 image manager |
 | `internal/storage` | `store.go` | Atomic JSON metadata + run-log/session-output files on disk |
 | `internal/executor` | `executor.go`, `nsjail.go`, `live.go`, `identity.go`, `fake.go`, `pty_relay.py` | nsjail config rendering, UID/GID mapping, one-shot and interactive process lifecycles, capped capture, PTY relay helper |
 | `configs` | `nsjail_python.cfg.tmpl`, `embed.go` | nsjail TextProto template (also compiled into the binary) |
-| `scripts` | `acceptance.sh`, `session-nsjail-check.sh`, `subscription-check.sh`, `nsjail-stub.py` | End-to-end acceptance transcript; privileged real-nsjail terminal-session + subscription acceptance; test stub |
+| `scripts` | `acceptance.sh`, `session-nsjail-check.sh`, `subscription-check.sh`, `archive-check.sh`, `nsjail-stub.py` | End-to-end acceptance transcript; privileged real-nsjail terminal-session + subscription + archive acceptance; test stub |
 
 Total ≈ 6.4k lines of Go across 8 packages, plus one embedded template and an
 OpenAPI 3.1 spec (`api/openapi.yaml`).
@@ -493,6 +495,51 @@ workspace with no subscription is never selected. The clock is injected
 config clock — assert days-long semantics in seconds. The `summary` exposed on
 the get and the list is the same pure `Derivations` output, so it can never
 disagree with enforcement.
+
+### 4.7 Native archives (an untrusted input, validated before a byte is written)
+
+Archive handling is an **in-engine** feature, not a shell-out: this host has no
+RAR tool at all, and a security boundary cannot live in a host binary that may
+be absent or different. The engine uses Go's `archive/zip` and
+`github.com/nwaples/rardecode/v2` (pure Go, MIT, no cgo). RAR is **read-only** —
+its encoder is proprietary, so export writes only ZIP.
+
+The pure half lives in `internal/archive` and never touches the filesystem
+directly; the service supplies a `Sink` backed by the workspace's symlink-safe,
+quota-accounted streaming writers (`internal/service/archive.go`):
+
+```mermaid
+flowchart TD
+    IN([uploaded or in-workspace archive]) --> DET["Detect: content magic bytes<br/>(never the filename)"]
+    DET --> P1["Pass 1: read every header,<br/>enforce entry-count cap, sum declared sizes"]
+    P1 --> BUILD["buildPlan: clean every name through<br/>the workspace path cleaner; reject<br/>traversal/absolute/drive/collision,<br/>symlink &amp; hardlink, per-file/ratio caps; skip junk"]
+    BUILD --> DRY{dry_run?}
+    DRY -->|yes| REP["report entries, write NOTHING"]
+    DRY -->|no| ANY{any rejected?}
+    ANY -->|yes| REFUSE["refuse the WHOLE archive<br/>(stable code, no partial tree)"]
+    ANY -->|no| P2["Pass 2: re-open, stream each entry<br/>under a byte budget, stripping<br/>privileged mode bits"]
+    P2 --> OUT([workspace files])
+```
+
+The load-bearing properties are:
+
+- **Detection is content-based.** A `.zip` that is really a RAR still works; an
+  unknown format is `415 unsupported_archive` naming the detected signature.
+- **Validate-then-write.** The whole header list is read and decided before the
+  first byte is written, so a refused archive leaves **no** partial tree.
+- **A streaming budget, not a header promise.** The bytes actually written are
+  bounded by `max_total_mb`/`max_file_mb`, so a header that lies about its size
+  cannot overshoot.
+- **Links are refused, not resolved.** A symlink or hardlink entry is never
+  materialized, so the engine never has to decide whether a target is safe.
+- **Modes are sanitized.** `setuid`/`setgid`/sticky bits are stripped.
+
+The three routes (`POST /files/archive`, `POST /files/extract`,
+`GET /files/archive`) and their stable refusal codes are documented in
+[docs/API.md](API.md#native-archives) and [SPEC.md](SPEC.md) §2.3.1; the
+decisions are recorded in [DECISIONS.md](DECISIONS.md) ADR 92, and
+`scripts/archive-check.sh` asserts the whole boundary against real nsjail and a
+real FUSE disk.
 
 ---
 
@@ -1000,7 +1047,7 @@ flowchart LR
         LIFECYCLE["POST .../{suspend,resume,stop}"]
         USAGE["GET /workspaces/{id}/usage"]
         PKG["GET/DELETE /workspaces/{id}/packages\nPOST .../packages/install"]
-        F["GET/DELETE /files · /files/stat\nGET/PUT /files/content · /files/download\nPOST /files/{mkdir,rename,upload}"]
+        F["GET/DELETE /files · /files/stat\nGET/PUT /files/content · /files/download\nPOST /files/{mkdir,rename,upload}\nPOST/GET /files/archive · POST /files/extract"]
         EX["POST /exec (sync, ≤60s)"]
         RN["POST/GET/DELETE /runs · /runs/{id}\nPOST /runs/{id}/stop\nDELETE /runs/{id}\nGET /runs/{id}/logs"]
         SS["POST/GET /sessions · /sessions/{id}\nPOST .../input|signal|resize\nGET .../output\nDELETE /sessions/{id}"]
@@ -1035,6 +1082,9 @@ flowchart LR
 | `POST .../files/mkdir` | mkdir -p | 201 | 400, 422 |
 | `POST .../files/rename` | rename | 204 | 404, 422 |
 | `POST .../files/upload` | multipart upload | 201 | 413, 507 |
+| `POST .../files/archive` | upload-and-extract an archive | 200 | 409 collision, 413 cap, 415 format, 422 unsafe/encrypted/multivolume |
+| `POST .../files/extract` | extract an in-workspace archive | 200 | 404, 409, 413, 415, 422 |
+| `GET .../files/archive?path=` | export a directory as a zip | 200 | 404, 422 `not_directory` |
 | `POST .../exec` | sync run | 200 | 422 bad cmd, 409 suspended, 503 no nsjail |
 | `POST .../runs` | async run | 202 | 400, 409 suspended |
 | `GET .../runs` / `.../runs/{id}` | list (filter/page) / get | 200 | 400, 404 |
@@ -1111,6 +1161,16 @@ subscription:                # workspace terms (engine clock; no billing)
   max_duration: "365d"       # server ceiling, measured from now
   grace_period: "168h"       # 7 days locked before deletion
   reap_interval: "60s"       # reaper tick
+archives:                    # native archive handling (in-engine; all defaulted)
+  enabled: true              # false refuses every archive route (422)
+  max_entries: 20000         # 413 archive_too_many_entries past this
+  max_total_mb: 2048         # streaming total budget → 413 archive_too_large
+  max_file_mb: 512           # per-entry cap → 413 archive_too_large
+  max_ratio: 200             # compression-ratio bomb guard → 413 archive_ratio_exceeded
+  upload_mb: 50              # archive upload cap (separate from caps.upload_mb)
+  overwrite: false           # default collision policy → 409 archive_entry_exists
+  skip_junk: true            # skip __MACOSX/, .DS_Store, ._*, Thumbs.db, desktop.ini
+  formats: ["zip", "rar"]    # content-detected allowlist (RAR is read-only)
 keys:                        # service bearer keys → principal_id (1:N allowed);
                              # held by the frontend, never by end users
   - { key: "dev-key-please-rotate", principal_id: "user_dev" }
@@ -1190,8 +1250,7 @@ real-nsjail acceptance transcript:
 | network egress | `NET_BLOCKED: OSError` | net namespace isolates |
 | `/etc/shadow` | `FileNotFoundError` | not mounted |
 | `mount(2)`/`ptrace` | exit **159** (SIGSYS) | seccomp kills it |
-| memory ceiling (`cgroup_mem_max`) | 4 GiB touch killed (exit 137) | physical ceiling enforced |
-| fork bomb | `FORKED 191` then `BlockingIOError` | cgroup pids limit |
+| memory ceiling (`cgroup_mem_max`) | 4 GiB touch killed (exit 137) | physical ceiling enforced || fork bomb | `FORKED 191` then `BlockingIOError` | cgroup pids limit |
 | stop long run | status `killed`, no orphan | process-group kill |
 | launch failure (no `--cgroupns=host`) | 503 + nsjail diagnostic | failure is explicit |
 
@@ -1237,7 +1296,10 @@ per-workspace disk boundary and curated `/proc` (ADR 85/86), and workspace
 subscriptions: the engine clock and absolute instants (ADR 87), the duration
 grammar with `mo`/`y` approximations (ADR 88), `locked` vs `suspended` and the
 allow/refuse split (ADR 89), the extension semantics (ADR 90), and the reaper
-(pure decision, injected clock, idempotent, backwards-clock rule; ADR 91).
+(pure decision, injected clock, idempotent, backwards-clock rule; ADR 91), and
+native archives: in-engine extraction (no host tool), the `rardecode/v2`
+dependency and read-only RAR, the validate-before-write rule and streaming
+budget, the link/mode policy, the collision policy and `dry_run` (ADR 92).
 
 ---
 

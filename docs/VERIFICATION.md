@@ -104,7 +104,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **394** (390 unit + 4 `integration`-tagged), including regression
+Test functions: **442** (438 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -174,7 +174,7 @@ file (the same measure `scripts/docs-consistency.sh` asserts against):
 
 ```
 $ find . -name '*_test.go' -exec grep -hE '^func Test' {} + | wc -l
-394
+442
 ```
 
 ## 2. Probes
@@ -2027,11 +2027,64 @@ What each group proves:
 instant: exactly at expiry, exactly at grace end; the backwards-clock rule) and
 the derivations (unlimited, active, expiring-soon, locked, clamped-at-0); the
 service adds the whole lifecycle with an injected clock; the API adds the
-request/response contract. Suite total `394` test functions (see §1).
+request/response contract. Suite total `442` test functions (see §1).
+
+## 9m. Native archives (this revision)
+
+Archive handling (upload-and-extract, in-place extract, directory export) is
+performed **in the engine** — Go's `archive/zip` and `github.com/nwaples/rardecode/v2`
+— never by shelling out. This host has **no RAR tool at all** and `unrar-free`
+cannot read RAR5, so the trust boundary lives in the engine; RAR is read-only
+because its encoder is proprietary. Extraction is a **security boundary**: an
+untrusted archive must not write outside the destination, set a privileged bit,
+or exceed a budget. See [DECISIONS.md](DECISIONS.md) ADR 92.
+
+### 9m.1 The binary under test
+
+The tested binary is a **fresh build of the committed tree** and carries a
+`strings`-level positive control (`archive.BuildMarker`), so a stale artifact
+cannot pass the gate:
+
+```
+$ go build -o /tmp/sbx-archive ./cmd/sandboxd
+$ grep -aoF 'zcp-archive-native-v0.0.19' /tmp/sbx-archive
+zcp-archive-native-v0.0.19
+```
+
+### 9m.2 The real-nsjail acceptance
+
+`scripts/archive-check.sh` drives the REAL service and nsjail and extracts the
+**committed** `internal/archive/testdata` fixtures through the real API, so the
+gate cannot pass without them. It asserts a normal zip with nested dirs, an empty
+file and a unicode name extracts; a `../` traversal and an absolute path are
+refused with `422 archive_unsafe_entry` and **nothing is written outside** (the
+would-be escape paths are asserted absent); a setuid bit is stripped (`0755`, not
+`4755`); a zip bomb and a ratio bomb are refused without the disk growing; an
+encrypted ZIP and RAR, and a multi-volume RAR, are refused; a hostile RAR
+symlink/hardlink is refused; random bytes, an empty file and a truncated zip are
+refused with the daemon still alive; `dry_run` writes nothing and reports the
+entries; `overwrite:false` refuses a collision (`409 archive_entry_exists`) and
+preserves the content while `overwrite:true` replaces it; `POST /files/extract`
+works on an uploaded archive; and `GET /files/archive` streams a valid zip with
+the tree. The measured numbers are recorded in §14c.
+
+### 9m.3 The pure engine and the API surface
+
+`internal/archive` carries 32 test functions: content detection (ZIP/RAR4/RAR5,
+unknown, empty), the plan (traversal, absolute, drive letter, intra-archive
+collision, junk skip, per-file/ratio caps), the **budget boundaries** (exactly at
+the cap is allowed; one byte over the total and over the entry is refused; the
+written bytes never exceed the budget), mode stripping (`4755`→`0755`), symlink
+refusal, the overwrite policy (`archive_entry_exists` preserves the original;
+`overwrite:true` replaces it) and the RAR refusals (encrypted RAR4/RAR5,
+multivolume, evil-symlink, hardlink) plus a ZIP round-trip that never emits a
+symlink. `internal/api/archive_test.go` covers the three endpoints, the disabled
+switch, `dry_run`, traversal and overwrite, and `/v1/meta` advertising the
+capability.
 
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **91** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **92** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -2073,6 +2126,12 @@ duration grammar with `mo`/`y` fixed-length approximations (#88), `locked` vs
 `suspended` and the exact allow/refuse split (#89), the extension semantics
 (add-while-live, from-now-when-lapsed, never-shorten; #90), and the reaper (pure
 decision, injected clock, idempotent, backwards-clock rule; #91). See §9l.
+**#92** records native archives: in-engine extraction (no host tool, and the
+measured absence of a usable RAR tool here), the `rardecode/v2` dependency
+(pure Go, MIT, no cgo) and read-only RAR, the content-based detection, the
+never-trust-the-headers rule and the streaming budget, the name/link/mode
+policy, the collision policy and `dry_run`, the export safety, and the full
+stable refusal-code table (see §9m).
 
 ## 11. OpenAPI
 
@@ -2218,7 +2277,7 @@ identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/
       disk.df_bare_workspace_1k 262144
       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
 docs-consistency.sh             193 passed / 0 failed
-go test ./...                  394 test functions (from 353)
+go test ./...                  442 test functions (from 353)
 ```
 
 The full gate set re-run for this revision, one gate at a time (concurrent runs
@@ -2232,7 +2291,7 @@ scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped   (real quick 
 scripts/identity-check.sh       131 passed / 0 failed / 2 skipped
 scripts/egress-decoy-check.sh    58 passed / 0 failed / 0 skipped
 scripts/subscription-check.sh    61 passed / 0 failed             (compressed clock; see §9l)
-go test ./...                    394 test functions; go vet ./... clean
+go test ./...                    442 test functions; go vet ./... clean
 ```
 
 `identity-check.sh` §1b and §1c are the new assertions: the curated `/proc`
