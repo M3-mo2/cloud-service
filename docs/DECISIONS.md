@@ -1651,6 +1651,42 @@ allowance, so:
   device`; 10×5MiB files land only up to the TOTAL (which `rlimit_fsize` cannot
   do). The boundary refuses the write rather than sampling afterwards.
 
+**Correction (this revision) — which `df` invocations are covered.** The claim
+"`df` is correct for free" was too broad. Coreutils `df` builds its filesystem
+table from **`/proc/self/mountinfo`**, and the curated `/proc` (ADR 86) initially
+provided only `/proc/mounts`. Measured inside a real workspace before the fix:
+
+- **`df --output=size <path>`, `df -B1 <path>`, `df --output=fstype <path>`,
+  `stat -f`, `os.statvfs()`** — **worked**, because with an explicit path `df`
+  `statvfs`es the path directly and does not need the mount table.
+- **bare `df -h`, `df -h <path>`, bare `df`** — **BROKEN**: `df: cannot read table
+  of mounted file systems: No such file or directory`, no row. These read
+  `/proc/self/mountinfo`, which did not exist.
+
+That split is exactly why the gate passed while the operator's literal command
+(`df -h`) was broken: the gate tested only the path/`--output=` forms. Fixed by
+generating `/proc/self/mountinfo` from the SAME mount list `/proc/mounts` is
+built from (see ADR 86). After the fix, bare `df -h` prints the workspace row
+with its own 256M, and `df -h /`/bare `df` exit 0. `df` needs **only mountinfo**;
+it does not read `/etc/mtab` (measured: `strace` shows coreutils `df` opening
+`/proc/self/mountinfo` alone), which is provided for conventional tools.
+
+**Correction (this revision) — the provisioning flake, root cause and fix.** The
+identity gate intermittently failed with grouped empty results, including disk
+provisioning returning HTTP 503. Root cause: `fitImage` measured the ext4 total
+with a transient **read-write** mount; `fuse2fs` commits the superblock
+asynchronously, so unmount-then-`resize2fs` raced the final write and
+`resize2fs` intermittently refused with `Please run 'e2fsck -f ... first`
+(measured standalone: **48/60 with the rw probe, 0/60 with a read-only probe**).
+A failed fit left the workspace permanently unprovisionable, so every exec
+returned 503. Fixes: measure with a **read-only** mount (it only `statvfs`es, so
+it never dirties the image), and self-heal a dirty image in `resize2fs` with
+`e2fsck -p -f` + one retry (verified against a deliberately dirtied image). The
+harness was also made honest: it surfaces an API error body instead of yielding
+an empty `got=`, and polls the REAL materialization condition before a group
+runs (bounded, no blind retry). See VERIFICATION.md §14c.2.
+
+
 **Exact sizing.** ext4's own metadata means the usable `statvfs` total is
 slightly below the image size, so `fitImage` sizes the filesystem so that the
 mounted total equals `disk_mb` **exactly**: it resizes with `resize2fs` to a
@@ -1706,9 +1742,14 @@ read-only over `/proc` (a curated directory, not the real procfs; `mount_proc`
 stays false). It carries exactly: `meminfo` (MemTotal = the memory ceiling,
 SwapTotal 0), `cpuinfo` (exactly `cpu_cores` processor entries), `stat`,
 `uptime`, `loadavg`, `version` (the same kernel string the shim's `uname`
-returns), `vmstat`, `filesystems`, `mounts`/`self/mounts`/`tab` (a neutral
-mounts table whose source token is `/dev/workspace`, so a bare `df` works and no
-host path or `zfs` type is named), and `self/limits`.
+returns), `vmstat`, `filesystems`, the mount table in BOTH shapes —
+`mounts`/`self/mounts` (the `/proc/mounts` form) and **`self/mountinfo`** (the
+real procfs `mountinfo` form coreutils `df` reads) — plus `tab` bound over
+`/etc/mtab`, and `self/limits`. Both mount shapes are rendered from the SAME
+`procMount` list so they can never disagree; the source token is the neutral
+`/dev/workspace`, so no host path or `zfs` type is named. **`/etc/mtab` is not
+required by `df`** (it opens `/proc/self/mountinfo` alone, measured) but is
+provided because the conventional `/etc/mtab` view exists on a normal host.
 
 **Why it is gated on masking.** The curated `/proc` and the LD_PRELOAD shim are
 the SAME channel viewed two ways: the shim answers `uname`/`sysconf`/`sysinfo`
@@ -1733,9 +1774,12 @@ would print a confusing "Error, do this: mount -t proc proc /proc" rather than a
 truthful view, so the profile omits them and its `notes` says why.
 
 **Proof.** `scripts/identity-check.sh` §1b/§1c assert the curated `/proc`
-reports only the workspace's own facts (host memory asserted ABSENT) and that
-`df`/`stat -f`/`os.statvfs` agree with the allowance while a write past it fails
-`ENOSPC`; measured `113 passed / 0 failed / 2 skipped` (from 97/0/2).
+reports only the workspace's own facts (host memory asserted ABSENT), that
+`/proc/self/mountinfo` and `/etc/mtab` are present and agree with `/proc/mounts`,
+that bare `df -h`, `df -h /workspace`, `df -h /` and bare `df` all exit 0 and
+show the workspace its own size, and that `df`/`stat -f`/`os.statvfs` agree with
+the allowance while a write past it fails `ENOSPC`; measured `130 passed / 0
+failed / 2 skipped` (from 113/0/2), green five consecutive runs.
 
 ## Additional defaults chosen during implementation
 

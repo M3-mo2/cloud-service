@@ -40,9 +40,9 @@ reports `"cgroups":true`.
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/process-stop-check.sh` → `25 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/session-nsjail-check.sh` → `18 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh` → `27 passed / 0 failed / 0 skipped`
-> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `97 passed / 0 failed / 2 skipped`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `130 passed / 0 failed / 2 skipped`
 > - `BASE=http://127.0.0.1:8099 KEY=… OTHER_KEY=… DATA_DIR=… NSJAIL=/usr/local/bin/nsjail sudo -n bash scripts/acceptance.sh` → `113 passed / 0 failed`
-> - `bash scripts/docs-consistency.sh` → `160 passed / 0 failed`
+> - `bash scripts/docs-consistency.sh` → `173 passed / 0 failed`
 >
 > The unprivileged suites (`gofmt`, `go build`, `go vet`, `go test ./...`, the
 > handler-level assertions and the sandbox-config render tests) were re-run and
@@ -103,7 +103,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **351** (347 unit + 4 `integration`-tagged), including regression
+Test functions: **353** (349 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -2028,16 +2028,22 @@ confusing "mount -t proc proc /proc" error rather than a truthful view).
 ### 14c. Gate results for this revision
 
 ```
-identity-check.sh               113 passed / 0 failed / 2 skipped   (from 97/0/2)
+identity-check.sh               130 passed / 0 failed / 2 skipped   (from 113/0/2)
   §1  closed.paths_none_readable 0
   §1b curated.meminfo_memtotal_workspace 262144 ; curated.cpuinfo_cpu_count 1
       curated.meminfo_swaptotal_zero 0 ; curated.no_host_memory_leak no
       curated.free_bytes_agree 268435456
+      curated.mountinfo_ok yes ; curated.mountinfo_workspace_present 1
+      curated.mountinfo_no_zfs 0 ; curated.mtab_present yes ; curated.mtab_agrees 1
   §1c disk.statvfs_total_workspace 268435456 ; disk.statf_agree 65536
       disk.df_agree 268435456 ; disk.no_host_fstype no
+      disk.dfh_bare_ok ok ; disk.dfh_bare_workspace_size 256M
+      disk.dfh_workspace_rc 0 ; disk.dfh_workspace_size 256M
+      disk.dfh_root_ok ok ; disk.dfh_root_has_row yes
+      disk.df_bare_workspace_1k 262144
       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
 docs-consistency.sh             173 passed / 0 failed
-go test ./...                   351 test functions (from 347)
+go test ./...                   353 test functions (from 351)
 ```
 
 The full gate set re-run for this revision, one gate at a time (concurrent runs
@@ -2047,16 +2053,143 @@ corrupt the `docs-consistency` tally), all green:
 scripts/docs-consistency.sh     173 passed / 0 failed
 scripts/acceptance.sh           113 passed / 0 failed
 scripts/process-stop-check.sh    25 passed / 0 failed
-scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped
-scripts/identity-check.sh       113 passed / 0 failed / 2 skipped
+scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped   (real quick tunnel)
+scripts/identity-check.sh       130 passed / 0 failed / 2 skipped
 scripts/egress-decoy-check.sh    58 passed / 0 failed / 0 skipped
-go test ./...                    351 test functions; go vet ./... clean
+go test ./...                    353 test functions; go vet ./... clean
 ```
 
 `identity-check.sh` §1b and §1c are the new assertions: the curated `/proc`
 reports only the workspace's own limits (with the host memory asserted ABSENT),
-and the disk channels agree with the workspace's allowance while a write past it
+the curated `/proc/self/mountinfo` and `/etc/mtab` are present and agree, and
+the disk channels agree with the workspace's allowance while a write past it
 fails with `ENOSPC` at the boundary.
+
+#### 14c.1 Bare `df -h` now works (defect found by the operator)
+
+`df -h` is the literal command the operator named. It did **not** work: coreutils
+`df` builds its filesystem table from `/proc/self/mountinfo`, and the curated
+`/proc` provided only `/proc/mounts` (mountinfo was `No such file or directory`,
+`/etc/mtab` absent). Measured inside a real workspace before the fix:
+
+```
+$ df -h
+df: cannot read table of mounted file systems: No such file or directory   (no row)
+$ df -h /workspace
+df: Warning: cannot read table of mounted file systems: No such file or directory
+$ df
+df: cannot read table of mounted file systems: No such file or directory   (empty)
+```
+
+`df --output=size /workspace` happened to work (it can `statvfs` the path), which
+is why the gate passed while the user-facing command was broken — the gate never
+invoked bare `df -h`. The fix generates `/proc/self/mountinfo` in the **real
+procfs format** (`mnt_id parent_id major:minor root mount_point mount_options -
+fstype source super_options`) from the **same** mount list `/proc/mounts` is
+built from, so the two views can never disagree, and binds the conventional
+`/etc/mtab` to it as well.
+
+`df` needs **only mountinfo**; it does not read `/etc/mtab` (measured: `strace`
+shows coreutils 9.4 `df` opening `/proc/self/mountinfo` and nothing else —
+`/etc/mtab` is a symlink to `/proc/self/mounts` on modern hosts and is provided
+for conventional tools, not for `df`). After the fix, inside a real 256MB
+workspace:
+
+```
+$ df -h
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs           252G     0  252G   0% /
+/dev/workspace  256M  444K  229M   1% /workspace
+$ df -h /workspace
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/workspace  256M  444K  229M   1% /workspace
+$ df
+Filesystem     1K-blocks  Used Available Use% Mounted on
+tmpfs          264001556     0 264001556   0% /
+/dev/workspace    262144   444    233488   1% /workspace
+```
+
+The workspace row carries the workspace's OWN size (256M / 262144 1K-blocks), not
+the host volume. `df -h /` and bare `df` now exit 0 and print rows instead of
+erroring. The device column is the neutral token `/dev/workspace`, never the host
+image path.
+
+#### 14c.2 The identity gate flake: root cause and fix
+
+The gate previously flaked with grouped `got=` (empty) results, most visibly
+`disk.fill_enospc` and whole groups. The empty `got=` is the **harness silently
+swallowing an API error body**: `exec_py | jsonf "['stdout']"` indexed a missing
+`stdout` key on an error JSON and yielded an empty string. The real engine defect
+behind it was **not** a PUT→exec race (directly tested: 10/10 clean). It was a
+disk-provisioning failure:
+
+* `fitImage` measured the ext4 total with a **read-write** transient mount.
+  `fuse2fs` commits the ext4 superblock asynchronously, so unmount-then-
+  `resize2fs` raced the final superblock write and `resize2fs` intermittently
+  refused with `Please run 'e2fsck -f ... first`. Measured in a standalone loop:
+  **48/60 failures with a read-write probe, 0/60 with a read-only probe.**
+* A failed fit leaves the workspace permanently unprovisionable, so **every**
+  exec in that workspace then returns HTTP 503 `workspace disk unavailable`, and
+  the harness mapped that to `got=` empty. Measured: a first exec returned 503 in
+  ~1 in 15 fresh workspaces.
+
+Fixes, all measured:
+
+* `fitImage` now measures with a **read-only** mount (it only `statvfs`s), so the
+  image is never dirtied and the fit is deterministic.
+* `resize2fs` self-heals a dirty image: on an `e2fsck` refusal it runs
+  `e2fsck -p -f` and retries once. Verified by deliberately dirtying an image
+  (`debugfs -w -R "ssv state 0"`), observing the refusal, then proving
+  `e2fsck -p -f` clears it and `resize2fs` succeeds.
+* The harness `jsonf` now **surfaces** an API error body (`EXEC_ERROR:<code>:…`)
+  instead of yielding empty, so a 503 can never masquerade as `got=`.
+* The harness waits for the **real condition** before a group runs:
+  `await_workspace` polls (bounded 30 s) until the curated `/proc` is present AND
+  `/workspace` reports `fuseblk`, asserting `harness.<name>_materialized`. It
+  never retries blind and never pads a sleep.
+
+A third flake mode, independent of the disk race: `disk.fill_enospc` wrote a
+single 300 MiB buffer, which is allocated **before** the first write; under the
+256 MiB cgroup ceiling the kernel OOM-kills python (exit 137, no output) instead
+of letting the filesystem return `ENOSPC`. Measured: exit 137, empty output in
+12/12 repetitions. The probe now writes in 1 MiB chunks, so it tests the disk
+boundary rather than the memory ceiling.
+
+The `mask_off.cpu_leaks_host` flake: the host's usable CPU count moves under load
+(observed `nproc` 2→3 mid-run). The check no longer asserts a value captured at
+the top of the run; it reads the host count **at the same moment** around the
+probe and, when the host is stable, asserts the leaked count equals it, plus the
+host-independent relationship `mask_off.cpu_distinct_from_workspace` (mask OFF
+reports the host's count, never the workspace's own).
+
+**Proof:** the gate was run **five times in a row** on the quiet host, back to
+back, all green with **zero empty `got=`**:
+
+```
+run 1: 130 passed / 0 failed / 2 skipped
+run 2: 130 passed / 0 failed / 2 skipped
+run 3: 130 passed / 0 failed / 2 skipped
+run 4: 130 passed / 0 failed / 2 skipped
+run 5: 130 passed / 0 failed / 2 skipped
+```
+
+The assertion count rose from 113 to 130 because honest assertions were **added**
+(the bare-`df` group, the mountinfo/mtab assertions, the materialization check,
+the mask-off relationship check); no assertion was weakened.
+
+#### 14c.3 A disclosed residual: `df -h /` reports a host-RAM-derived size
+
+The synthetic root (`/`, nsjail's tmpfs) reports `252G`, which is the jail
+tmpfs backed by host RAM — reachable by `stat -f /` with or without the curated
+mountinfo (the tmpfs is real; only its mount-table row is synthetic). It is
+**not** the workspace's own `disk_mb` and it is not the host volume's `100G`
+either; it is the size of the per-sandbox tmpfs. This was reachable before the
+fix (`stat -f /`), so the fix does not introduce it; it is disclosed here rather
+than hidden. Keeping `/` out of the table would make a bare `df -h` error, which
+is worse. The workspace's own allowance is always shown on the `/workspace` row,
+which is what the requirement is about. (Sizing the synthetic `/` to the
+workspace's memory ceiling is a possible future refinement, out of scope here.)
+
 
 ### 14d. The measured fallback (when FUSE is unavailable)
 
