@@ -437,8 +437,14 @@ func TestFrameIsParseableJSON(t *testing.T) {
 	p := &fakeProvider{}
 	p.set([]WorkspaceInfo{{ID: "ws", OwnerID: "u1", DiskRoot: "/none", DiskLimitBytes: 64, MemoryLimitBytes: 64}})
 	r.diskOK["/none"] = true
-	s := New(DefaultConfig(), p, r)
+	cfg := DefaultConfig()
+	cfg.Interval = time.Hour // only the initial publish and the explicit calls below
+	s := New(cfg, p, r)
 	sub, _ := s.Subscribe(Scope{OwnerID: "u1"}, 0)
+	// Read the initial frame the sampler goroutine publishes on start, so the
+	// manual publishes below are the only writers from here on (no concurrent
+	// publish can interleave and reorder timestamps).
+	<-sub.Frames()
 	var last time.Time
 	for i := 0; i < 3; i++ {
 		s.publish()
@@ -449,8 +455,8 @@ func TestFrameIsParseableJSON(t *testing.T) {
 		if err := json.Unmarshal(body, &snap); err != nil {
 			t.Fatalf("frame %d not JSON: %v", i, err)
 		}
-		if snap.Timestamp.Before(last) {
-			t.Fatalf("timestamp went backwards: %v < %v", snap.Timestamp, last)
+		if !last.IsZero() && !snap.Timestamp.After(last) {
+			t.Fatalf("timestamp not strictly increasing: %v <= %v", snap.Timestamp, last)
 		}
 		last = snap.Timestamp
 	}
