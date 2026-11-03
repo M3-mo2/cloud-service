@@ -363,15 +363,22 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	// overshoot bound. It is NEVER a kernel boundary (contrast the disk TOTAL);
 	// see ADR 95.
 	writeRateCap := map[string]any{
-		"enabled":         s.svc.WriteRateEnabled(),
-		"server_max_mb_s": s.cfg.MaxLimits.WriteRateMBs,
-		"default_mb_s":    s.cfg.Limits.WriteRateMBs,
-		"samples":         s.svc.WriteRateSamples(),
-		"outcome":         string(model.RunRateLimited),
-		"refusal_code":    model.CodeWriteRateExceeded,
-		"mechanism":       "sample the workspace's real disk growth (one statfs on the metrics tick) and stop the run(s) after N consecutive over-limit samples; the engine's own write path (API upload/write, archive extraction) is refused with 429 write_rate_exceeded while over the ceiling",
-		"limits":          "SAMPLED, not a kernel boundary: the worst-case overshoot is N x interval_seconds x write_rate_mb_s; a single burst above the ceiling does not kill a run; a workspace already at its disk ceiling is not a rate violation; usage that falls (a delete) resets the baseline. io.max cannot limit this here (measured) because the image is on ZFS and the bio is generated outside the cgroup.",
-		"one_line_enable": "disk: { write_rate_enabled: true }  # plus a per-workspace limits.write_rate_mb_s",
+		"enabled":           s.svc.WriteRateEnabled(),
+		"server_max_mb_s":   s.cfg.MaxLimits.WriteRateMBs,
+		"default_mb_s":      s.cfg.Limits.WriteRateMBs,
+		"samples":           s.svc.WriteRateSamples(),
+		"outcome":           string(model.RunRateLimited),
+		"refusal_code":      model.CodeWriteRateExceeded,
+		"overshoot_formula": "N x interval_seconds x write_rate_mb_s (a SAMPLED ceiling, never a kernel boundary)",
+		"mechanism":         "sample the workspace's real disk growth (one statfs on the metrics tick) and stop the run(s) after N consecutive over-limit samples; the engine's own write path (API upload/write, archive extraction) is refused with 429 write_rate_exceeded while over the ceiling",
+		"limits":            "SAMPLED, not a kernel boundary: the worst-case overshoot is N x interval_seconds x write_rate_mb_s; a single burst above the ceiling does not kill a run; a workspace already at its disk ceiling is not a rate violation; usage that falls (a delete) resets the baseline. io.max cannot limit this here (measured) because the image is on ZFS and the bio is generated outside the cgroup.",
+		"one_line_enable":   "disk: { write_rate_enabled: true }  # plus a per-workspace limits.write_rate_mb_s",
+	}
+	// The worst-case overshoot is a COMPUTED number for the configured default
+	// ceiling, so the advertised bound is the real one and never a hand-waved
+	// figure (ADR 95).
+	if v := s.svc.WriteRateOvershootMB(s.cfg.Limits.WriteRateMBs); v > 0 {
+		writeRateCap["default_overshoot_mb"] = v
 	}
 	// Workspace subscriptions: the engine owns the clock and enforcement, stores
 	// an absolute expiry, and locks a lapsed term (distinct from suspension); the

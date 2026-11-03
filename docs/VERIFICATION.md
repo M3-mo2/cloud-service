@@ -2535,25 +2535,26 @@ identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/
       disk.dfh_root_ok ok ; disk.dfh_root_has_row yes
       disk.df_bare_workspace_1k 262144
       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
-docs-consistency.sh             258 passed / 0 failed
- go test ./...                  465 test functions (from 353)
+docs-consistency.sh             272 passed / 0 failed
+ go test ./...                  488 test functions (from 353)
 ```
 
 The full gate set re-run for this revision, one gate at a time (concurrent runs
 corrupt the `docs-consistency` tally), all green:
 
 ```
-scripts/docs-consistency.sh     258 passed / 0 failed   (245 before the ceiling additions)
+scripts/docs-consistency.sh     272 passed / 0 failed   (258 before the write-rate additions)
 scripts/acceptance.sh           113 passed / 0 failed
-scripts/process-stop-check.sh    30 passed / 0 failed   (25 before; the nested-layout assertions)
+scripts/process-stop-check.sh    30 passed / 0 failed
 scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped   (real quick tunnel)
 scripts/identity-check.sh       131 passed / 0 failed / 2 skipped   (run 3x: 131/0/2 each)
 scripts/egress-decoy-check.sh    58 passed / 0 failed / 0 skipped
-scripts/subscription-check.sh    62 passed / 0 failed             (compressed clock; see §9l)
-scripts/archive-check.sh        102 passed / 0 failed             (native archives; see §9m)
-scripts/metrics-check.sh         56 passed / 0 failed             (resource stream; see §9n)
-scripts/spread-check.sh          32 passed / 0 failed             (per-workspace ceiling; see §9o)
-go test ./...                    465 test functions; go vet ./... clean
+scripts/subscription-check.sh    62 passed / 0 failed
+scripts/archive-check.sh        102 passed / 0 failed
+scripts/metrics-check.sh         56 passed / 0 failed
+scripts/spread-check.sh          32 passed / 0 failed
+scripts/write-rate-check.sh      29 passed / 0 failed             (write-rate ceiling; see §9p)
+go test ./...                    488 test functions; go vet ./... clean
 ```
 
 `scripts/metrics-check.sh` is the new gate for this revision: it drives the real
