@@ -1,0 +1,364 @@
+package workspace
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+// DiskBackend selects how a workspace's disk allowance is enforced.
+//
+//   - "fuse"    — a real per-workspace ext4 filesystem image, mounted with
+//                 fuse2fs. This is a KERNEL-enforced boundary: a write past the
+//                 allowance fails with ENOSPC at the boundary, with no
+//                 overshoot, and `df`/`stat -f`/os.statvfs() report the
+//                 workspace's own size because the mounted filesystem IS that
+//                 size. This is the default and the strongest mechanism.
+//   - "counter" — the engine's own used-bytes counter, promoted to an authority
+//                 over running processes (the API file path plus a run-stopping
+//                 check). Real but SAMPLED: a process already running can
+//                 overshoot the allowance before the next check terminates it.
+//                 The measured overshoot is documented in docs/DECISIONS.md.
+//   - "none"    — no disk enforcement. Nothing is reported as an allowance and
+//                 nothing is enforced (the honest state).
+type DiskBackend string
+
+// Disk backends.
+const (
+	DiskBackendFuse    DiskBackend = "fuse"
+	DiskBackendCounter DiskBackend = "counter"
+	DiskBackendNone    DiskBackend = "none"
+)
+
+// DiskManagerConfig configures the per-workspace disk image manager.
+type DiskManagerConfig struct {
+	Backend    DiskBackend
+	Fuse2FS    string // fuse2fs binary (default "fuse2fs")
+	MkfsExt4   string // mkfs.ext4 binary (default "mkfs.ext4")
+	Resize2FS  string // resize2fs binary (default "resize2fs")
+	Fusermount string // fusermount3 binary (default "fusermount3")
+	UID        int    // sandbox uid written into the image (uid= mount option)
+	GID        int    // sandbox gid
+}
+
+func (c DiskManagerConfig) withDefaults() DiskManagerConfig {
+	if c.Fuse2FS == "" {
+		c.Fuse2FS = "fuse2fs"
+	}
+	if c.MkfsExt4 == "" {
+		c.MkfsExt4 = "mkfs.ext4"
+	}
+	if c.Resize2FS == "" {
+		c.Resize2FS = "resize2fs"
+	}
+	if c.Fusermount == "" {
+		c.Fusermount = "fusermount3"
+	}
+	return c
+}
+
+// DiskManager provisions and mounts a per-workspace ext4 filesystem image. The
+// image file lives beside the workspace's `files` directory
+// ({wsdir}/disk.img); the workspace directory itself is the mount point, so the
+// executor's existing bind of WorkspaceRoot needs no change: it binds whatever
+// is mounted at that path.
+//
+// The mount is performed HOST-SIDE by the orchestrator, so the workspace only
+// ever sees the mounted result and needs neither /dev/fuse nor fuse2fs inside
+// the jail. This is the cleanest shape and keeps /dev minimal.
+type DiskManager struct {
+	cfg DiskManagerConfig
+
+	mu    sync.Mutex
+	state map[string]*diskState
+}
+
+// diskState tracks a live per-workspace image.
+type diskState struct {
+	image    string
+	mounted  bool
+	sizeMB   int
+	mountErr error
+}
+
+// NewDiskManager constructs a disk manager.
+func NewDiskManager(cfg DiskManagerConfig) *DiskManager {
+	return &DiskManager{cfg: cfg.withDefaults(), state: map[string]*diskState{}}
+}
+
+// Available reports whether the FUSE backend can run: the fuse2fs, mkfs.ext4,
+// resize2fs and fusermount binaries must be resolvable and /dev/fuse must be a
+// usable character device. reason explains an unavailable state.
+func (d *DiskManager) Available() (bool, string) {
+	for _, b := range []string{d.cfg.Fuse2FS, d.cfg.MkfsExt4, d.cfg.Fusermount} {
+		if _, err := exec.LookPath(b); err != nil {
+			return false, "missing binary: " + b
+		}
+	}
+	if fi, err := os.Stat("/dev/fuse"); err != nil {
+		return false, "/dev/fuse unavailable: " + err.Error()
+	} else if fi.Mode()&os.ModeCharDevice == 0 {
+		return false, "/dev/fuse is not a character device"
+	}
+	return true, ""
+}
+
+// imagePath returns the image file for a workspace mount point.
+func imagePath(root string) string {
+	return filepath.Join(filepath.Dir(root), "disk.img")
+}
+
+// Ensure creates the per-workspace image (if absent) and mounts it at root. It
+// is idempotent: calling it for an already-mounted workspace verifies the mount
+// and the size, and returns without a second mount. sizeMB is the workspace's
+// allowance; the filesystem is sized so that statvfs total == sizeMB (see
+// fitImage). root must exist and be empty of other content.
+func (d *DiskManager) Ensure(root string, sizeMB int) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if st, ok := d.state[root]; ok && st.mounted && st.sizeMB == sizeMB {
+		return st.mountErr
+	}
+	if sizeMB < 1 {
+		sizeMB = 1
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+	img := imagePath(root)
+	if err := d.ensureImage(img, sizeMB); err != nil {
+		d.state[root] = &diskState{image: img, mounted: false, sizeMB: sizeMB, mountErr: err}
+		return err
+	}
+	// If the desired size differs from the on-disk filesystem size, unmount and
+	// resize first (ext4 cannot be grown under fuse2fs reliably, so the image is
+	// resized offline).
+	if mountedFuse(root) {
+		if cur, err := fsTotalMB(root); err == nil && cur == int64(sizeMB) {
+			d.state[root] = &diskState{image: img, mounted: true, sizeMB: sizeMB}
+			return nil
+		}
+		_ = d.unmount(root)
+	}
+	if err := d.fitImage(img, sizeMB); err != nil {
+		d.state[root] = &diskState{image: img, mounted: false, sizeMB: sizeMB, mountErr: err}
+		return err
+	}
+	if err := d.mount(img, root); err != nil {
+		d.state[root] = &diskState{image: img, mounted: false, sizeMB: sizeMB, mountErr: err}
+		return err
+	}
+	d.state[root] = &diskState{image: img, mounted: true, sizeMB: sizeMB}
+	return nil
+}
+
+// Release unmounts a workspace's image but keeps the image file (so a restart
+// or a suspended workspace does not lose data).
+func (d *DiskManager) Release(root string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	err := d.unmount(root)
+	delete(d.state, root)
+	return err
+}
+
+// Remove unmounts the image and deletes the image file, so deleting a
+// workspace leaves nothing behind.
+func (d *DiskManager) Remove(root string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_ = d.unmount(root)
+	delete(d.state, root)
+	if err := os.Remove(imagePath(root)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// Mounted reports whether root is currently a fuse mount.
+func (d *DiskManager) Mounted(root string) bool { return mountedFuse(root) }
+
+// ensureImage creates an ext4 image of about sizeMB if it does not exist, then
+// fits it exactly.
+func (d *DiskManager) ensureImage(img string, sizeMB int) error {
+	if _, err := os.Stat(img); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(img), 0o755); err != nil {
+		return err
+	}
+	// The image needs headroom for ext4 metadata; 1.5x + slack, then resized
+	// down to the exact target by fitImage.
+	headroom := sizeMB + sizeMB/2 + 32
+	f, err := os.OpenFile(img, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Truncate(int64(headroom) * 1024 * 1024); err != nil {
+		f.Close()
+		return err
+	}
+	f.Close()
+	cmd := exec.Command(d.cfg.MkfsExt4, "-q", "-F", "-m", "0", "-O", "^has_journal", img)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("mkfs.ext4: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// fitImage sizes the ext4 filesystem inside img so that the mounted total
+// (statvfs f_blocks * f_frsize) equals sizeMB * 1 MiB. ext4's own metadata
+// makes the usable total shrink as the filesystem grows, so the fit is
+// iterative: resize2fs to a target block count, measure the resulting total via
+// a transient mount, and correct. It converges in a few iterations (measured
+// for 8 MiB..1 GiB). The image file is grown if needed to hold the target.
+func (d *DiskManager) fitImage(img string, sizeMB int) error {
+	targetBlocks := int64(sizeMB) * 1024 * 1024 / 4096
+	// Read the current filesystem block count.
+	bc, err := fsBlockCount(img)
+	if err != nil {
+		return err
+	}
+	// Grow the backing file if the fs needs more room than it has.
+	needBytes := (targetBlocks + targetBlocks/4 + 4096) * 4096
+	if fi, err := os.Stat(img); err == nil && fi.Size() < needBytes {
+		if err := os.Truncate(img, needBytes); err != nil {
+			return err
+		}
+	}
+	probe := filepath.Join(filepath.Dir(img), ".fit-"+filepath.Base(filepath.Dir(img)))
+	_ = os.MkdirAll(probe, 0o755)
+	// Iterate. The correction is exact in one step when statvfs total == the
+	// resize target; otherwise the delta (desired - measured) is added.
+	for i := 0; i < 8; i++ {
+		if err := d.resize2fs(img, bc); err != nil {
+			return err
+		}
+		total, err := d.measureTotalBlocks(img, probe)
+		if err != nil {
+			return err
+		}
+		if total == targetBlocks {
+			_ = os.RemoveAll(probe)
+			return nil
+		}
+		bc += targetBlocks - total
+		if bc < 1024 {
+			bc = 1024
+		}
+		// Ensure the backing file can hold the new target.
+		nb := (bc + bc/4 + 4096) * 4096
+		if fi, err := os.Stat(img); err == nil && fi.Size() < nb {
+			if err := os.Truncate(img, nb); err != nil {
+				return err
+			}
+		}
+	}
+	_ = os.RemoveAll(probe)
+	return fmt.Errorf("could not fit image %s to %d MB (ext4 metadata overhead)", img, sizeMB)
+}
+
+// measureTotalBlocks mounts img transiently at probe and returns statvfs
+// f_blocks -- the total block count the workspace will see.
+func (d *DiskManager) measureTotalBlocks(img, probe string) (int64, error) {
+	if err := d.mount(img, probe); err != nil {
+		return 0, err
+	}
+	defer d.unmount(probe)
+	_, blocks, err := statvfsFull(probe)
+	return blocks, err
+}
+
+// resize2fs runs resize2fs to the given block count.
+func (d *DiskManager) resize2fs(img string, blocks int64) error {
+	cmd := exec.Command(d.cfg.Resize2FS, img, strconv.FormatInt(blocks, 10))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("resize2fs to %d: %v: %s", blocks, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// mount mounts an image at dir as the sandbox uid with allow_other.
+func (d *DiskManager) mount(img, dir string) error {
+	if mountedFuse(dir) {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	opts := fmt.Sprintf("allow_other,fakeroot,uid=%d,gid=%d", d.cfg.UID, d.cfg.GID)
+	cmd := exec.Command(d.cfg.Fuse2FS, "-o", opts, img, dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("fuse2fs mount %s: %v: %s", dir, err, strings.TrimSpace(string(out)))
+	}
+	if !mountedFuse(dir) {
+		return fmt.Errorf("fuse2fs reported success but %s is not a fuse mount", dir)
+	}
+	// The mount root must be traversable and writable by the sandbox uid; the
+	// fakeroot/uid options make the image's root owned by the sandbox uid, and
+	// the workspace directory itself must be searchable by every ancestor.
+	_ = os.Chmod(dir, 0o755)
+	return nil
+}
+
+// unmount unmounts dir if it is a fuse mount.
+func (d *DiskManager) unmount(dir string) error {
+	if !mountedFuse(dir) {
+		return nil
+	}
+	cmd := exec.Command(d.cfg.Fusermount, "-u", dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// Fall back to a lazy unmount; a busy workspace (a running workload)
+		// must not wedge the caller.
+		cmd2 := exec.Command(d.cfg.Fusermount, "-u", "-z", dir)
+		if out2, err2 := cmd2.CombinedOutput(); err2 != nil {
+			return fmt.Errorf("fusermount -u %s: %v: %s (lazy: %v: %s)", dir, err, strings.TrimSpace(string(out)), err2, strings.TrimSpace(string(out2)))
+		}
+	}
+	return nil
+}
+
+// fsBlockCount returns the ext4 block count recorded in the superblock, read
+// with dumpe2fs when available, else derived from a transient mount.
+func fsBlockCount(img string) (int64, error) {
+	if p, err := exec.LookPath("dumpe2fs"); err == nil {
+		out, err := exec.Command(p, "-h", img).Output()
+		if err == nil {
+			sc := bufio.NewScanner(strings.NewReader(string(out)))
+			var blocks int64 = -1
+			for sc.Scan() {
+				line := sc.Text()
+				if strings.HasPrefix(line, "Block count:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "Block count:"))
+					if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+						blocks = n
+					}
+				}
+			}
+			if blocks > 0 {
+				return blocks, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("could not read block count of %s (dumpe2fs missing?)", img)
+}
+
+// fsTotalBlocks reports statvfs f_blocks for a path.
+func fsTotalBlocks(path string) (int64, error) {
+	total, _, err := statvfs(path)
+	return total, err
+}
+
+// fsTotalMB reports the mounted total size in MiB (rounded).
+func fsTotalMB(path string) (int64, error) {
+	bsize, blocks, err := statvfsFull(path)
+	if err != nil {
+		return 0, err
+	}
+	return bsize * blocks / (1024 * 1024), nil
+}

@@ -45,6 +45,12 @@ func (s *Service) Exec(w *model.Workspace, spec ExecSpec) (ExecOutcome, error) {
 	if err != nil {
 		return ExecOutcome{}, err
 	}
+	// Mount the workspace's per-workspace disk before the sandbox binds it, so
+	// the workload's /workspace IS the bounded filesystem. A provisioning
+	// failure refuses the exec rather than running against the host volume.
+	if err := s.ensureWorkspaceDisk(w); err != nil {
+		return ExecOutcome{}, model.New(503, model.CodeUnavailable, "workspace disk unavailable: "+err.Error())
+	}
 	req := executor.Request{
 		Workspace:     w,
 		WorkspaceRoot: s.store.WorkspaceRoot(w.ID),

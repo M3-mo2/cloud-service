@@ -47,6 +47,9 @@ func newHarnessAt(t *testing.T, dataDir string) *harness {
 	cfg := config.Default()
 	cfg.Storage.DataDir = dataDir
 	cfg.Sandbox.NsjailPath = "/nonexistent/nsjail"
+	// API tests exercise request/response logic against the FakeRunner; they do
+	// not need (and must not require) a real per-workspace FUSE filesystem.
+	cfg.Disk.Enabled = false
 	cfg.Caps.JSONBodyMB = 1
 	cfg.Caps.FileWriteMB = 1
 	// The session-start reap window is a short startup probe; keep it small in

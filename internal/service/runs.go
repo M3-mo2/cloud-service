@@ -209,6 +209,12 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		return nil, err
 	}
 
+	// Mount the workspace's per-workspace disk before the run is recorded, so
+	// the sandbox binds a bounded filesystem with the workspace's own size.
+	if err := s.ensureWorkspaceDisk(w); err != nil {
+		return nil, model.New(503, model.CodeUnavailable, "workspace disk unavailable: "+err.Error())
+	}
+
 	// Resolve the two package tiers before the run starts. A failure to
 	// prepare the private tier is fatal; a missing shared tier is not.
 	sharedHost, privateHost, err := s.packageDirs(w)

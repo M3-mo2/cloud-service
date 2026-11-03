@@ -17,6 +17,10 @@ func newTestServiceCfg(t *testing.T, mutate func(*config.Config)) (*Service, *ex
 	t.Helper()
 	cfg := config.Default()
 	cfg.Storage.DataDir = t.TempDir()
+	// These tests use the FakeRunner and are about service logic, not the
+	// FUSE-backed disk; disable disk provisioning by default (a test may turn it
+	// on via mutate when it exercises the disk path).
+	cfg.Disk.Enabled = false
 	if mutate != nil {
 		mutate(&cfg)
 	}

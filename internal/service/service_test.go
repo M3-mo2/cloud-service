@@ -18,6 +18,9 @@ func newTestService(t *testing.T) (*Service, *executor.FakeRunner) {
 	t.Helper()
 	cfg := config.Default()
 	cfg.Storage.DataDir = t.TempDir()
+	// Service unit tests use the FakeRunner and are about service logic, not the
+	// FUSE-backed disk; disable disk provisioning so they need no /dev/fuse.
+	cfg.Disk.Enabled = false
 	store, err := storage.New(cfg.Storage.DataDir)
 	if err != nil {
 		t.Fatal(err)

@@ -23,7 +23,56 @@ type Config struct {
 	Tunnels   TunnelsConfig  `koanf:"tunnels"`
 	Identity  IdentityConfig `koanf:"identity"`
 	Profiles  ProfilesConfig `koanf:"profiles"`
+	Disk      DiskConfig     `koanf:"disk"`
 	Keys      []KeyConfig    `koanf:"keys"`
+}
+
+// DiskConfig controls how each workspace's disk allowance is ENFORCED and
+// REPORTED. The product requirement is that `df -h`, `stat -f` and
+// os.statvfs() report the workspace's OWN allowance, and that a workspace
+// cannot exceed it.
+//
+// The default mechanism is a real per-workspace ext4 filesystem image mounted
+// with fuse2fs (kernel-enforced: a write past the allowance fails with ENOSPC
+// at the boundary, no overshoot, and every reporting channel is correct for
+// free because the mounted filesystem IS the allowance). It is ON by default;
+// the previous behaviour (a tenant seeing the platform's ZFS volume and its
+// `zfs` type) is itself a leak of the host filesystem identity.
+//
+// When the FUSE mechanism is unavailable (no /dev/fuse, missing tools) the
+// engine falls back to its own used-bytes counter promoted to an authority over
+// running processes. That fallback is REAL but SAMPLED: a process already
+// running can overshoot before the next check terminates it. The measured
+// overshoot is stated in docs/DECISIONS.md; it is never presented as
+// equivalent to the kernel boundary.
+type DiskConfig struct {
+	// Enabled is the server-level switch. Default true. When false no
+	// per-workspace filesystem is mounted and the disk allowance is not
+	// enforced or reported as the workspace's own (a diagnostic state).
+	Enabled bool `koanf:"enabled"`
+	// Backend selects the enforcement mechanism: "fuse" (default, kernel
+	// boundary), "counter" (engine watchdog; real but sampled), or "none".
+	// "auto" behaves as "fuse" when the host supports it and "counter"
+	// otherwise. An unrecognised value is treated as "auto".
+	Backend string `koanf:"backend"`
+	// Fuse2FSPath / MkfsExt4Path / Resize2FSPath / FusermountPath override the
+	// binaries used to build and mount the image. Empty uses the conventional
+	// name on PATH.
+	Fuse2FSPath    string `koanf:"fuse2fs_path"`
+	MkfsExt4Path   string `koanf:"mkfs_ext4_path"`
+	Resize2FSPath  string `koanf:"resize2fs_path"`
+	FusermountPath string `koanf:"fusermount_path"`
+	// CounterPollMS bounds how often the counter watchdog audits a workspace's
+	// usage and stops runs that exceed the allowance. Smaller is a tighter
+	// overshoot bound and more CPU; 0 uses the default (500 ms).
+	CounterPollMS int `koanf:"counter_poll_ms"`
+	// ProcEnabled controls the synthetic per-workspace /proc payload (meminfo,
+	// cpuinfo, uptime, loadavg, stat, version and a curated mounts list), so
+	// `free -h`, `uptime` and `vmstat` report the workspace's own memory and
+	// never the host's. Default true. mount_proc stays false: this is a curated
+	// directory bind-mounted over /proc, not the real procfs (which leaks host
+	// process information).
+	ProcEnabled bool `koanf:"proc_enabled"`
 }
 
 // ProfilesConfig controls the named, explicit-allowlist workspace profiles.
@@ -533,6 +582,12 @@ func Default() Config {
 			Dir:     "",
 			Default: "python",
 		},
+		Disk: DiskConfig{
+			Enabled:       true,
+			Backend:       "auto",
+			CounterPollMS: 500,
+			ProcEnabled:   true,
+		},
 		Keys: []KeyConfig{},
 	}
 }
@@ -746,6 +801,12 @@ func (c *Config) applyDefaults() {
 	if c.Profiles.Default == "" {
 		c.Profiles.Default = d.Profiles.Default
 	}
+	if c.Disk.Backend == "" {
+		c.Disk.Backend = d.Disk.Backend
+	}
+	if c.Disk.CounterPollMS <= 0 {
+		c.Disk.CounterPollMS = d.Disk.CounterPollMS
+	}
 }
 
 func rawDefaults() []byte {
@@ -837,5 +898,14 @@ identity:
 profiles:
   dir: ""
   default: "python"
+disk:
+  enabled: true
+  backend: "auto"
+  fuse2fs_path: ""
+  mkfs_ext4_path: ""
+  resize2fs_path: ""
+  fusermount_path: ""
+  counter_poll_ms: 500
+  proc_enabled: true
 `)
 }

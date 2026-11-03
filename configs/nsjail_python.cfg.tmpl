@@ -252,6 +252,27 @@ mount {
   mandatory: false
 }
 
+{{- if .ProcEnabled }}
+
+# Synthetic per-workspace /proc. mount_proc stays false: the real procfs leaks
+# host process, network and kernel-identity information. This is a CURATED,
+# per-workspace directory carrying ONLY the workspace's own resource facts --
+# meminfo (MemTotal = the workspace's memory ceiling, SwapTotal 0), cpuinfo and
+# stat (exactly cpu_cores cpus), uptime, loadavg, a matching version string and
+# a neutral mounts table so `free -h`, `uptime`, `vmstat` and a bare `df` report
+# the workspace, never the host. It is read-only (the workspace cannot rewrite
+# its own apparent limits) and its source lives under the per-run tmp dir, which
+# is removed with the run. mandatory:true is fail-loud: if it cannot be mounted
+# the run aborts rather than expose the (empty, but also host-shaped) fallback.
+mount {
+  src: "{{ .ProcRoot }}"
+  dst: "{{ .ProcJail }}"
+  is_bind: true
+  rw: false
+  mandatory: true
+}
+{{- end }}
+
 {{- if .MaskEnabled }}
 
 # Build-identity masking. The shim intercepts the syscall-reachable

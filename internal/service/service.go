@@ -27,6 +27,13 @@ type Service struct {
 	// and published ports are disabled).
 	net Network
 
+	// disk provisions each workspace's real, per-workspace filesystem (a
+	// fuse2fs-mounted ext4 image sized to its disk_mb) so `df`/`stat -f`/
+	// os.statvfs() report the workspace's OWN allowance and a write past it
+	// fails at the boundary. nil when the FUSE backend is disabled/unavailable;
+	// the counter fallback then applies.
+	disk *workspace.DiskManager
+
 	mu       sync.Mutex
 	runs     map[string]*runningRun
 	sessions map[string]*liveSession
@@ -41,7 +48,7 @@ type runningRun struct {
 
 // New constructs a Service.
 func New(cfg config.Config, store *storage.Store, runner executor.Runner, logger *slog.Logger) *Service {
-	return &Service{
+	s := &Service{
 		cfg:      cfg,
 		store:    store,
 		runner:   runner,
@@ -49,7 +56,48 @@ func New(cfg config.Config, store *storage.Store, runner executor.Runner, logger
 		runs:     make(map[string]*runningRun),
 		sessions: make(map[string]*liveSession),
 	}
+	if cfg.Disk.Enabled {
+		id := executor.ResolveIdentity(cfg)
+		s.disk = workspace.NewDiskManager(workspace.DiskManagerConfig{
+			Backend:    workspace.DiskBackend(cfg.Disk.Backend),
+			Fuse2FS:    cfg.Disk.Fuse2FSPath,
+			MkfsExt4:   cfg.Disk.MkfsExt4Path,
+			Resize2FS:  cfg.Disk.Resize2FSPath,
+			Fusermount: cfg.Disk.FusermountPath,
+			UID:        id.SandboxUID,
+			GID:        id.SandboxGID,
+		})
+	}
+	return s
 }
+
+// DiskStatus reports the disk enforcement capability truthfully: enabled is
+// the configured switch, mechanism names the effective backend, and note
+// explains the state (including a fall back from the FUSE boundary to the
+// sampled counter).
+func (s *Service) DiskStatus() (enabled bool, mechanism, note string) {
+	if !s.cfg.Disk.Enabled {
+		return false, "none", "disk provisioning disabled by configuration (disk.enabled=false)"
+	}
+	backend := workspace.DiskBackend(s.cfg.Disk.Backend)
+	if backend == "auto" || backend == "" {
+		backend = workspace.DiskBackendFuse
+	}
+	if backend == workspace.DiskBackendNone {
+		return true, "none", "disk.backend=none: the allowance is neither enforced nor reported"
+	}
+	if backend == workspace.DiskBackendCounter {
+		return true, "counter", "disk.backend=counter: engine used-bytes watchdog (real but sampled; a running process can overshoot before the next poll)"
+	}
+	if s.disk == nil {
+		return true, "counter", "FUSE backend requested but not initialized; using the sampled counter"
+	}
+	if ok, reason := s.disk.Available(); !ok {
+		return true, "counter", "FUSE backend unavailable (" + reason + "); using the sampled counter"
+	}
+	return true, "fuse", "per-workspace fuse2fs ext4 image sized to disk_mb (kernel boundary, no overshoot)"
+}
+
 
 // Config returns the service configuration.
 func (s *Service) Config() config.Config { return s.cfg }
@@ -300,6 +348,9 @@ func (s *Service) DeleteWorkspace(id, principalID string) error {
 	// Tunnels die with the workspace: stop every cloudflared process and drop
 	// the records before the tree is removed.
 	s.ReleaseWorkspaceTunnels(w)
+	// Unmount and delete the workspace's per-workspace disk image before the
+	// tree is removed, so no FUSE mount and no image file is left behind.
+	s.removeWorkspaceDisk(w.ID)
 	if err := s.store.DeleteWorkspace(w.ID); err != nil {
 		return err
 	}

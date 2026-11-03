@@ -79,6 +79,16 @@ commands:
   - nproc
   - getconf
   - hostname
+  # Resource-reporting tools. Each reads ONLY the synthetic per-workspace
+  # /proc files (meminfo/stat/uptime/loadavg/vmstat), so it reports the
+  # workspace's OWN memory and cpu, never the host's. `top` and `ps` are
+  # deliberately NOT included: they enumerate /proc/<pid>/*, which the curated
+  # (synthetic) /proc does not carry, so they would fail with a confusing
+  # "mount -t proc proc /proc" error rather than report anything useful (see
+  # `notes`).
+  - free
+  - vmstat
+  - uptime
   - md5sum
   - sha256sum
   - grep
@@ -178,3 +188,15 @@ notes: |
   exists on the host. The compiler chain (gcc, g++, cc), apt,
   add-apt-repository, gdb, cmake and the other host tooling are deliberately NOT
   in this profile.
+
+  `free`, `vmstat` and `uptime` report the WORKSPACE's own resources. They read
+  only the curated, per-workspace /proc payload (meminfo, stat, uptime, loadavg,
+  vmstat), which the engine generates from this workspace's limits and mounts
+  read-only over /proc; none of the host's memory, cpu or uptime is reachable.
+  `free -h` therefore shows this workspace's memory allowance, and `vmstat`
+  shows this workspace's cpu count. `top` and `ps` are deliberately EXCLUDED:
+  they enumerate /proc/<pid>/* for every process, and the curated /proc
+  deliberately carries no per-process entries (the real procfs would leak host
+  process information). Exposing them would produce a confusing
+  "Error, do this: mount -t proc proc /proc" message rather than a truthful
+  view, so the profile omits them and this note records why.

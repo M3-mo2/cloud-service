@@ -862,6 +862,14 @@ type tmplData struct {
 	// mapped back to its owning run/session in the inventory.
 	TagEnv []string
 
+	// Synthetic /proc (see proc.go). When ProcEnabled is true a curated
+	// per-workspace directory is bind-mounted read-only over /proc, carrying
+	// only the workspace's own resource facts (meminfo/cpuinfo/uptime/loadavg/
+	// stat/version/mounts). mount_proc stays false.
+	ProcEnabled bool
+	ProcRoot    string
+	ProcJail    string
+
 	// Host-identity masking (see mask.go). When MaskEnabled is true the shim
 	// and its ld.so.preload list are bind-mounted read-only and MaskEnv carries
 	// the workspace's own cpu/memory values the shim reports.
@@ -1007,6 +1015,29 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 	}
 	sortExtraMounts(extra)
 
+	// Synthetic per-workspace /proc (see proc.go). It is generated under the
+	// run's private tmp dir (removed with it) and bind-mounted read-only over
+	// /proc. It carries only the workspace's own resource facts, so `free -h`
+	// and `uptime` report the workspace, never the host. mount_proc stays false.
+	procEnabled := r.cfg.Disk.ProcEnabled
+	procRoot := ""
+	procJail := ""
+	if procEnabled {
+		procRoot = filepath.Join(runTmp, ".proc")
+		cpuCount := mask.CPUs
+		if cpuCount < 1 {
+			cpuCount = 1
+		}
+		kr := mask.KernelRelease
+		if kr == "" {
+			kr = config.DefaultMaskKernelRelease
+		}
+		if _, err := writeSyntheticProc(procRoot, cpuCount, lim.MemoryMB, lim.DiskMB, kr); err != nil {
+			return "", fmt.Errorf("synthetic proc: %w", err)
+		}
+		procJail = "/proc"
+	}
+
 	data := tmplData{
 		Argv:          req.Argv,
 		Env:           withPackagePath(formatEnv(req.Env), pkgPath),
@@ -1049,6 +1080,10 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		MaskShimJail:    mask.ShimJail,
 		MaskPreloadJail: mask.PreloadJail,
 		MaskEnv:         mask.envEntries(),
+
+		ProcEnabled: procEnabled,
+		ProcRoot:    procRoot,
+		ProcJail:    procJail,
 
 		OverlayEnabled: mask.OverlayEnabled,
 		UsrRoot:        mask.UsrRoot,

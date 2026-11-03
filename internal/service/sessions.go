@@ -120,6 +120,12 @@ func (s *Service) StartSession(w *model.Workspace, spec StartSessionSpec) (*mode
 		return nil, err
 	}
 
+	// Mount the workspace's per-workspace disk before the session starts, so
+	// the shell's /workspace IS the bounded filesystem.
+	if err := s.ensureWorkspaceDisk(w); err != nil {
+		return nil, model.New(503, model.CodeUnavailable, "workspace disk unavailable: "+err.Error())
+	}
+
 	now := time.Now().UTC()
 	sess := &model.Session{
 		ID:             model.NewSessionID(),
