@@ -42,7 +42,8 @@ reports `"cgroups":true`.
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh` → `27 passed / 0 failed / 0 skipped`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `131 passed / 0 failed / 2 skipped`
 > - `BASE=http://127.0.0.1:8099 KEY=… OTHER_KEY=… DATA_DIR=… NSJAIL=/usr/local/bin/nsjail sudo -n bash scripts/acceptance.sh` → `113 passed / 0 failed`
-> - `bash scripts/docs-consistency.sh` → `173 passed / 0 failed`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/subscription-check.sh` → `61 passed / 0 failed`
+> - `bash scripts/docs-consistency.sh` → `193 passed / 0 failed`
 >
 > The unprivileged suites (`gofmt`, `go build`, `go vet`, `go test ./...`, the
 > handler-level assertions and the sandbox-config render tests) were re-run and
@@ -2215,21 +2216,22 @@ identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/
       disk.dfh_root_ok ok ; disk.dfh_root_has_row yes
       disk.df_bare_workspace_1k 262144
       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
-docs-consistency.sh             173 passed / 0 failed
-go test ./...                   353 test functions (from 351)
+docs-consistency.sh             193 passed / 0 failed
+go test ./...                  390 test functions (from 353)
 ```
 
 The full gate set re-run for this revision, one gate at a time (concurrent runs
 corrupt the `docs-consistency` tally), all green:
 
 ```
-scripts/docs-consistency.sh     173 passed / 0 failed
+scripts/docs-consistency.sh     193 passed / 0 failed
 scripts/acceptance.sh           113 passed / 0 failed
 scripts/process-stop-check.sh    25 passed / 0 failed
 scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped   (real quick tunnel)
 scripts/identity-check.sh       131 passed / 0 failed / 2 skipped
 scripts/egress-decoy-check.sh    58 passed / 0 failed / 0 skipped
-go test ./...                    353 test functions; go vet ./... clean
+scripts/subscription-check.sh    61 passed / 0 failed             (compressed clock; see §9l)
+go test ./...                    390 test functions; go vet ./... clean
 ```
 
 `identity-check.sh` §1b and §1c are the new assertions: the curated `/proc`
