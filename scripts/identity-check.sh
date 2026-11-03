@@ -501,7 +501,7 @@ chk "disk.dfh_workspace_rc" "0" "$(dval DFH_WS_RC)"
 chk "disk.dfh_workspace_size" "256M" "$(dval DFH_WS_SIZE)"
 chk "disk.dfh_root_ok" "ok" "$(dval DFH_ROOT_ERR)"
 chk "disk.dfh_root_rc" "0" "$(dval DFH_ROOT_RC)"
-chk "disk.dfh_root_has_row" "yes" "$([ "${DFH_ROOT_ROWS:-0}" -ge 1 ] && echo yes || echo no)"
+chk "disk.dfh_root_has_row" "yes" "$([ "$(dval DFH_ROOT_ROWS)" -ge 1 ] && echo yes || echo no)"
 chk "disk.df_bare_rc" "0" "$(dval DF_RC)"
 chk "disk.df_bare_workspace_1k" "$((WS_DISK_MB * 1024))" "$(dval DF_WS_1K)"
 # Fill past the allowance: the write must fail at the boundary (ENOSPC), not
