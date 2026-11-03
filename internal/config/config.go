@@ -31,7 +31,60 @@ type Config struct {
 	Subscription SubscriptionConfig `koanf:"subscription"`
 	Archives     ArchivesConfig     `koanf:"archives"`
 	Metrics      MetricsConfig      `koanf:"metrics"`
+	Ports        PortsConfig        `koanf:"ports"`
 	Keys         []KeyConfig        `koanf:"keys"`
+}
+
+// PortsConfig controls native per-workspace port/service discovery: the
+// on-demand GET /v1/workspaces/{id}/ports endpoint that answers which ports a
+// workspace is listening on and which process serves each one.
+//
+// It is DEFAULT ON, deliberately, and this is a considered choice rather than an
+// inherited default. The feature is READ-ONLY introspection of the tenant's OWN
+// workspace: it reveals nothing about the host, another workspace, or the
+// operator. With it off, a user has NO way to see their own services at all --
+// inside a workspace the curated /proc carries no /proc/net (ADR 86) and neither
+// `ss` nor `netstat` is installed -- so a user who binds a port cannot discover
+// it. Disabling it would leave the user blind to their own work. An operator who
+// wants the surface absent can still set ports.enabled:false, and the route then
+// reads as 404.
+//
+// It is deliberately NOT part of the metrics stream: one table read is measured
+// at ~4.6 ms, and 4.6 ms x 1000 workspaces would add 4.6 s to every 3-second
+// metrics tick. It is on-demand only (ADR 96).
+type PortsConfig struct {
+	// Enabled is the server-level switch. Default true (on). When false the
+	// route is refused with 404 ports_disabled and /v1/meta reports it off.
+	Enabled bool `koanf:"enabled"`
+	// MaxPids bounds how many of the workspace's processes are examined for the
+	// socket-inode attribution. It caps the cost of one request. Default 64.
+	MaxPids int `koanf:"max_pids"`
+	// MaxFDsPerPID bounds how many file descriptors are examined per process
+	// during attribution. Default 512.
+	MaxFDsPerPID int `koanf:"max_fds_per_pid"`
+	// IncludeUnix reports unix-domain sockets in a SEPARATE section (never mixed
+	// into the port list, because a unix socket is not a reachable port).
+	// Default true.
+	IncludeUnix bool `koanf:"include_unix"`
+}
+
+// EnabledOrDefault reports whether the port-discovery route is served. The
+// default is ON, so a zero-value config in a test that does not set the flag
+// still serves the route; production always loads Default() first.
+func (p PortsConfig) EnabledOrDefault() bool { return p.Enabled }
+
+// Limits returns the bounded-scan limits for one request, filling any unset
+// (non-positive) value from the defaults.
+func (p PortsConfig) Limits() (maxPids, maxFDs int) {
+	maxPids = p.MaxPids
+	if maxPids <= 0 {
+		maxPids = 64
+	}
+	maxFDs = p.MaxFDsPerPID
+	if maxFDs <= 0 {
+		maxFDs = 512
+	}
+	return maxPids, maxFDs
 }
 
 // MetricsConfig controls the per-workspace resource stream (RAM + disk), the
@@ -848,6 +901,12 @@ func Default() Config {
 			IdleReconcileInterval: "15s",
 			MaxSubscribers:        1024,
 		},
+		Ports: PortsConfig{
+			Enabled:      true,
+			MaxPids:      64,
+			MaxFDsPerPID: 512,
+			IncludeUnix:  true,
+		},
 		Keys: []KeyConfig{},
 	}
 }
@@ -1160,6 +1219,15 @@ func (c *Config) applyDefaults() {
 	if met.MaxSubscribers <= 0 {
 		met.MaxSubscribers = d.Metrics.MaxSubscribers
 	}
+	// Port discovery: the numeric caps default when unset. Enabled is
+	// deliberately NOT touched here: its default (true) lives in rawDefaults so
+	// an explicit `ports.enabled: false` survives.
+	if c.Ports.MaxPids <= 0 {
+		c.Ports.MaxPids = d.Ports.MaxPids
+	}
+	if c.Ports.MaxFDsPerPID <= 0 {
+		c.Ports.MaxFDsPerPID = d.Ports.MaxFDsPerPID
+	}
 }
 
 func rawDefaults() []byte {
@@ -1288,5 +1356,10 @@ metrics:
   include_cpu: false
   idle_reconcile_interval: "15s"
   max_subscribers: 1024
+ports:
+  enabled: true
+  max_pids: 64
+  max_fds_per_pid: 512
+  include_unix: true
 `)
 }

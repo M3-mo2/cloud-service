@@ -13,6 +13,7 @@ import (
 	"sandboxd/internal/auth"
 	"sandboxd/internal/config"
 	"sandboxd/internal/executor"
+	"sandboxd/internal/ports"
 	"sandboxd/internal/service"
 	"sandboxd/internal/storage"
 )
@@ -61,6 +62,10 @@ func newHarnessAt(t *testing.T, dataDir string) *harness {
 		t.Fatalf("store: %v", err)
 	}
 	fake := &executor.FakeRunner{AvailableFlag: false, CgroupsFlag: true, Stdout: "hi\n"}
+	// An unwatched workspace has no sockets: the default port read is an empty,
+	// complete result (the real executor reports complete=true unless a bound is
+	// hit).
+	fake.PortTables = ports.NetTables{Complete: true, Holders: map[uint64][]int{}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(cfg, store, fake, logger)
 	authn := auth.New([]config.KeyConfig{

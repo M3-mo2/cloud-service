@@ -80,6 +80,8 @@ func (s *Server) Router() http.Handler {
 				r.Get("/processes", s.handleListProcesses)
 				r.Post("/processes/{processID}/stop", s.handleStopProcess)
 
+				r.Get("/ports", s.handleListPorts)
+
 				r.Post("/tunnels", s.handleCreateTunnel)
 				r.Get("/tunnels", s.handleListTunnels)
 				r.Get("/tunnels/{tunnelID}", s.handleGetTunnel)
@@ -459,6 +461,24 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 			"GET /v1/workspaces/{id}/metrics/stream",
 		},
 	}
+	// Native port/service discovery: ON demand, per workspace, answering which
+	// ports are open and which process serves each one. Advertised truthfully:
+	// the switch, the bounded-scan caps, whether unix sockets are reported and
+	// the route. It is deliberately NOT part of the metrics stream (one table
+	// read is measured at ~4.6 ms; see ADR 96). A port here is listening inside
+	// the workspace's private namespace and is NOT thereby reachable from
+	// outside.
+	portsOn, portsMaxPids, portsMaxFDs, portsUnix := s.svc.PortsStatus()
+	portsCap := map[string]any{
+		"enabled":         portsOn,
+		"max_pids":        portsMaxPids,
+		"max_fds_per_pid": portsMaxFDs,
+		"include_unix":    portsUnix,
+		"mechanism":       "on-demand read of /proc/<pid>/net/{tcp,tcp6,udp,udp6,unix} for a pid inside the workspace's own namespace, with socket-inode -> owning-process attribution over the workspace's process registry; never cached and never on the metrics tick",
+		"routes":          []string{"GET /v1/workspaces/{id}/ports"},
+		"reachability":    "a reported port is listening inside the workspace's private network namespace; it is NOT reachable from outside unless a tunnel publishes it (limits.allow_tunnels AND tunnels.enabled)",
+		"default_note":    "enabled by default: read-only introspection of the tenant's own workspace, which the tenant cannot see from inside (no /proc/net, no ss/netstat)",
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":       model.Version,
 		"api_version":   model.APIVersion,
@@ -467,6 +487,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"subscriptions": subCap,
 		"archives":      archivesCap,
 		"metrics":       metricsCap,
+		"ports":         portsCap,
 		"limits_defaults": map[string]any{
 			"cpu_cores":            l.CPUCores,
 			"memory_mb":            l.MemoryMB,

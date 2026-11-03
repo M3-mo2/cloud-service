@@ -21,6 +21,7 @@ import (
 	"sandboxd/internal/config"
 	"sandboxd/internal/decoy"
 	"sandboxd/internal/model"
+	"sandboxd/internal/ports"
 	"sandboxd/internal/profile"
 )
 
@@ -677,6 +678,12 @@ func (r *NsjailRunner) KillProcessTree(pid int) bool {
 
 // ListProcesses returns every live process currently inside a sandbox cgroup.
 func (r *NsjailRunner) ListProcesses() []ProcessInfo { return ListJailProcesses() }
+
+// NetTablesForPids reads the /proc/<pid>/net/* tables and attributes socket
+// inodes to the supplied candidate pids. See executor/ports.go.
+func (r *NsjailRunner) NetTablesForPids(pids []int, limits ports.Limits) ports.NetTables {
+	return NetTablesForPids(pids, limits)
+}
 
 // ReapOrphans kills and removes every orphaned sandbox cgroup on the host.
 func (r *NsjailRunner) ReapOrphans() int { return ReapOrphans() }

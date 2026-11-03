@@ -8,6 +8,7 @@ import (
 
 	"sandboxd/configs"
 	"sandboxd/internal/model"
+	"sandboxd/internal/ports"
 	"sandboxd/internal/profile"
 )
 
@@ -62,6 +63,12 @@ type FakeRunner struct {
 	// RunCgroups, when set, is returned by RunCgroupDirs so the metrics sampler
 	// can be tested without a real cgroup hierarchy.
 	RunCgroups map[string]string
+
+	// PortTables, when set, is returned by NetTablesForPids so the port/service
+	// inventory can be tested without a real /proc. LastPortLimits records the
+	// limits the service passed, so a test can assert the bound is applied.
+	PortTables     ports.NetTables
+	LastPortLimits ports.Limits
 
 	// cgroupEnsured records the workspace ids EnsureWorkspaceCgroup was called
 	// for, so a service test can assert the provisioning path ran.
@@ -340,6 +347,19 @@ func (f *FakeRunner) RunCgroupDirs() map[string]string {
 		out[id] = dir
 	}
 	return out
+}
+
+// NetTablesForPids returns the configured port tables and records the limits, so
+// the port/service contract can be tested without a real /proc.
+func (f *FakeRunner) NetTablesForPids(pids []int, limits ports.Limits) ports.NetTables {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.LastPortLimits = limits
+	t := f.PortTables
+	if t.Holders == nil {
+		t.Holders = map[uint64][]int{}
+	}
+	return t
 }
 
 // SetOrphans configures how many orphans ReapOrphans reports.

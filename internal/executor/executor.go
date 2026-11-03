@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"sandboxd/internal/model"
+	"sandboxd/internal/ports"
 	"sandboxd/internal/profile"
 )
 
@@ -214,4 +215,12 @@ type Runner interface {
 	// O(live runs): the metrics sampler joins it against the service's run table
 	// to attribute a cgroup to a workspace, so it never scans /sys/fs/cgroup.
 	RunCgroupDirs() map[string]string
+
+	// NetTablesForPids reads the /proc/<pid>/net/* network tables for a pid that
+	// is inside a workspace's network namespace, and attributes each socket
+	// inode to the supplied candidate pids. It is the host-read primitive
+	// behind the port/service inventory. It is bounded (at most len(pids)
+	// processes and limits.MaxFDsPerPID fds each) and its result carries an
+	// explicit Complete flag so a partial read is reported as partial.
+	NetTablesForPids(pids []int, limits ports.Limits) ports.NetTables
 }

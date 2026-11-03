@@ -139,6 +139,13 @@ const (
 	// produced while disk.write_rate_enabled is on; the ceiling is SAMPLED, so
 	// the write that crosses it is not refused by a kernel boundary (see ADR 95).
 	CodeWriteRateExceeded = "write_rate_exceeded"
+
+	// CodePortsDisabled is returned (HTTP 404) when native port/service
+	// discovery is switched off (ports.enabled=false). The route reads as "not
+	// found" rather than 403, so the surface is simply absent, matching how the
+	// metrics routes behave when disabled. The feature is ON by default; see
+	// docs/DECISIONS.md ADR 96 for why.
+	CodePortsDisabled = "ports_disabled"
 )
 
 // Error is the canonical API error, carrying an HTTP mapping and a code.
