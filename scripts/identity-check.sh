@@ -248,6 +248,14 @@ cleanup() {
   for d in "$NSDIR" "$NSDIR2"; do
     for n in $(ls "$d" 2>/dev/null); do umount "$d/$n" 2>/dev/null; rm -f "$d/$n"; done
   done
+  # Remove this run's workspace parent cgroups (ws-*) and nested leaves; a
+  # non-empty cgroup is left alone.
+  for d in $(ls -d /sys/fs/cgroup/ws-*/NSJAIL.* 2>/dev/null); do
+    [ -s "$d/cgroup.procs" ] || rmdir "$d" 2>/dev/null
+  done
+  for d in $(ls -d /sys/fs/cgroup/ws-* 2>/dev/null); do
+    [ -s "$d/cgroup.procs" ] || rmdir "$d" 2>/dev/null
+  done
   rm -rf "$DATA" "$DATA2" "$BIN" "$WORK"
 }
 trap cleanup EXIT INT TERM

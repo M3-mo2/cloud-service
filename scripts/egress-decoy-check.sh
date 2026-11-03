@@ -100,6 +100,15 @@ cleanup() {
   [ -n "$SRV" ] && { kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; }
   sleep 1
   for n in $(ls "$NSDIR" 2>/dev/null); do umount "$NSDIR/$n" 2>/dev/null; rm -f "$NSDIR/$n"; done
+  # Remove this run's workspace parent cgroups (ws-*) and any nested NSJAIL.*
+  # leaves; a non-empty cgroup is left alone. This gate creates a workspace but
+  # does not DELETE it, so its engine-owned ceiling cgroup must be torn down here.
+  for d in $(ls -d /sys/fs/cgroup/ws-*/NSJAIL.* 2>/dev/null); do
+    [ -s "$d/cgroup.procs" ] || rmdir "$d" 2>/dev/null
+  done
+  for d in $(ls -d /sys/fs/cgroup/ws-* 2>/dev/null); do
+    [ -s "$d/cgroup.procs" ] || rmdir "$d" 2>/dev/null
+  done
   rm -rf "$DATA" "$BIN" "$WORK"
 }
 trap cleanup EXIT INT TERM
