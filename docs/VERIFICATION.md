@@ -106,7 +106,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **458** (454 unit + 4 `integration`-tagged), including regression
+Test functions: **465** (461 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -176,7 +176,7 @@ file (the same measure `scripts/docs-consistency.sh` asserts against):
 
 ```
 $ find . -name '*_test.go' -exec grep -hE '^func Test' {} + | wc -l
-458
+465
 ```
 
 ## 2. Probes
@@ -2029,7 +2029,7 @@ What each group proves:
 instant: exactly at expiry, exactly at grace end; the backwards-clock rule) and
 the derivations (unlimited, active, expiring-soon, locked, clamped-at-0); the
 service adds the whole lifecycle with an injected clock; the API adds the
-request/response contract. Suite total `458` test functions (see §1).
+request/response contract. Suite total `465` test functions (see §1).
 
 ## 9m. Native archives (this revision)
 
@@ -2193,9 +2193,70 @@ isolation across principals, and JSON frame shape with monotonic timestamps.
 measured numbers). The four routes and the frame shape are documented in
 [docs/API.md](API.md) and `api/openapi.yaml`, and advertised in `GET /v1/meta`.
 
+## 9o. Per-workspace resource ceiling (this revision)
+
+The RAM half of the "a workspace is a server-shaped thing with its own quota"
+model was missing: the ceiling was **per run** (ADR 94). Measured before the
+change: one workspace at `memory_mb: 128` with three runs produced **three**
+`/sys/fs/cgroup/NSJAIL.<pid>` cgroups, each with `memory.max = 134217728`, so it
+could consume 384 MB against an advertised 128 MB. This revision makes the
+memory/CPU/pids ceiling **per workspace**, mirroring the disk half (ADR 85).
+
+### 9o.1 The mechanism (measured)
+
+- ONE parent cgroup per workspace (`ws-<id>`) carries `memory.max = memory_mb`,
+  `memory.swap.max = 0`, `memory.oom.group = 1`, `pids.max = max_runs*64`,
+  `cpu.max = <cpu_cores*1000000> 1000000`, with `+memory +cpu +pids` delegated in
+  `cgroup.subtree_control`.
+- nsjail is pointed at that parent with `cgroupv2_mount`, so every run's and
+  session's leaf cgroup (`<parent>/NSJAIL.<pid>`) is created **inside** it; the
+  parent enforces the SUM. Moving an existing cgroup into a parent is **EPERM**
+  (measured: `mv` → "Operation not permitted", `os.rename` `errno=1`), so the
+  parent must exist before launch and nsjail must be told to use it.
+- The per-run limits are kept **equal** to the workspace's values, not 0:
+  measured, nsjail creates **no** leaf cgroup when all three per-run limits are
+  0, which would cost the cgroup-scoped kill/inventory handle.
+- Measured enforcement: two concurrent 100 MB allocations against a 128 MB
+  parent drove the parent's `oom_kill` counter and both runs exited 137; a single
+  200 MB allocation exited nsjail 137 with the parent recording `oom_kill 2`,
+  `oom_group_kill 1`.
+
+### 9o.2 The real-nsjail acceptance
+
+`scripts/spread-check.sh` drives the REAL service, real nsjail and a real FUSE
+disk (bounded: one workspace, at most three concurrent runs, torn down between
+phases; this check must not hammer the host). It asserts:
+
+- creating and running in a workspace creates **exactly one** parent cgroup
+  `ws-<id>` with `cpu memory pids` delegated and `memory.max = memory_mb`,
+  `memory.swap.max = 0`, `memory.oom.group = 1`;
+- a run's leaf cgroup appears **inside** the parent and **zero** `NSJAIL.*` exist
+  directly under `/sys/fs/cgroup` while runs are live;
+- **the central assertion**: a single allocation of 2 × `memory_mb` is refused
+  (run status `oom`, the parent records `oom_kill`), and with **three**
+  concurrent ~0.9 × `memory_mb` allocations whose SUM exceeds `memory_mb` the
+  parent's `memory.max` is `memory_mb`, the API's `ram_limit_bytes` is exactly
+  `memory_mb`, the ceiling fires an `oom_kill`, and a run reads as `oom` — the
+  measured "before" was three runs × `memory_mb` all succeeding;
+- `ram_used <= ram_limit` and `ram_percent <= 100` under load (the contract the
+  tenant sees; the old model could report > 100%);
+- a `setsid()`-escaped process is **still killed** by the workspace stop (the
+  kill path survived the layout change);
+- deleting the workspace removes its parent cgroup and leaves no `NSJAIL.*` and
+  no `ws-*` parent behind; and
+- the disk budget is the workspace's OWN allowance: `df` inside the workspace
+  equals `disk_mb`, and a write past it is refused.
+
+### 9o.3 The disk reserve was checked and is sound
+
+The suspected archive-budget reserve hole is **not** a hole: the archive path
+writes through a `Sink` backed by the workspace `Fs`, whose `reserve()` refuses
+when `used+delta > diskLimit` with a `QuotaError`; `statvfs`/`Bavail` is not on
+that path at all. The disk mechanism is left unchanged (see ADR 94).
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **92** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **94** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -2388,7 +2449,7 @@ identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/
       disk.df_bare_workspace_1k 262144
       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
 docs-consistency.sh             245 passed / 0 failed
- go test ./...                  458 test functions (from 353)
+ go test ./...                  465 test functions (from 353)
 ```
 
 The full gate set re-run for this revision, one gate at a time (concurrent runs
@@ -2404,7 +2465,7 @@ scripts/egress-decoy-check.sh    58 passed / 0 failed / 0 skipped
 scripts/subscription-check.sh    61 passed / 0 failed             (compressed clock; see §9l)
 scripts/archive-check.sh        101 passed / 0 failed             (native archives; see §9m)
 scripts/metrics-check.sh         51 passed / 0 failed             (resource stream; see §9n)
-go test ./...                    458 test functions; go vet ./... clean
+go test ./...                    465 test functions; go vet ./... clean
 ```
 
 `scripts/metrics-check.sh` is the new gate for this revision: it drives the real

@@ -605,7 +605,7 @@ fly (`configs/nsjail_python.cfg.tmpl`). The rendered sandbox has:
 | mount ns | host `/usr`,`/lib`,`/lib64`,`/bin`,`/sbin` RO; workspace RW at `/workspace`; private `/tmp` | Child sees only the runtime + its own files | always |
 | `/proc` | `mount_proc: false`; a CURATED per-workspace `/proc` payload (meminfo/cpuinfo/stat/uptime/loadavg/version/vmstat/mounts) is bound RO over it | Host process/network/kernel view not visible; the workspace sees only its OWN resource facts (`free -h`, `vmstat`, a bare `df` work) | `disk.proc_enabled` (default on) **and** `identity.enabled` |
 | `/workspace` | a real per-workspace ext4 image (fuse2fs, host-side mount) sized to `disk_mb` | `df`/`stat -f`/`os.statvfs()` report the workspace's own allowance; a write past it fails `ENOSPC` (kernel boundary, no overshoot) | `disk.enabled` (default on); falls back to a sampled used-bytes watchdog |
-| cgroup v2 | `cgroup_mem_max` (bytes), `cgroup_pids_max`, `cgroup_cpu_ms_per_sec` | Memory, process-count, CPU throttling | **only with `--cgroupns=host`** |
+| cgroup v2 | ONE parent cgroup per workspace (`ws-<id>`) carries `memory.max` (bytes), `pids.max`, `cpu.max`; nsjail is pointed at it via `cgroupv2_mount`, so every run's leaf cgroup is created **inside** it | Per-WORKSPACE memory / process-count / CPU throttling, enforced as the SUM across concurrent runs (ADR 94) | **only with `--cgroupns=host`** |
 | rlimits | `as` (MB), `fsize` (MB), `nofile`, `nproc`, `core=0` | Kernel-enforced ceilings | always |
 | seccomp | default-allow, KILL a dangerous denylist | `mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`, modules, keyctl, … | always |
 | identity | uid/gid map + `--user sandbox` | Runs as the unprivileged `sandbox` user | always |
@@ -619,12 +619,12 @@ fly (`configs/nsjail_python.cfg.tmpl`). The rendered sandbox has:
 > disk limit; `rlimit_as` is **not** `memory_mb` but `memory_mb + headroom`
 > (floored at 2048 MB), because a managed runtime reserves a large *virtual*
 > address space it never commits and `RLIMIT_AS` counts reservations (ADR 82):
-> the physical ceiling is `cgroup_mem_max = memory_mb`. cgroup v2 ceilings
-> require write access to the host cgroup hierarchy,
-> i.e. the container must run with `--cgroupns=host`; without it nsjail aborts
-> before `execve` and **no** cgroup ceiling applies (see §5.4 and §10). The
-> process ceiling comes from `cgroup_pids_max`, because `RLIMIT_NPROC` does not
-> bind for the root-run sandbox.
+> the physical ceiling is the workspace parent cgroup's `memory.max = memory_mb`
+> (ADR 94). cgroup v2 ceilings require write access to the host cgroup
+> hierarchy, i.e. the container must run with `--cgroupns=host`; without it
+> nsjail aborts before `execve` and **no** cgroup ceiling applies (see §5.4 and
+> §10). The process ceiling comes from `pids.max` on the workspace parent,
+> because `RLIMIT_NPROC` does not bind for the root-run sandbox.
 
 ### 5.2 The filesystem the sandbox sees
 
@@ -759,7 +759,13 @@ error. Getting to a green real-nsjail run required:
   are in megabytes** (a subtle unit mismatch covered by a test). `rlimit_as` is
   `memory_mb + headroom` (floor 2048 MB), not `memory_mb`, so a managed runtime
   whose `PROT_NONE` reservations count against `RLIMIT_AS` can still start; the
-  cgroup is the physical ceiling (ADR 82).
+  cgroup is the physical ceiling (ADR 82). Since ADR 94 the physical ceiling is
+  the workspace **parent** cgroup's `memory.max`, and nsjail is pointed at that
+  parent with `cgroupv2_mount: /sys/fs/cgroup/ws-<id>` so each run's leaf cgroup
+  is created inside it. The per-run `cgroup_mem_max` is kept equal to the
+  workspace `memory_mb` (not 0): measured, nsjail creates **no** leaf cgroup
+  when all three per-run limits are 0, which would cost the cgroup-scoped
+  kill/inventory handle.
 - cgroup v2 is only usable when the container is started with
   `--cgroupns=host`; otherwise nsjail aborts before `execve`.
 - `uidmap`/`gidmap` `inside_id`/`outside_id` must be quoted **strings**.
@@ -1303,7 +1309,8 @@ real-nsjail acceptance transcript:
 | network egress | `NET_BLOCKED: OSError` | net namespace isolates |
 | `/etc/shadow` | `FileNotFoundError` | not mounted |
 | `mount(2)`/`ptrace` | exit **159** (SIGSYS) | seccomp kills it |
-| memory ceiling (`cgroup_mem_max`) | 4 GiB touch killed (exit 137) | physical ceiling enforced || fork bomb | `FORKED 191` then `BlockingIOError` | cgroup pids limit |
+| memory ceiling (workspace parent `memory.max`) | 4 GiB touch killed (exit 137, run status `oom`) | per-workspace physical ceiling enforced as the SUM across runs (ADR 94) |
+| fork bomb | `FORKED 191` then `BlockingIOError` | cgroup pids limit |
 | stop long run | status `killed`, no orphan | process-group kill |
 | launch failure (no `--cgroupns=host`) | 503 + nsjail diagnostic | failure is explicit |
 
@@ -1326,8 +1333,8 @@ Deferred to v0.1 (documented, not bugs):
   path and rechecked with `du`; the sandbox process is bounded by `rlimit_fsize`
   per file (now correctly in MB), not a total per-tree quota.
 - **Process ceiling** — `RLIMIT_NPROC` does not bind for the root-run sandbox;
-  the ceiling is provided by `cgroup_pids_max`, hence cgroup v2
-  (`--cgroupns=host`) is mandatory.
+  the ceiling is provided by `pids.max` on the workspace's parent cgroup, hence
+  cgroup v2 (`--cgroupns=host`) is mandatory.
 - **Bare-host unprivileged operation** — blocked by AppArmor unprivileged-userns
   restrictions on some kernels; run as root / setuid / privileged container.
 

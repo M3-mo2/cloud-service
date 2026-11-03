@@ -2133,11 +2133,15 @@ session added `NSJAIL.<pid>`), so the sum covers run cgroups and session cgroups
 **`memory.max` is a per-RUN ceiling — a documented property, not a fix.** Because
 there is one cgroup per run, a workspace with N runs can consume **N ×
 `memory_mb`** (with the default `max_runs: 20`, that is 20× the advertised
-figure). This is a pre-existing property of the engine's enforcement model and is
-**deliberately not changed here**: the stream reports the summed truth (the
-`ram_cgroup_limit_bytes` field is the sum of the live cgroups' `memory.max`),
-and this ADR records the per-run behaviour honestly. Changing the enforcement
-model is a separate decision the operator has not made.
+figure). This was a pre-existing property of the engine's enforcement model and
+was **deliberately not changed here**: this ADR (the stream) reports the summed
+truth and recorded the per-run behaviour honestly. **ADR 94 then changed the
+enforcement model itself** — one parent cgroup per workspace, limits on the
+parent, nsjail pointed at it — so `ram_cgroup_limit_bytes` (the per-run ceiling
+sum, which could exceed the advertised limit) was **removed** and
+`ram_limit_bytes` became the ENFORCED parent ceiling. The stream's design in this
+ADR is unchanged; only the enforcement model and that one contradictory field
+are superseded by ADR 94.
 
 **The disk-reporting bug this task fixed (measured).** `MountedDiskUsed`
 computed `used = total − f_bavail`. `f_bavail` is the space available to a
@@ -2228,6 +2232,155 @@ real nsjail and a real FUSE disk and asserts the whole cheap-stream contract —
 including the `df`-inside-the-workspace assertion that caught the `f_bavail`
 bug, the SUM assertion (two runs exceed one cgroup), idle elision, fan-out, no
 tree walk, the floor, coalescing, clean disconnect, and a full leak check.
+
+### ADR 94 — one cgroup per WORKSPACE: the advertised ceiling is the enforced ceiling
+
+**Decision.** A workspace's memory/CPU/pids ceiling is enforced by **ONE parent
+cgroup per workspace**, owned by the engine, whose `memory.max` is the
+workspace's advertised `memory_mb`. nsjail is pointed at that parent via
+`cgroupv2_mount`, so every run's and session's leaf cgroup is created **inside**
+it and the parent bounds the SUM across concurrent runs. This makes the RAM half
+behave like the DISK half, which already gives each workspace its own
+kernel-enforced allowance (ADR 85): a workspace is a server-shaped thing with its
+own quota, and no process inside it can get around it.
+
+**The measured finding that decided this (do not re-derive).** The ceiling was
+**per run**. `cgroup_mem_max: {{ .MemoryBytes }}` goes into the nsjail config and
+nsjail created one cgroup per launch at `/sys/fs/cgroup/NSJAIL.<pid>`, directly
+under the root. Measured: one workspace at `memory_mb: 128` with **three** runs
+produced **three** cgroups, EACH with `memory.max = 134217728`, so the workspace
+could consume 384 MB against an advertised 128 MB, and `live_cgroups` equalled
+the run count. `ADR 93` reported this honestly; this ADR fixes the enforcement.
+
+**Moving an existing cgroup is EPERM (measured) — do not retry it.** Creating a
+parent, delegating controllers, and `mv`-ing an existing `NSJAIL.<pid>` into it
+fails with `mv: cannot move … : Operation not permitted` and `os.rename`
+`errno=1` (EPERM). A cgroup cannot be reparented after creation, so the parent
+must exist **before** nsjail launches and nsjail must be **told** to use it.
+That is the whole reason the mechanism is `cgroupv2_mount` rather than a
+move/hook.
+
+**`cgroupv2_mount` is the mechanism and it works (measured).** With a parent
+cgroup created and `+memory +cpu +pids` delegated into its
+`cgroup.subtree_control`, and nsjail's `cgroupv2_mount` set to that parent, the
+parent's `memory.current` summed the child (measured 87363584 for the child's
+memory) and **zero** `NSJAIL.*` were left directly under `/sys/fs/cgroup`; the
+leaf appeared at `<parent>/NSJAIL.<leader>`. No nsjail upgrade and no kernel
+feature is needed.
+
+**Why nsjail must create the leaf, and why the per-run limits stay equal to the
+workspace ceiling (measured).** nsjail creates its leaf cgroup only when at
+least one per-run cgroup limit is set. Measured: with
+`cgroup_mem_max=0 cgroup_pids_max=0 cgroup_cpu_ms_per_sec=0` nsjail created
+**no** leaf cgroup at all (`leaf=NONE`, parent `memory.current=0`); with any one
+set it does. Setting the per-run `memory_mem_max` to 0 "unlimited" would
+therefore cost the engine its cgroup-scoped kill/inventory handle — the exact
+handle the kill path depends on. The per-run limits are therefore left EQUAL to
+the workspace's values (`cgroup_mem_max = memory_mb`, `cgroup_pids_max =
+max_runs*64`, `cgroup_cpu_ms_per_sec = cpu_cores`); the **parent** still enforces
+the SUM, so one run may use up to `memory_mb` and N runs share the same
+`memory_mb` — they no longer each get their own. (Measured with the intended
+config: two concurrent 100 MB allocations against a 128 MB parent drove the
+parent's `oom_kill` counter and both runs exited 137.)
+
+**What is enforced where.**
+
+| Level | File | Meaning |
+|-------|------|---------|
+| Workspace parent `ws-<id>` | `memory.max = memory_mb` | the **advertised** physical ceiling, enforced as the **SUM** |
+| | `memory.swap.max = 0` | no swap — the ceiling is a real physical ceiling, not a soft one |
+| | `memory.oom.group = 1` | an OOM kills the whole workspace group, not one arbitrary process |
+| | `pids.max = max_runs*64` | the workspace-wide process budget |
+| | `cpu.max = <cpu_cores*1000000> 1000000` | the workspace-wide CPU quota |
+| | `cgroup.subtree_control = +memory +cpu +pids` | the delegated controllers (a parent with delegation but no enabled child controllers silently enforces nothing) |
+| Run/session leaf `<parent>/NSJAIL.<pid>` | same values as the parent | keeps the leaf created so the kill/inventory handle exists; a single run is limited alone while the SUM is limited by the parent |
+
+**Reporting the real ceiling (the contract the tenant sees).** `ram_used_bytes`
+remains the SUM over the live run AND session leaf cgroups, but `ram_limit_bytes`
+is now the **parent cgroup's `memory.max`** (read from the kernel while a run or
+session is live, falling back to `memory_mb` when idle). Because the kernel
+enforces the SUM at the parent, `ram_used_bytes <= ram_limit_bytes` always holds
+and `ram_percent` never exceeds 100. The **contradictory second limit field
+`ram_cgroup_limit_bytes` was removed**: it was the SUM of the per-run
+`memory.max` values, which could exceed the workspace allowance (measured 320 MB
+against a 160 MB workspace), and a tenant reading `ram_percent: 106.3` with
+`ram_used 142 MB > ram_limit 128 MB` read it as a broken contract. One limit, the
+enforced one, is the honest surface.
+
+**What happens at the ceiling (measured, and made observable).** With
+`memory.max` and `memory.swap.max=0` set on the parent and `memory.oom.group=1`,
+a workload that commits past the ceiling is killed by the kernel's OOM killer,
+which sends SIGKILL to the workspace's whole process group. Measured: a single
+200 MB allocation in a 128 MB workspace exited nsjail with code **137** and the
+parent's `memory.events` recorded `oom_kill 2`, `oom_group_kill 1`, `max 37`.
+`memory.oom.group=1` is worth setting: without it an OOM kills one process inside
+the group (possibly a helper), whereas with it the whole run dies as one unit
+that the engine can attribute. **An OOM at the ceiling must not read as a clean
+`exited`**: since a `137` is also the exit an ordinary SIGKILL produces, the
+executor reads the workspace parent's cumulative `oom_kill` counter from
+`memory.events.local` **before and after** the run; an increase classifies the
+run as the new terminal status **`oom`** (distinct from `exited` and from an
+explicit `killed`). A missing counter reads as `-1` (no counter), never a
+fabricated 0, so a signal is never misreported as an OOM. The parent persists for
+the workspace's lifetime, so the counter is readable after the run.
+
+**The kill path survived the layout change (and is gated).** The engine used to
+find and reap a run's cgroup by assuming `/sys/fs/cgroup/NSJAIL.<pid>` under the
+root (`cgroupDirs`, `resolveCgroup`/`CgroupForNsjailPID`, `reapTrackedCgroup`,
+`ReapCgroup`, `untrack`, and `Kill` "prefers the run's cgroup"). Once cgroups
+stopped living under the root, run killing would have **silently degraded** to
+the process group — a `setsid()` survivor would live — which is a worse
+regression than the bug being fixed and would still pass the old gates.
+`CgroupDirOfPID` now returns the pid's **full** `/proc/<pid>/cgroup` membership
+(correct for both the nested `ws-<id>/NSJAIL.<pid>` and a legacy root-level
+`NSJAIL.<pid>`), `listNsjailCgroups` enumerates both, and `ReapOrphans` reaps
+workspace parents and stray root leaves. `scripts/spread-check.sh` and
+`scripts/process-stop-check.sh` assert that a `setsid()`-escaped process is
+**still killed** by the workspace stop — the assertion that proves the kill path
+survived.
+
+**Lifecycle.** The parent is created idempotently before every run/exec/session
+(so a workspace created before this feature, or one whose limits were `PATCH`ed,
+converges on its next use) and removed on workspace delete **after** every
+run/session/process has been stopped; a cgroup that still has processes is never
+`rmdir`'d — `cgroup.kill` is written first and the members drain. On startup
+`ReapOrphans` also removes any workspace parent left by a hard daemon death.
+
+**The nsjail-version situation.** The installed nsjail is an older build: it
+rejects `--log-level` and has no apt package, so building it from source would be
+the only way to change its behaviour. A config-level fix (one parent cgroup +
+`cgroupv2_mount`) needs **no** nsjail change, which is why it is the right
+mechanism here.
+
+**The disk reserve hole was CHECKED and is NOT a hole — do not "fix" it.**
+Suspected: the archive budget might spend ext4's 5 % reserved margin, since a
+`disk_mb: 64` workspace shows `df` size 64M but only ~57M *available* (measured:
+`total − f_bavail` = 7.6 MB while only 90 KB is used). The call path was checked
+before asserting anything: `internal/archive/extract.go` writes through a `Sink`
+interface, `internal/service/archive.go` supplies the workspace `Fs`, and
+`internal/workspace/fs.go`'s `reserve()` refuses when `used+delta > diskLimit`
+with a `QuotaError` (and `isNoSpace(err)` from the fs itself maps to a
+`QuotaError`). `statvfs`/`Bavail` is **not on the archive path at all** (it is
+used only in `diskfs.go` for image/mount sizing). So an extraction's budget is
+the workspace's own allowance and a workload writing directly is bounded by the
+ext4 image extent: **no over-limit path, no reserve leak.** The disk mechanism is
+correct and is left alone; the ADR records this so nobody later "fixes" a correct
+mechanism. (`MountedDiskUsed` still reports **used** as `total − f_bfree`, which
+equals `df`; the USED figure and the BUDGET are different quantities, and the
+budget is the workspace's own allowance.)
+
+**Proof.** Unit tests in `internal/executor` (the parent path derivation, the
+delegation/limit writes, the OOM-counter parse), `internal/workspace` (the quota
+boundary: exactly-at-the-limit and one-block-over), and `internal/metrics` (the
+sum with the enforced ceiling, `ram_used <= ram_limit`, the parent `memory.max`
+read); plus `scripts/spread-check.sh`, which drives the REAL service, real
+nsjail and a real FUSE disk and asserts: one parent cgroup per workspace with the
+delegated controllers; the leaf nested inside it and zero `NSJAIL.*` at the root;
+three concurrent runs whose SUM exceeds `memory_mb` are killed (one run of
+2 × `memory_mb` is refused, the parent records `oom_kill`, a run reads as `oom`);
+`ram_used <= ram_limit` with `ram_percent <= 100`; a `setsid()`-escaped process is
+still killed; the parent is removed on delete with nothing left behind; and the
+disk budget is the workspace's own allowance.
 
 ## Additional defaults chosen during implementation
 

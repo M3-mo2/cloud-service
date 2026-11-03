@@ -259,24 +259,26 @@ cause no pressure. Four routes:
   (`text/event-stream`), one JSON frame per tick, flushed after every frame.
 
 Each frame reports, per workspace: `ram_used_bytes`, `ram_limit_bytes`,
-`ram_cgroup_limit_bytes`, `ram_percent`, `ram_complete`, `disk_used_bytes`,
-`disk_limit_bytes`, `disk_percent`, `disk_complete`, `live_runs`,
-`live_cgroups` (and `cpu_usage_usec`/`pids_current` when `include_cpu` is on).
-Together with a `timestamp`, `interval_seconds`, and the `sampler` counters
-(`ticks`, `cgroup_reads`, `statfs_reads`, `tree_walk_reads`, `subscribers`,
-`running`, `dropped_frames`, `candidates`).
+`ram_percent`, `ram_complete`, `disk_used_bytes`, `disk_limit_bytes`,
+`disk_percent`, `disk_complete`, `live_runs`, `live_cgroups` (and
+`cpu_usage_usec`/`pids_current` when `include_cpu` is on). Together with a
+`timestamp`, `interval_seconds`, and the `sampler` counters (`ticks`,
+`cgroup_reads`, `statfs_reads`, `tree_walk_reads`, `subscribers`, `running`,
+`dropped_frames`, `candidates`).
 
 The design is fixed by measurement (see [docs/DECISIONS.md](DECISIONS.md)
-ADR 93): disk comes from a single **`statfs`** (O(1), ~1.7 µs), never a tree
-walk (153 µs/file); RAM is the **SUM** over the workspace's per-run **and**
-per-session cgroups (the cgroup is per run, not per workspace); **one**
-service-wide sampler starts on the first subscriber and stops on the last;
-sampling happens **once per tick** and is fanned out, so cost is independent of
-the subscriber count; an idle workspace (no live cgroup) costs **zero** cgroup
-reads and reports RAM 0; each stream holds at most **one pending frame**
-(coalesce, never queue; drops are counted); and `?interval=` is clamped to a
-configured **floor** (below it → `422`). The whole feature is gated on
-`metrics.enabled` and advertised in `GET /v1/meta`.
+ADR 93 and ADR 94): disk comes from a single **`statfs`** (O(1), ~1.7 µs), never
+a tree walk (153 µs/file); RAM is the **SUM** over the workspace's per-run
+**and** per-session leaf cgroups, but every leaf lives inside ONE
+**per-workspace parent** cgroup whose `memory.max` is the ENFORCED ceiling (so
+`ram_limit_bytes` is the parent's `memory.max` and `ram_used_bytes <=
+ram_limit_bytes` always holds); **one** service-wide sampler starts on the first
+subscriber and stops on the last; sampling happens **once per tick** and is
+fanned out, so cost is independent of the subscriber count; an idle workspace (no
+live cgroup) costs **zero** cgroup reads and reports RAM 0; each stream holds at
+most **one pending frame** (coalesce, never queue; drops are counted); and
+`?interval=` is clamped to a configured **floor** (below it → `422`). The whole
+feature is gated on `metrics.enabled` and advertised in `GET /v1/meta`.
 
 ### 2.3 Files (per workspace)
 
@@ -455,11 +457,13 @@ its `output` readable.
 Run JSON:
 
 ```json
-{"id":"run_...","workspace_id":"ws_...","kind":"file|command","argv":[...],"cwd":"/","status":"queued|running|exited|killed|timeout|failed|interrupted","exit_code":0,"timeout_sec":300,"unlimited":false,"interpreter":"python3","started_at":"...","ended_at":"...","logs":{"stdout_bytes":0,"stderr_bytes":0,"truncated":false}}
+{"id":"run_...","workspace_id":"ws_...","kind":"file|command","argv":[...],"cwd":"/","status":"queued|running|exited|killed|timeout|failed|interrupted|oom","exit_code":0,"timeout_sec":300,"unlimited":false,"interpreter":"python3","started_at":"...","ended_at":"...","logs":{"stdout_bytes":0,"stderr_bytes":0,"truncated":false}}
 ```
 
 `cwd` is always present. `timeout_sec` is `null` exactly when `unlimited` is
 `true`. `interpreter` is present for a `kind=file` run and omitted otherwise.
+`status: "oom"` marks a run the kernel's OOM killer ended at the workspace's
+memory ceiling — distinct from a clean `exited` and from an explicit `killed`.
 
 **`POST /exec` does not create a run record.** Only the asynchronous
 `POST .../runs` persists a `Run`; `exec` returns its output inline and leaves no
@@ -468,7 +472,7 @@ auditable record must use `runs`.
 
 **Listing is filtered and paginated.** `GET .../runs` accepts `status`
 (repeatable or comma-separated; each value must be one of
-`queued,running,exited,killed,timeout,failed,interrupted`, else `400`), `kind`
+`queued,running,exited,killed,timeout,failed,interrupted,oom`, else `400`), `kind`
 (`file` or `command`, else `400`), `limit` (`0`/absent means all remaining) and
 `offset` (default 0). It returns newest-first and includes `total` (the count of
 runs matching the filter **before** pagination) so offset pagination is

@@ -20,6 +20,11 @@ sandbox:
   kill_grace_sec: 3
 
 # Default per-workspace resource limits (overridable per workspace).
+# cpu_cores, memory_mb and max_runs are enforced by ONE cgroup per WORKSPACE: a
+# parent cgroup (ws-<id>) whose memory.max/pids.max/cpu.max are these values.
+# nsjail is pointed at that parent, so every run's and session's leaf cgroup is
+# created inside it and the parent bounds the SUM across concurrent runs. The
+# advertised number IS the enforced number; see docs/DECISIONS.md ADR 94.
 limits:
   cpu_cores: 1
   memory_mb: 512
@@ -401,9 +406,10 @@ archives:
 #   * disk comes from ONE statfs (O(1), ~1.7us), NEVER a directory tree walk
 #     (153us PER FILE, 82x worse); the existing Service.Usage() walk is never on
 #     the sampling path;
-#   * a workspace's RAM is the SUM over its per-run AND per-session cgroups (the
-#     cgroup is per run, not per workspace); memory.max is a PER-RUN ceiling, so
-#     the advertised memory_mb does not cap a workspace with several runs;
+#   * a workspace's RAM is the SUM over its per-run AND per-session leaf cgroups;
+#     every leaf lives inside ONE per-workspace parent cgroup (ws-<id>) whose
+#     memory.max is the workspace's memory_mb, so the advertised ceiling IS the
+#     enforced ceiling (ram_used <= ram_limit always holds; see ADR 94);
 #   * ONE service-wide sampler goroutine starts on the first subscriber and stops
 #     on the last, so a service nobody watches costs exactly zero;
 #   * it samples ONCE per tick and fans out, so cost is independent of the number

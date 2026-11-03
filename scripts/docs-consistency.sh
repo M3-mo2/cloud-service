@@ -545,6 +545,81 @@ else
   fail "metrics.meta-advertised" "GET /v1/meta does not advertise the metrics capability"
 fi
 
+# --- 4d-septies. the per-WORKSPACE ceiling mechanism and its harness ----------
+# The workspace's RAM/CPU/pids ceiling must be per WORKSPACE (one parent cgroup,
+# limits on the parent, nsjail pointed at it), not per run. This block pins the
+# mechanism, the ADR, the new `oom` run status, the dropped contradictory limit
+# field, and the spread-check harness -- so none can silently regress.
+if grep -qF 'ADR 94' docs/DECISIONS.md; then
+  ok "ceiling.adr"
+else
+  fail "ceiling.adr" "docs/DECISIONS.md is missing ADR 94 (per-workspace resource ceiling)"
+fi
+if grep -qF 'WorkspaceCgroupPrefix' internal/executor/cgroup.go && \
+   grep -qF 'cgroupv2_mount' configs/nsjail_python.cfg.tmpl && \
+   grep -qF 'cgroupv2_mount' internal/executor/nsjail.go; then
+  ok "ceiling.parent-cgroup"
+else
+  fail "ceiling.parent-cgroup" "the per-workspace parent cgroup / cgroupv2_mount mechanism is missing"
+fi
+if grep -qF 'EnsureWorkspaceCgroup' internal/executor/cgroup.go && \
+   grep -qF 'RemoveWorkspaceCgroup' internal/executor/cgroup.go; then
+  ok "ceiling.parent-lifecycle"
+else
+  fail "ceiling.parent-lifecycle" "the workspace parent cgroup lifecycle (create/remove) is missing"
+fi
+if grep -qE 'RunOOM[[:space:]]+RunStatus = "oom"' internal/model/types.go && \
+   grep -qF 'RunOOM' internal/service/runs.go; then
+  ok "ceiling.oom-status"
+else
+  fail "ceiling.oom-status" "the distinct `oom` run status is missing from the model or the run classifier"
+fi
+if grep -qF 'oom' api/openapi.yaml && grep -qF 'interrupted, oom' api/openapi.yaml; then
+  ok "ceiling.oom-documented"
+else
+  fail "ceiling.oom-documented" "the `oom` run status is not in the openapi run-status enum"
+fi
+if ! grep -qF 'ram_cgroup_limit_bytes' internal/metrics/metrics.go; then
+  ok "ceiling.no-contradictory-limit"
+else
+  fail "ceiling.no-contradictory-limit" "ram_cgroup_limit_bytes (the contradictory second limit) is still present"
+fi
+if grep -qF 'ram_limit_bytes' docs/API.md && grep -qiF 'enforced' docs/API.md; then
+  ok "ceiling.ram-limit-documented"
+else
+  fail "ceiling.ram-limit-documented" "ram_limit_bytes is not documented as the ENFORCED ceiling in docs/API.md"
+fi
+if [ -f scripts/spread-check.sh ]; then
+  ok "ceiling-harness.exists"
+else
+  fail "ceiling-harness.exists" "scripts/spread-check.sh is missing"
+fi
+if [ -x scripts/spread-check.sh ]; then
+  ok "ceiling-harness.executable"
+else
+  fail "ceiling-harness.executable" "scripts/spread-check.sh is not executable"
+fi
+if grep -qF 'spread-check.sh' docs/VERIFICATION.md; then
+  ok "ceiling-harness.documented"
+else
+  fail "ceiling-harness.documented" "docs/VERIFICATION.md does not mention scripts/spread-check.sh"
+fi
+if grep -qE '^spread-check:' Makefile; then
+  ok "makefile.target.spread-check"
+else
+  fail "makefile.target.spread-check" "Makefile has no 'spread-check:' target"
+fi
+if grep -qE 'bash scripts/spread-check.sh' Makefile; then
+  ok "makefile.sudo.spread-check"
+else
+  fail "makefile.sudo.spread-check" "Makefile's 'spread-check' target does not run scripts/spread-check.sh"
+fi
+if grep -qE '^\.PHONY:.*\bspread-check\b' Makefile; then
+  ok "makefile.phony.spread-check"
+else
+  fail "makefile.phony.spread-check" "'spread-check' is not in .PHONY"
+fi
+
 # The masking shim source and the embedded artifact must both be present, so a
 # stale or missing .so cannot silently disable the mask.
 if [ -f internal/executor/hostmask/hostmask.c ]; then

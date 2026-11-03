@@ -3,7 +3,7 @@ PKG := ./...
 GO ?= go
 CC ?= cc
 
-.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check identity-check egress-decoy-check subscription-check archive-check metrics-check docs-check
+.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check spread-check tunnel-check identity-check egress-decoy-check subscription-check archive-check metrics-check docs-check
 
 all: fmt vet shim build test
 
@@ -77,6 +77,19 @@ session-check:
 # after a forced daemon death + restart.
 process-check:
 	sudo -E bash scripts/process-stop-check.sh
+
+# Per-WORKSPACE resource-ceiling acceptance against REAL nsjail and a REAL FUSE
+# disk on the host (needs root, no container). It asserts the mechanism that
+# makes a workspace a server-shaped thing with ITS OWN quota: one parent cgroup
+# per workspace with the delegated controllers, a run's leaf cgroup nested
+# inside it and zero NSJAIL.* at the root, the SUM across three concurrent runs
+# bounded by the advertised memory_mb (a single 2x memory_mb allocation is
+# OOM-killed and reads as `oom`, never a clean `exited`), ram_used <= ram_limit
+# with ram_percent <= 100, the setsid()-escape kill path still working, the
+# parent cgroup removed on delete, and the disk budget still the workspace's own
+# allowance.
+spread-check:
+	sudo -E bash scripts/spread-check.sh
 
 # Per-workspace egress and quick-tunnel acceptance against REAL nsjail,
 # slirp4netns and cloudflared on the host (needs root, no container). It asserts

@@ -1929,22 +1929,21 @@ components:
         sampler: { $ref: "#/components/schemas/MetricsCounters" }
     WorkspaceMetrics:
       type: object
-      required: [workspace_id, ram_used_bytes, ram_limit_bytes, ram_cgroup_limit_bytes, ram_percent, ram_complete, disk_used_bytes, disk_limit_bytes, disk_percent, disk_complete, live_runs, live_cgroups]
+      required: [workspace_id, ram_used_bytes, ram_limit_bytes, ram_percent, ram_complete, disk_used_bytes, disk_limit_bytes, disk_percent, disk_complete, live_runs, live_cgroups]
       properties:
         workspace_id: { type: string }
         ram_used_bytes:
           type: integer
           format: int64
-          description: "SUM of memory.current over the live run AND session cgroups."
+          description: "SUM of memory.current over the live run AND session cgroups. The kernel enforces this SUM at the workspace's parent cgroup, so it can never exceed ram_limit_bytes."
         ram_limit_bytes:
           type: integer
           format: int64
-          description: "The workspace's configured allowance (memory_mb), stable whether or not a cgroup is live."
-        ram_cgroup_limit_bytes:
-          type: integer
-          format: int64
-          description: "SUM of the live cgroups' memory.max (the ceiling actually enforced). It can exceed ram_limit_bytes because the cgroup is per run."
-        ram_percent: { type: number, format: float }
+          description: "The workspace's ENFORCED ceiling: the parent cgroup's memory.max (memory_mb bytes), read from the kernel while a run or session is live. It is the number the tenant is advertised AND the number the kernel enforces."
+        ram_percent:
+          type: number
+          format: float
+          description: "ram_used_bytes / ram_limit_bytes * 100. Because the ceiling is enforced this never exceeds 100."
         ram_complete:
           type: boolean
           description: "false when a cgroup read failed, making ram_used_bytes a lower bound."
@@ -2244,7 +2243,8 @@ components:
         unlimited: { type: boolean, description: "True when the run has no wall-clock limit." }
         status:
           type: string
-          enum: [queued, running, exited, killed, timeout, failed, interrupted]
+          enum: [queued, running, exited, killed, timeout, failed, interrupted, oom]
+          description: "`oom` is a run the kernel's OOM killer ended at the workspace's memory ceiling; it is distinct from a clean `exited` and from an explicit `killed`."
         exit_code: { type: [integer, "null"] }
         started_at: { type: string, format: date-time }
         ended_at: { type: string, format: date-time }
