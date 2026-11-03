@@ -731,7 +731,7 @@ if grep -qE '^\.PHONY:.*\bports-check\b' Makefile; then
 else
   fail "makefile.phony.ports-check" "'ports-check' is not in .PHONY"
 fi
-if grep -qF 'PortsConfig struct' internal/config/config.go && grep -qF 'Ports PortsConfig' internal/config/config.go; then
+if grep -qF 'PortsConfig struct' internal/config/config.go && grep -qE 'Ports +PortsConfig' internal/config/config.go; then
   ok "ports.config"
 else
   fail "ports.config" "the config.PortsConfig type / Ports field is missing from internal/config/config.go"
