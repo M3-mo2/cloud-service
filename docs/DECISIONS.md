@@ -1522,7 +1522,9 @@ layer, not a security boundary.** It removes the problem for casual discovery.
 It is defeated by a tenant who controls their own endpoint, because the address
 is decided by whoever exits to the internet, and no host-side interception can
 change that. It is stated here first so no later sentence implies a stronger
-guarantee:
+guarantee. Stated plainly and without line breaks: this is a decoy layer, not a security boundary.
+
+The specific limits, in order of importance:
 
 1. **A tenant's own endpoint defeats it entirely.** `ssh user@their-server`,
    `curl https://their-server/`, `nc their-server 9999`, `ping their-server`,
