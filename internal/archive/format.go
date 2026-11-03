@@ -13,6 +13,12 @@ import (
 // Format names a supported archive container.
 type Format string
 
+// BuildMarker is an opaque string embedded in the binary and logged at startup.
+// An acceptance harness greps the built binary for it as a positive control,
+// proving the tested artifact is a fresh build of the intended commit. It names
+// no engine.
+const BuildMarker = "zcp-archive-native-v0.0.19"
+
 // Supported formats.
 const (
 	FormatZip Format = "zip"

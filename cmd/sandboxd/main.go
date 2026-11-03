@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"sandboxd/internal/api"
+	"sandboxd/internal/archive"
 	"sandboxd/internal/auth"
 	"sandboxd/internal/config"
 	"sandboxd/internal/decoy"
@@ -152,12 +153,14 @@ func main() {
 	// with no in-memory counters. It is a no-op when subscription.enabled is
 	// false; a workspace without a subscription is never touched.
 	svc.StartReaper()
-	// The opaque build marker lands in the binary so the subscription acceptance
-	// harness can `strings` it and prove the tested artifact is a fresh build of
-	// the intended commit (a positive control against a stale binary). It names
-	// no engine internals and is only ever written to the operator's log.
+	// The opaque build markers land in the binary so each acceptance harness can
+	// `strings` it and prove the tested artifact is a fresh build of the
+	// intended commit (a positive control against a stale binary). They name no
+	// engine internals and are only ever written to the operator's log.
 	logger.Info("subscription reaper configured", "build_marker", service.ReaperMarker,
 		"enabled", cfg.Subscription.Enabled)
+	logger.Info("native archive support configured", "build_marker", archive.BuildMarker,
+		"enabled", cfg.Archives.Enabled, "formats", cfg.Archives.Formats)
 	authn := auth.New(cfg.Keys)
 	server := api.NewServer(svc, authn, logger)
 
