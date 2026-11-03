@@ -185,12 +185,13 @@ type DecoyConfig struct {
 	Country string `koanf:"country"`
 	Region  string `koanf:"region"`
 	RDNS    string `koanf:"rdns"`
-	// ResolverPort / HTTPPort / HTTPSPort / DOTPort are the in-namespace ports
-	// the stubs bind; the nft rules redirect 53/80/443/853 to them.
+	// ResolverPort / HTTPPort / HTTPSPort are the in-namespace ports the stubs
+	// bind; the nft rules redirect 53/80/443/853 to them. (DNS-over-TLS is
+	// answered on HTTPSPort, which distinguishes a DNS-over-TLS frame from
+	// HTTP, so no separate port is needed.)
 	ResolverPort int `koanf:"resolver_port"`
 	HTTPPort     int `koanf:"http_port"`
 	HTTPSPort    int `koanf:"https_port"`
-	DOTPort      int `koanf:"dot_port"`
 	// ExtraHosts / ExtraPatterns add hostnames or regular expressions to the
 	// intercepted set (the built-in shape patterns already cover the common
 	// services and invented variants).
@@ -445,7 +446,6 @@ func DefaultDecoy() DecoyConfig {
 		ResolverPort:  15353,
 		HTTPPort:      18080,
 		HTTPSPort:     18443,
-		DOTPort:       18853,
 		ExtraHosts:    nil,
 		ExtraPatterns: nil,
 	}
@@ -724,9 +724,6 @@ func (c *Config) applyDefaults() {
 	if dec.HTTPSPort <= 0 || dec.HTTPSPort > 65535 {
 		dec.HTTPSPort = dd.HTTPSPort
 	}
-	if dec.DOTPort <= 0 || dec.DOTPort > 65535 {
-		dec.DOTPort = dd.DOTPort
-	}
 	tun := &c.Tunnels
 	if tun.MaxPerWorkspace <= 0 {
 		tun.MaxPerWorkspace = d.Tunnels.MaxPerWorkspace
@@ -824,7 +821,6 @@ network:
     resolver_port: 15353
     http_port: 18080
     https_port: 18443
-    dot_port: 18853
     extra_hosts: []
     extra_patterns: []
 tunnels:

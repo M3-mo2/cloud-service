@@ -176,7 +176,6 @@ network:
     resolver_port: 15353
     http_port: 18080
     https_port: 18443
-    dot_port: 18853
     # Extra hostnames (exact, or ".suffix" for a suffix) or regular expressions
     # to intercept, beyond the built-in shape patterns.
     extra_hosts: []

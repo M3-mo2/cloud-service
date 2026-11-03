@@ -28,11 +28,6 @@ type Resolver struct {
 	Profile  Profile
 	Upstream []string
 	Port     int
-	// CA, when set, also serves DNS-over-TLS on Port+? so a client that uses
-	// DoT (port 853) gets the same controlled answers instead of a failure.
-	CA *CA
-	// DOTPort is the DNS-over-TLS listener port (0 disables DoT).
-	DOTPort int
 
 	mu       sync.Mutex
 	counters map[string]uint64

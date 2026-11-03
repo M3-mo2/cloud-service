@@ -1775,7 +1775,7 @@ security boundary**; see [EGRESS-DECOY.md](EGRESS-DECOY.md) and
 
 `scripts/egress-decoy-check.sh` runs the real service against the host's real
 nsjail and slirp4netns with the decoy ON and asserts, from inside a real
-workspace. **This session: `57 passed / 0 failed / 0 skipped`** (the decoy-on
+workspace. **This session: `58 passed / 0 failed / 0 skipped`** (the decoy-on
 service was built from this commit; the running binary was md5-checked against a
 fresh `go build`).
 
