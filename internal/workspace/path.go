@@ -72,6 +72,13 @@ func cleanRelative(userPath string) (string, error) {
 	return strings.Join(stack, "/"), nil
 }
 
+// CleanRelative exposes cleanRelative so archive extraction validates EVERY
+// entry through the SAME machinery the API file paths use -- never a second,
+// weaker validator. See docs/DECISIONS.md ADR 92. It strips leading slashes,
+// normalises backslashes to slashes, resolves interior `..` that stays inside,
+// and returns errTraversal (reported by IsUnsafe) for a climb above the root.
+func CleanRelative(userPath string) (string, error) { return cleanRelative(userPath) }
+
 // within reports whether target is inside (or equal to) root.
 func within(root, target string) bool {
 	rel, err := filepath.Rel(root, target)

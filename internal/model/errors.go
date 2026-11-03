@@ -92,6 +92,43 @@ const (
 	// supplies an absolute expires_at EARLIER than a still-live term. The engine
 	// never silently shortens a paid term.
 	CodeSubscriptionWouldShorten = "subscription_would_shorten"
+
+	// Archive extraction refusal codes. They are STABLE and documented (see
+	// docs/API.md, docs/DECISIONS.md ADR 92). Every archive operation refuses
+	// with one of these rather than a generic error, so a client can act on it
+	// and the safety rules stay inspectable. Archive handling lives only in the
+	// engine (internal/archive); no shell tool is invoked, so the refusals are
+	// deterministic and identical on every host.
+
+	// CodeUnsupportedArchive is returned (HTTP 415) when the uploaded/selected
+	// archive's CONTENT (magic bytes) matches no supported format. The detected
+	// signature is named in the details; the filename is never trusted.
+	CodeUnsupportedArchive = "unsupported_archive"
+	// CodeArchiveEncrypted is returned (HTTP 422) when the archive is encrypted
+	// (ZIP general-purpose flag bit 0, or a RAR archive/entry that needs a
+	// password). The engine holds no password, so emitting possibly-garbage
+	// plaintext is never an option.
+	CodeArchiveEncrypted = "archive_encrypted"
+	// CodeArchiveMultivolume is returned (HTTP 422) when a RAR archive declares
+	// itself multi-volume (partN.rar): the engine extracts single-volume
+	// archives only, so it refuses rather than truncating silently.
+	CodeArchiveMultivolume = "archive_multivolume"
+	// CodeArchiveTooLarge is returned (HTTP 413) when the archive's total
+	// uncompressed size exceeds archives.max_total_mb.
+	CodeArchiveTooLarge = "archive_too_large"
+	// CodeArchiveTooManyEntries is returned (HTTP 413) when the archive holds
+	// more entries than archives.max_entries.
+	CodeArchiveTooManyEntries = "archive_too_many_entries"
+	// CodeArchiveRatioExceeded is returned (HTTP 413) when an entry's
+	// uncompressed/compressed ratio exceeds archives.max_ratio (a bomb guard).
+	CodeArchiveRatioExceeded = "archive_ratio_exceeded"
+	// CodeArchiveUnsafeEntry is returned (HTTP 422) when an entry name escapes
+	// the destination (traversal, absolute, drive letter, escaping symlink or
+	// hardlink, or an unsafe collision).
+	CodeArchiveUnsafeEntry = "archive_unsafe_entry"
+	// CodeArchiveEntryExists is returned (HTTP 409) when an entry would
+	// overwrite an existing file and overwrite is false.
+	CodeArchiveEntryExists = "archive_entry_exists"
 )
 
 // Error is the canonical API error, carrying an HTTP mapping and a code.

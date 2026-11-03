@@ -88,6 +88,9 @@ func (s *Server) Router() http.Handler {
 				r.Post("/files/mkdir", s.handleMkdir)
 				r.Post("/files/rename", s.handleRename)
 				r.Post("/files/upload", s.handleUpload)
+				r.Post("/files/archive", s.handleUploadArchive)
+				r.Post("/files/extract", s.handleExtractArchive)
+				r.Get("/files/archive", s.handleExportArchive)
 
 				r.Post("/exec", s.handleExec)
 

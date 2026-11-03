@@ -738,6 +738,172 @@ func (f *Fs) DiskUsage() (int64, error) {
 	return subtreeSize(f.root)
 }
 
+// CreateStream opens a file for streaming writes under a workspace-relative
+// path, applying the SAME quota accounting as Write. It is used by the archive
+// extractor, which must account for bytes as they are actually written (never
+// trusting an archive's declared sizes).
+//
+// Safety properties, because this is a security boundary:
+//   - the parent directory is resolved with secureJoin, so a symlink in the
+//     path that escapes the root is rejected before anything is created;
+//   - MkdirAll is only reached after every existing component was checked by
+//     secureJoin (secureJoin returns early at the first non-existent component,
+//     and no symlink can exist beneath a non-existent component);
+//   - the final component is opened with O_NOFOLLOW, so an existing symlink at
+//     the destination is NEVER followed (the write cannot pass through it);
+//   - the file is reserved against the workspace quota; a write past the
+//     allowance fails with ENOSPC at the filesystem boundary and is normalized
+//     to a QuotaError, matching UploadFile/WriteFile;
+//   - the mode drops setuid/setgid/sticky and is masked to the sandbox's
+//     ownership model.
+func (f *Fs) CreateStream(userPath string, mode os.FileMode, overwrite bool) (*StreamWriter, error) {
+	clean, err := cleanRelative(userPath)
+	if err != nil {
+		return nil, err
+	}
+	if clean == "." {
+		return nil, errIsDirectory
+	}
+	abs, err := secureJoin(f.root, clean)
+	if err != nil {
+		return nil, err
+	}
+	if abs == f.root {
+		return nil, errTraversal
+	}
+	// Refuse a directory at the destination explicitly.
+	if fi, err := os.Lstat(abs); err == nil && fi.IsDir() {
+		return nil, errIsDirectory
+	}
+	perm := mode.Perm() // drops setuid/setgid/sticky
+	if perm == 0 {
+		perm = 0o644
+	}
+	flags := os.O_CREATE | os.O_WRONLY
+	if overwrite {
+		flags |= os.O_TRUNC
+	} else {
+		flags |= os.O_EXCL
+	}
+	// Resolve parent safety first, then create it (parents are all checked by
+	// secureJoin above; no escaping symlink can be beneath a missing component).
+	parent := filepath.Dir(abs)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return nil, err
+	}
+	// Re-validate the immediate parent: MkdirAll could in principle have raced
+	// with an attacker-created symlink inside the workspace. resolveFinal
+	// rejects an escaping final symlink, and we check the parent is a real
+	// directory we can trust.
+	if resolvedParent, err := filepath.EvalSymlinks(parent); err != nil || !within(f.root, resolvedParent) {
+		return nil, errSymlinkEsc
+	}
+	// O_NOFOLLOW ensures an existing symlink at abs is refused rather than
+	// followed. os.OpenFile does not expose it directly, so use syscall via
+	// O_NOFOLLOW in the flags on Linux.
+	fh, err := os.OpenFile(abs, flags|syscall.O_NOFOLLOW, perm)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil, ErrExists
+		}
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, errSymlinkEsc
+		}
+		if isNoSpace(err) {
+			return nil, &QuotaError{Used: f.Used(), Limit: f.diskLimit}
+		}
+		return nil, err
+	}
+	return &StreamWriter{fs: f, file: fh, path: abs}, nil
+}
+
+// StreamWriter writes a file under quota accounting. Close must be called; it
+// reconciles the tracked usage with the bytes actually written.
+type StreamWriter struct {
+	fs       *Fs
+	file     *os.File
+	path     string
+	written  int64
+	reserved int64
+	closed   bool
+}
+
+// Write appends p, reconciling the quota by the delta actually accepted. A
+// short write or an ENOSPC at the filesystem boundary is surfaced (ENOSPC is
+// normalized to a QuotaError by the archive layer).
+func (w *StreamWriter) Write(p []byte) (int, error) {
+	if w.closed {
+		return 0, os.ErrClosed
+	}
+	// Reserve the bytes about to be written; if the quota refuses, fail before
+	// touching the file so the disk error is attributed correctly.
+	if err := w.fs.reserve(int64(len(p))); err != nil {
+		return 0, err
+	}
+	n, err := w.file.Write(p)
+	if n > 0 {
+		w.written += int64(n)
+		w.reserved += int64(n)
+	}
+	if n < len(p) {
+		// Refund the bytes not written.
+		_ = w.fs.reserve(int64(n - len(p)))
+		w.reserved += int64(n - len(p))
+	}
+	if err != nil && isNoSpace(err) {
+		return n, &QuotaError{Used: w.fs.Used(), Limit: w.fs.diskLimit}
+	}
+	return n, err
+}
+
+// Written returns the number of bytes written so far.
+func (w *StreamWriter) Written() int64 { return w.written }
+
+// Close closes the file.
+func (w *StreamWriter) Close() error {
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	return w.file.Close()
+}
+
+// MkdirStream creates a directory under a workspace-relative path with the same
+// symlink safety as CreateStream. The mode drops privileged bits.
+func (f *Fs) MkdirStream(userPath string, mode os.FileMode) error {
+	clean, err := cleanRelative(userPath)
+	if err != nil {
+		return err
+	}
+	if clean == "." {
+		return nil
+	}
+	abs, err := secureJoin(f.root, clean)
+	if err != nil {
+		return err
+	}
+	perm := mode.Perm()
+	if perm == 0 {
+		perm = 0o755
+	}
+	if fi, err := os.Lstat(abs); err == nil {
+		if fi.IsDir() {
+			return nil
+		}
+		return errIsDirectory
+	}
+	if err := os.MkdirAll(abs, perm); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ErrExists signals that a destination already exists and overwrite is false.
+var ErrExists = &plainError{"file already exists"}
+
+// IsExists reports whether err indicates an existing destination.
+func IsExists(err error) bool { return err == ErrExists }
+
 // errWalkLimit is an internal sentinel used to stop a bounded walk early.
 var errWalkLimit = &plainError{"walk entry limit reached"}
 

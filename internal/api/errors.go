@@ -6,10 +6,29 @@ import (
 	"errors"
 	"net/http"
 
+	"sandboxd/internal/archive"
 	"sandboxd/internal/executor"
 	"sandboxd/internal/model"
 	"sandboxd/internal/workspace"
 )
+
+// archiveStatus maps a stable archive refusal code to its documented HTTP
+// status. It is the single place the statuses live, so the API, the gate and
+// the OpenAPI spec cannot drift.
+func archiveStatus(code string) int {
+	switch code {
+	case model.CodeUnsupportedArchive:
+		return http.StatusUnsupportedMediaType // 415
+	case model.CodeArchiveTooLarge, model.CodeArchiveTooManyEntries, model.CodeArchiveRatioExceeded:
+		return http.StatusRequestEntityTooLarge // 413
+	case model.CodeArchiveEntryExists:
+		return http.StatusConflict // 409
+	case model.CodeArchiveEncrypted, model.CodeArchiveMultivolume, model.CodeArchiveUnsafeEntry:
+		return http.StatusUnprocessableEntity // 422
+	default:
+		return http.StatusUnprocessableEntity
+	}
+}
 
 // errorEnvelope is the standard JSON error body.
 type errorEnvelope struct {
@@ -53,6 +72,10 @@ func mapError(err error) *model.Error {
 	var apiErr *model.Error
 	if errors.As(err, &apiErr) {
 		return apiErr
+	}
+	var arcErr *archive.Error
+	if errors.As(err, &arcErr) {
+		return model.Wrap(archiveStatus(arcErr.Code), arcErr.Code, arcErr.Message, arcErr.Details)
 	}
 	var qe *workspace.QuotaError
 	if errors.As(err, &qe) {

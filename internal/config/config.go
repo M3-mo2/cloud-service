@@ -27,6 +27,7 @@ type Config struct {
 	Profiles     ProfilesConfig     `koanf:"profiles"`
 	Disk         DiskConfig         `koanf:"disk"`
 	Subscription SubscriptionConfig `koanf:"subscription"`
+	Archives     ArchivesConfig     `koanf:"archives"`
 	Keys         []KeyConfig        `koanf:"keys"`
 }
 
@@ -76,6 +77,64 @@ func (c SubscriptionConfig) DefaultDurationValue() (time.Duration, bool, error) 
 		return 0, false, err
 	}
 	return d, true, nil
+}
+
+// ArchivesConfig controls native archive handling (upload-and-extract, in-place
+// extract, and directory export). Every key is defaulted so nothing changes
+// unless an operator uses it. Extraction is performed IN GO (stdlib archive/zip
+// and github.com/nwaples/rardecode/v2); no shell tool is ever invoked, because
+// this host has no RAR tool and the trust boundary must live in the engine.
+//
+// The caps here are a CEILING; the workspace's own filesystem allowance is the
+// real floor (a write past it fails with ENOSPC and is reported as a disk
+// error). See docs/DECISIONS.md ADR 92.
+type ArchivesConfig struct {
+	// Enabled is the server-level switch. Default true. When false every
+	// /files/archive, /files/extract and GET /files/archive request is refused
+	// with 422 unprocessable (archives disabled).
+	Enabled bool `koanf:"enabled"`
+	// MaxEntries caps how many entries one extraction may contain. Default 20000.
+	MaxEntries int `koanf:"max_entries"`
+	// MaxTotalMB caps the total uncompressed bytes written across an archive,
+	// enforced by a STREAMING budget so a lying header cannot overshoot.
+	// Default 2048.
+	MaxTotalMB int `koanf:"max_total_mb"`
+	// MaxFileMB caps a single entry's uncompressed size. Default 512.
+	MaxFileMB int `koanf:"max_file_mb"`
+	// MaxRatio caps the uncompressed/compressed ratio of an entry (a bomb
+	// guard). Default 200.
+	MaxRatio int `koanf:"max_ratio"`
+	// UploadMB is the multipart archive upload cap. It is SEPARATE from
+	// caps.upload_mb so an operator can size them independently. Default 50.
+	UploadMB int `koanf:"upload_mb"`
+	// Overwrite is the default collision policy: false (the default) refuses to
+	// clobber an existing file with 409 archive_entry_exists.
+	Overwrite bool `koanf:"overwrite"`
+	// SkipJunk skips macOS resource-fork / metadata entries (__MACOSX/... and
+	// .DS_Store) by default. Default true.
+	SkipJunk bool `koanf:"skip_junk"`
+	// Formats is the allowlist of archive formats. An operator can disable one
+	// (e.g. only ["zip"]). Default ["zip","rar"].
+	Formats []string `koanf:"formats"`
+}
+
+// MaxTotalBytes returns the total uncompressed budget in bytes.
+func (a ArchivesConfig) MaxTotalBytes() int64 { return int64(a.MaxTotalMB) * 1024 * 1024 }
+
+// MaxFileBytes returns the single-entry uncompressed cap in bytes.
+func (a ArchivesConfig) MaxFileBytes() int64 { return int64(a.MaxFileMB) * 1024 * 1024 }
+
+// UploadBytes returns the archive upload cap in bytes.
+func (a ArchivesConfig) UploadBytes() int64 { return int64(a.UploadMB) * 1024 * 1024 }
+
+// FormatEnabled reports whether the named format ("zip" or "rar") is allowed.
+func (a ArchivesConfig) FormatEnabled(name string) bool {
+	for _, f := range a.Formats {
+		if f == name {
+			return true
+		}
+	}
+	return false
 }
 
 // MaxDurationValue parses max_duration, defaulting to 365d when empty.
@@ -670,6 +729,17 @@ func Default() Config {
 			GracePeriod:     "168h",
 			ReapInterval:    "60s",
 		},
+		Archives: ArchivesConfig{
+			Enabled:    true,
+			MaxEntries: 20000,
+			MaxTotalMB: 2048,
+			MaxFileMB:  512,
+			MaxRatio:   200,
+			UploadMB:   50,
+			Overwrite:  false,
+			SkipJunk:   true,
+			Formats:    []string{"zip", "rar"},
+		},
 		Keys: []KeyConfig{},
 	}
 }
@@ -901,6 +971,28 @@ func (c *Config) applyDefaults() {
 	if c.Subscription.ReapInterval == "" {
 		c.Subscription.ReapInterval = d.Subscription.ReapInterval
 	}
+	// Archives: numeric caps and the format allowlist default when unset.
+	// enabled / overwrite / skip_junk are deliberately NOT touched here: their
+	// defaults live in rawDefaults so an explicit `false` survives.
+	arc := &c.Archives
+	if arc.MaxEntries <= 0 {
+		arc.MaxEntries = d.Archives.MaxEntries
+	}
+	if arc.MaxTotalMB <= 0 {
+		arc.MaxTotalMB = d.Archives.MaxTotalMB
+	}
+	if arc.MaxFileMB <= 0 {
+		arc.MaxFileMB = d.Archives.MaxFileMB
+	}
+	if arc.MaxRatio <= 0 {
+		arc.MaxRatio = d.Archives.MaxRatio
+	}
+	if arc.UploadMB <= 0 {
+		arc.UploadMB = d.Archives.UploadMB
+	}
+	if len(arc.Formats) == 0 {
+		arc.Formats = d.Archives.Formats
+	}
 }
 
 func rawDefaults() []byte {
@@ -1007,5 +1099,15 @@ subscription:
   max_duration: "365d"
   grace_period: "168h"
   reap_interval: "60s"
+archives:
+  enabled: true
+  max_entries: 20000
+  max_total_mb: 2048
+  max_file_mb: 512
+  max_ratio: 200
+  upload_mb: 50
+  overwrite: false
+  skip_junk: true
+  formats: ["zip", "rar"]
 `)
 }
