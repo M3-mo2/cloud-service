@@ -293,6 +293,18 @@ wait_live() {
   done
   echo no
 }
+# wait_cgroups WS N SECONDS -> waits until the sampler reports >=N live cgroups
+# for the workspace. The cgroup can appear a beat after the run is running.
+wait_cgroups() {
+  local ws="$1" want="$2" secs="$3" n=""
+  local end=$(( $(date +%s) + secs ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    n=$(snap_ws_field "$ws" live_cgroups)
+    [ "${n:-0}" -ge "$want" ] && { echo yes; return; }
+    sleep 0.3
+  done
+  echo "no($n)"
+}
 
 cg_before=$(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null | wc -l | tr -d ' ')
 FUSE_BASE=$(fuse_count)
@@ -476,7 +488,13 @@ print("no")
 PY
 )
 chkbool "both sum runs reached running" "yes" "$BOTH"
-R2=$(wait_ram "$WA" above 40000000 25)
+# Wait until the SAMPLER reports BOTH cgroups live (the second cgroup may appear
+# a beat after the run is running), then read the summed RAM.
+CG2=$(wait_cgroups "$WA" 2 25)
+chkbool "sampler reports two live cgroups" "yes" "$CG2"
+# The two-run sum must exceed the single-run reading by a margin a single cgroup
+# cannot produce. Wait for the SUM to appear (a single cgroup cannot reach it).
+R2=$(wait_ram "$WA" above "$((R1 + 30000000))" 25)
 chkge "two-run RAM exceeds the single-run reading by a margin" "$R2" "$((R1 + 30000000))"
 wait_run_done "$WA" 40 >/dev/null
 
@@ -510,15 +528,18 @@ for _ in range(3):
     s.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {key}\r\nAccept: text/event-stream\r\n\r\n".encode())
     socks.append(s)
 def read_frame(s, buf):
-    while b"\n\n" not in buf:
-        c=s.recv(65536)
-        if not c: return None, buf
-        buf+=c
-    ev, buf = buf.split(b"\n\n",1)
-    for line in ev.decode("utf-8","replace").splitlines():
-        if line.startswith("data: "):
-            return json.loads(line[6:]), buf
-    return None, buf
+    # Skip the initial ": connected" comment (an event with no data: line) and
+    # keep reading until a real JSON frame arrives.
+    while True:
+        while b"\n\n" not in buf:
+            c=s.recv(65536)
+            if not c: return None, buf
+            buf+=c
+        ev, buf = buf.split(b"\n\n",1)
+        for line in ev.decode("utf-8","replace").splitlines():
+            if line.startswith("data: "):
+                return json.loads(line[6:]), buf
+        # an event with no data line (e.g. a comment) -- keep reading
 buf=b""
 prev=None
 res=None
