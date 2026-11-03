@@ -300,6 +300,54 @@ func TestResolverServeUDP(t *testing.T) {
 	}
 }
 
+func TestNftProgramCoversDNSAndBypasses(t *testing.T) {
+	cfg := Defaults()
+	cfg.ResolverPort = 15353
+	cfg.HTTPPort = 18080
+	cfg.HTTPSPort = 18443
+	spec := DefaultRulesSpec(cfg, "ws-nft")
+	prog := NftProgram(spec, false)
+	for _, needle := range []string{
+		"add table inet sbxd_decoy",
+		"type nat hook output",
+		"meta mark 0x24 accept",
+		"udp dport 53 dnat ip to 127.0.0.1:15353",
+		"tcp dport 53 dnat ip to 127.0.0.1:15353",
+		"ip daddr 1.1.1.1 tcp dport { 443, 853 } dnat ip to 127.0.0.1:18443",
+		"ip daddr " + spec.ProfileIP + " tcp dport 443 dnat ip to 127.0.0.1:18443",
+	} {
+		if !strings.Contains(prog, needle) {
+			t.Errorf("nft program missing %q\n%s", needle, prog)
+		}
+	}
+	// The mark-accept rule must be FIRST, or the stub's own upstream queries
+	// are re-captured and DNS never resolves.
+	markIdx := strings.Index(prog, "meta mark 0x24 accept")
+	dnsIdx := strings.Index(prog, "udp dport 53 dnat")
+	if markIdx < 0 || dnsIdx < 0 || markIdx > dnsIdx {
+		t.Fatalf("mark-accept rule must precede the port-53 redirect:\n%s", prog)
+	}
+	del := NftProgram(spec, true)
+	if !strings.HasPrefix(del, "delete table inet sbxd_decoy") {
+		t.Fatalf("delete program must delete only the engine table: %q", del)
+	}
+}
+
+func TestSpecFilePathStableAndDistinct(t *testing.T) {
+	a := SpecFilePath("/tmp/x", "ws-1")
+	b := SpecFilePath("/tmp/x", "ws-1")
+	c := SpecFilePath("/tmp/x", "ws-2")
+	if a != b {
+		t.Fatalf("spec path not stable: %q vs %q", a, b)
+	}
+	if a == c {
+		t.Fatalf("two workspaces share a spec path: %q", a)
+	}
+	if !strings.HasPrefix(a, "/tmp/x/decoy-spec-") {
+		t.Fatalf("unexpected spec path %q", a)
+	}
+}
+
 func freePort(t *testing.T) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")

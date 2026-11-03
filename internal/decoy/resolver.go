@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -28,9 +27,6 @@ type Resolver struct {
 	Profile  Profile
 	Upstream []string
 	Port     int
-
-	mu       sync.Mutex
-	counters map[string]uint64
 }
 
 // NewResolver builds a resolver from a config and workspace id.
@@ -40,7 +36,6 @@ func NewResolver(cfg Config, workspaceID string, upstream []string) *Resolver {
 		Profile:  cfg.Derive(workspaceID),
 		Upstream: upstream,
 		Port:     cfg.ResolverPort,
-		counters: map[string]uint64{},
 	}
 }
 

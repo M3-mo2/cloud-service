@@ -103,7 +103,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **345** (332 unit + 4 `integration`-tagged), including regression
+Test functions: **347** (343 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -1858,7 +1858,7 @@ The decoy is reported truthfully: `/readyz.egress_decoy` is
 it off; `/v1/meta.egress_decoy` carries the `mechanism` and the honest `limits`.
 With the layer **off** (the default), `identity-check.sh` §6 still reports the
 measured real egress IP — no gate regresses. `go test ./...` passes; the suite
-adds `9` test functions (net `345`, from `336`), and
+adds `11` test functions (net `347`, from `336`), and
 `scripts/docs-consistency.sh` stays green.
 
 ## 10. Decisions

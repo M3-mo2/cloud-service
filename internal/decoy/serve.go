@@ -12,7 +12,6 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
-	"time"
 )
 
 // ServeSubcommand is the hidden argv[0] subcommand the manager uses to start a
@@ -136,18 +135,4 @@ func SpecFilePath(dir, workspaceID string) string {
 func shortHash(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])[:16]
-}
-
-// waitReady polls for the helper's ready file.
-func waitReady(path string, d time.Duration) error {
-	deadline := time.Now().Add(d)
-	for {
-		if _, err := os.Stat(path); err == nil {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for %s", path)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 }

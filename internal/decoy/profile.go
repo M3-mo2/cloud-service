@@ -256,20 +256,6 @@ func IsDoH(host string) bool {
 	return false
 }
 
-// PatternList returns the built-in shape patterns as strings, for docs and for
-// the /v1/meta capability report.
-func PatternList() []string {
-	out := make([]string, 0, len(hostPatterns)+len(dohHostPatterns))
-	for _, p := range hostPatterns {
-		out = append(out, p.String())
-	}
-	for _, p := range dohHostPatterns {
-		out = append(out, p.String())
-	}
-	sort.Strings(out)
-	return out
-}
-
 // wellKnownDoHIPList returns the covered resolver addresses in a stable order.
 func wellKnownDoHIPList() []string {
 	out := make([]string, 0, len(wellKnownDoHIPs))
