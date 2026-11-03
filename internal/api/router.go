@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"sandboxd/internal/archive"
 	"sandboxd/internal/auth"
 	"sandboxd/internal/config"
 	"sandboxd/internal/model"
@@ -364,12 +365,52 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"locked_status":      "locked (automatic, lapsed term) is distinct from suspended (manual); refused work is 403 subscription_expired, reads/usage/delete stay allowed",
 		"summary_present_on": []string{"GET /v1/workspaces/{id}", "GET /v1/workspaces"},
 	}
+	// Native archive handling: extraction and export are performed IN THE
+	// ENGINE (no shell tool), so the refusals are deterministic and identical on
+	// every host. Advertised truthfully: enabled is the server switch, formats
+	// is the content-detected allowlist, limits are the bounds actually in
+	// force, and refusal_codes is the stable set a client can act on. RAR is
+	// read-only (its encoder is proprietary); only ZIP is ever written.
+	arc := s.cfg.Archives
+	archivesCap := map[string]any{
+		"enabled": arc.Enabled,
+		"formats": arc.Formats,
+		"read_only": []string{
+			string(archive.FormatRAR),
+		},
+		"limits": map[string]any{
+			"max_entries":  arc.MaxEntries,
+			"max_total_mb": arc.MaxTotalMB,
+			"max_file_mb":  arc.MaxFileMB,
+			"max_ratio":    arc.MaxRatio,
+			"upload_mb":    arc.UploadMB,
+			"overwrite":    arc.Overwrite,
+			"skip_junk":    arc.SkipJunk,
+		},
+		"routes": []string{
+			"POST /v1/workspaces/{id}/files/archive",
+			"POST /v1/workspaces/{id}/files/extract",
+			"GET /v1/workspaces/{id}/files/archive",
+		},
+		"refusal_codes": []string{
+			model.CodeUnsupportedArchive,
+			model.CodeArchiveEncrypted,
+			model.CodeArchiveMultivolume,
+			model.CodeArchiveTooLarge,
+			model.CodeArchiveTooManyEntries,
+			model.CodeArchiveRatioExceeded,
+			model.CodeArchiveUnsafeEntry,
+			model.CodeArchiveEntryExists,
+		},
+		"semantics": "extraction validates every entry before writing (a refused archive leaves no partial tree); an entry that escapes the destination, is a symlink/hardlink, or sets a privileged bit is refused, and the bytes written are bounded by a streaming budget so a lying header cannot overshoot; overwrite:false (the default) refuses to clobber an existing file with 409 archive_entry_exists",
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":       model.Version,
 		"api_version":   model.APIVersion,
 		"runtimes":      []string{"python3"},
 		"profiles":      profileCap,
 		"subscriptions": subCap,
+		"archives":      archivesCap,
 		"limits_defaults": map[string]any{
 			"cpu_cores":            l.CPUCores,
 			"memory_mb":            l.MemoryMB,

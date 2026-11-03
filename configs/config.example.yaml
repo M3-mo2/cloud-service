@@ -339,6 +339,59 @@ subscription:
   # How often the reaper tick runs.
   reap_interval: "60s"
 
+# Native archive handling: upload-and-extract, in-place extract, and directory
+# export, all performed IN THE ENGINE (Go's stdlib archive/zip and
+# github.com/nwaples/rardecode/v2). No shell tool is ever invoked: this host has
+# no RAR tool at all, and the trust boundary must live in the engine, not in a
+# host binary. RAR is READ-ONLY by design (its encoder is proprietary); the
+# engine can read RAR4/RAR5 but only ever writes ZIP.
+#
+# SECURITY BOUNDARY. The archive is untrusted input: an entry may not escape the
+# destination (no `..`, no absolute path, no drive letter), a symlink/hardlink is
+# refused rather than materialized, privileged mode bits (setuid/setgid/sticky)
+# are stripped, everything is validated BEFORE a byte is written (a refused
+# archive leaves no partial tree), and the bytes actually written are bounded by
+# a STREAMING budget so a lying header cannot overshoot. Every refusal uses one
+# of the stable codes documented in docs/API.md. The caps below are a CEILING;
+# the workspace's own disk allowance is the real floor (a write past it fails
+# with ENOSPC and is reported as insufficient_storage).
+#
+# DEFAULTS CHANGE NOTHING: with enabled:true the service behaves but no archive
+# is handled unless a client calls one of the three archive routes.
+archives:
+  # Server-level switch. When false every /files/archive and /files/extract
+  # request is refused with 422 unprocessable (archive support is disabled).
+  enabled: true
+  # Maximum number of entries one archive may contain; more is refused with
+  # 413 archive_too_many_entries.
+  max_entries: 20000
+  # Total uncompressed bytes written across one archive (MiB); more is refused
+  # with 413 archive_too_large. Enforced by a streaming budget, so a header that
+  # lies about its size cannot overshoot it.
+  max_total_mb: 2048
+  # A single entry's uncompressed size (MiB); more is refused with
+  # 413 archive_too_large.
+  max_file_mb: 512
+  # Compression-ratio guard: an entry whose uncompressed/compressed ratio
+  # exceeds this is refused with 413 archive_ratio_exceeded (a zip-bomb guard).
+  max_ratio: 200
+  # Multipart archive upload cap (MiB). SEPARATE from caps.upload_mb so an
+  # operator can size them independently; a larger upload is refused with
+  # 413 payload_too_large.
+  upload_mb: 50
+  # Default collision policy. false (the default) refuses to clobber an existing
+  # file with 409 archive_entry_exists and leaves its content intact; a request
+  # may opt in per call with overwrite=true.
+  overwrite: false
+  # Skip macOS resource-fork / metadata noise (__MACOSX/..., .DS_Store,
+  # AppleDouble "._*", Thumbs.db, desktop.ini) by default. Skipped entries are
+  # reported with skipped:true and are never written.
+  skip_junk: true
+  # Allowlist of formats, detected from content (magic bytes, never the
+  # filename). An operator can disable one (e.g. only ["zip"]); a detected
+  # format not in the list is refused with 415 unsupported_archive.
+  formats: ["zip", "rar"]
+
 # Static API keys. Each entry maps a key to a principal_id.
 # Multiple keys may share a principal_id.
 keys:

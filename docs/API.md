@@ -100,6 +100,14 @@ additional code the router emits:
 | `timeout` | 504 | Timeout | **Defined but never emitted** (see discrepancies). |
 | `tunnel_url_unavailable` | 504 | No public URL was observed in time | `POST .../tunnels` when cloudflared did not print a `trycloudflare.com` URL within `tunnels.url_timeout_sec`, including when Cloudflare's rate-limited quick-tunnel provisioning returns `429` (cloudflared's own text is in `details.reason`). The engine never fabricates a URL. |
 | `unavailable` | 503 | Sandbox backend unavailable | nsjail binary missing, or nsjail could not set up/launch the sandbox (`details.nsjail`); also when the network/tunnel layer is not configured. |
+| `unsupported_archive` | 415 | The content matches no supported archive format | An archive request whose **content** (magic bytes) is not a known ZIP/RAR, or a detected format the `archives.formats` allowlist disables. `details.signature` names the leading bytes. The filename is never trusted. |
+| `archive_encrypted` | 422 | The archive is encrypted | A ZIP (general-purpose flag bit 0/6) or a RAR archive/entry that needs a password. The engine holds no password, so it never emits possibly-garbage plaintext. |
+| `archive_multivolume` | 422 | The archive is multi-volume | A RAR `partN.rar` that continues in another file. The engine extracts single-volume archives only; it refuses rather than truncating. |
+| `archive_too_large` | 413 | A size cap would be exceeded | An archive whose total uncompressed bytes exceed `archives.max_total_mb`, or a single entry above `archives.max_file_mb`. Enforced by a streaming budget, so a lying header cannot overshoot. |
+| `archive_too_many_entries` | 413 | Entry-count cap exceeded | An archive with more entries than `archives.max_entries`. |
+| `archive_ratio_exceeded` | 413 | Compression-ratio cap exceeded | An entry whose uncompressed/compressed ratio exceeds `archives.max_ratio` (a zip-bomb guard). `details.entry` names it. |
+| `archive_unsafe_entry` | 422 | An entry would escape the destination or is a link | An entry whose name is `..` traversal, absolute, a drive letter or a duplicate collision; a symlink or hardlink entry; or any entry the workspace path cleaner rejects. **Nothing is written.** `details.entry` names it. |
+| `archive_entry_exists` | 409 | An entry would clobber an existing file | An archive request with `overwrite:false` (the default) where an entry's target already exists. The existing content is left intact; use `overwrite:true` to replace. `details.entry` names it. |
 | `internal` | 500 | Unexpected server error | Bugs and genuinely unmapped conditions. |
 
 Note the code is not always a 1:1 mirror of the status: a **405 method not
@@ -224,6 +232,20 @@ default per-workspace limits.
       "locked_status": "locked (automatic, lapsed term) is distinct from suspended (manual); refused work is 403 subscription_expired, reads/usage/delete stay allowed",
       "summary_present_on": ["GET /v1/workspaces/{id}", "GET /v1/workspaces"]
     },
+    "archives": {
+      "enabled": true,
+      "formats": ["zip", "rar"],
+      "read_only": ["rar"],
+      "limits": {"max_entries": 20000, "max_total_mb": 2048, "max_file_mb": 512,
+                 "max_ratio": 200, "upload_mb": 50, "overwrite": false, "skip_junk": true},
+      "routes": ["POST /v1/workspaces/{id}/files/archive",
+                 "POST /v1/workspaces/{id}/files/extract",
+                 "GET /v1/workspaces/{id}/files/archive"],
+      "refusal_codes": ["unsupported_archive", "archive_encrypted", "archive_multivolume",
+                        "archive_too_large", "archive_too_many_entries",
+                        "archive_ratio_exceeded", "archive_unsafe_entry", "archive_entry_exists"],
+      "semantics": "extraction validates every entry before writing (a refused archive leaves no partial tree); an entry that escapes the destination, is a symlink/hardlink, or sets a privileged bit is refused, and the bytes written are bounded by a streaming budget so a lying header cannot overshoot; overwrite:false (the default) refuses to clobber an existing file with 409 archive_entry_exists"
+    },
     "interpreters": ["bash", "node", "perl", "python3"],
     "runnable_extensions": [".bash", ".cjs", ".js", ".mjs", ".pl", ".pm", ".py", ".sh"],
     "limits_defaults": {
@@ -336,6 +358,13 @@ default per-workspace limits.
   `locked_status` states that `locked` is automatic (distinct from `suspended`),
   that refused work is `403 subscription_expired`, and that reads/usage/delete
   stay allowed. See [Subscriptions](#subscriptions).
+  `archives` reports the native-archive capability: `enabled` is the server
+  switch, `formats` the content-detected allowlist, `read_only` the formats that
+  may be read but never written (`rar`), `limits` the bounds actually in force
+  (from the `archives:` config block), `routes` the three archive endpoints,
+  `refusal_codes` the stable codes a client can act on, and `semantics` a plain
+  statement of the validation-before-write and overwrite rules. See
+  [Native archives](#native-archives).
 
 ```sh
 KEY=dev-key-please-rotate
@@ -1355,6 +1384,119 @@ curl -s -H "Authorization: Bearer $KEY" \
 # {"name":"uploaded.py","path":"/uploaded.py","size":18}
 ```
 
+### POST /v1/workspaces/{workspaceID}/files/archive
+
+Upload an archive and extract it into the workspace in one request.
+
+- **Path parameter:** `workspaceID`.
+- **Request:** `multipart/form-data` with:
+  - `archive` (binary, **required**) — the archive bytes. The format is detected
+    from the **content** (magic bytes), never the filename.
+  - `path` (string, optional) — destination directory; default `/`. It is
+    resolved through the workspace path machinery and may not escape the root.
+  - `overwrite` (bool, optional) — default is the server's `archives.overwrite`
+    (`false`). With `false`, an entry that would clobber an existing file is
+    refused.
+  - `dry_run` (bool, optional) — default `false`. With `true` the archive is
+    validated and the entries are reported, and **nothing is written**.
+- **Response 200:** an `archiveResult`:
+
+  ```json
+  {
+    "format": "zip",
+    "destination": "/",
+    "entries_total": 5,
+    "entries_extracted": 4,
+    "entries_skipped": 1,
+    "entries_rejected": 0,
+    "bytes_written": 51,
+    "dry_run": false,
+    "entries": [
+      {"name":"src/main.py","path":"/src/main.py","type":"file","size":15,
+       "mode":"-rw-r--r--","rejected":false,"skipped":false}
+    ]
+  }
+  ```
+
+  Each entry carries `name` (as stored in the archive), `path` (the resolved
+  workspace path), `type` (`file`/`dir`/`symlink`/`hardlink`), `size`, `mode`
+  (privileged bits already stripped), `rejected` and `skipped`. A rejected entry
+  adds `reason` (a stable refusal code); a skipped one adds `skip_reason`.
+- **Errors:** 400 `validation` (not multipart, missing `archive`), 401, 403, 403
+  `subscription_expired` (locked workspace), 409 `archive_entry_exists` (a
+  collision with `overwrite:false`), 413 `payload_too_large` (upload >
+  `archives.upload_mb`) or `archive_too_large` / `archive_too_many_entries` /
+  `archive_ratio_exceeded` (a cap), 415 `unsupported_archive`, 422
+  `archive_unsafe_entry` / `archive_encrypted` / `archive_multivolume` /
+  `unprocessable` (corrupt), 507 `insufficient_storage` (workspace disk).
+- **Semantics:** extraction is performed **in the engine** (Go's
+  `archive/zip` and `github.com/nwaples/rardecode/v2`); no host tool is invoked.
+  The archive is untrusted input; see [Native archives](#native-archives) for the
+  full safety model. The whole archive is validated **before** a byte is written,
+  so a refusal leaves no partial tree. The archive-level caps are a ceiling; the
+  workspace's own disk allowance is the real floor.
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" \
+  -F archive=@project.zip -F path=/dst \
+  localhost:8080/v1/workspaces/$WS/files/archive
+```
+
+### POST /v1/workspaces/{workspaceID}/files/extract
+
+Extract an archive that is **already in the workspace** (an upload, a downloaded
+release, a clone artifact) into a destination directory, using the same engine.
+
+- **Path parameter:** `workspaceID`.
+- **Request body (`extractRequest`):**
+
+  | Field | Go type | JSON | Required | Validation | Default |
+  |-------|---------|------|----------|------------|---------|
+  | `path` | `string` | `path` | yes | the source archive path | — (400) |
+  | `dest` | `string` | `dest` | no | resolved; may not escape the root | workspace root |
+  | `overwrite` | `bool` | `overwrite` | no | — | `archives.overwrite` (`false`) |
+  | `dry_run` | `bool` | `dry_run` | no | — | `false` |
+
+- **Response 200:** the same `archiveResult` as the upload-and-extract route.
+- **Errors:** as above; the source file is read under the `archives.upload_mb`
+  cap (a larger source is 413 `payload_too_large`), and a missing source is 404
+  `not_found`.
+- **Semantics:** identical safety model and refusal codes to the upload route;
+  only the source differs (a workspace file instead of the request body).
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"path":"/bundle.zip","dest":"/out"}' \
+  localhost:8080/v1/workspaces/$WS/files/extract
+```
+
+### GET /v1/workspaces/{workspaceID}/files/archive
+
+Stream a **zip** of a directory tree in the workspace ("download my project").
+
+- **Path parameter:** `workspaceID`.
+- **Query parameter:** `path` (string, optional) — the directory to export;
+  default `/`. A missing path is 404 `not_found`; a non-directory is 422
+  `not_directory`.
+- **Response 200:** the zip bytes, with `Content-Type: application/zip` and a
+  `Content-Disposition` attachment whose filename is derived from the directory
+  (default `workspace.zip`).
+- **Errors:** 401, 403, 403 `subscription_expired`, 404 `not_found`, 422
+  `not_directory`. A failure **before** any byte is streamed is reported as a
+  normal JSON error; a mid-stream failure can only truncate, which the client
+  detects.
+- **Semantics:** the export is built by the same engine package as extraction, so
+  the two directions are symmetrical. The walk never follows a symlink and
+  **skips** links and, when `archives.skip_junk` is on, macOS metadata junk, so a
+  zip can never smuggle a link out and an import/export round-trips cleanly. The
+  root itself is never emitted. Only **ZIP is written**; RAR is read-only (its
+  encoder is proprietary).
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" -o project.zip \
+  "localhost:8080/v1/workspaces/$WS/files/archive?path=/project"
+```
+
 ### POST /v1/workspaces/{workspaceID}/exec
 
 Run one command **synchronously** and return its output inline.
@@ -2364,6 +2506,84 @@ curl -s -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/js
 # renew early (adds 30 days to the live term) or renew a locked workspace
 curl -s -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"duration":"30d"}' localhost:8080/v1/workspaces/$WS/subscription/extend
+```
+
+## Native archives
+
+The engine reads and writes archives **itself** (Go's `archive/zip` and
+`github.com/nwaples/rardecode/v2`); it never shells out to `unzip`, `tar` or
+`unrar`. This host has no RAR tool at all, and a security boundary cannot live in
+a host binary that may be absent or different. Because the behavior is in the
+engine, every refusal is deterministic and identical on every host. The three
+routes are `POST /files/archive` (upload-and-extract), `POST /files/extract`
+(in-place) and `GET /files/archive` (export). The capability is advertised in
+`GET /v1/meta` under `archives`. See [DECISIONS.md](DECISIONS.md) ADR 92.
+
+**Formats.** `zip` and `rar` (both RAR4 and RAR5) are detected from the
+**content's magic bytes**, never the filename — a `.zip` that is really a RAR
+still works, and an unrecognized format is `415 unsupported_archive` naming the
+detected signature. An operator can disable one via `archives.formats`.
+**Extraction** reads ZIP and RAR; **export** writes only ZIP, because RAR's
+encoder is proprietary, so **RAR is read-only by design**.
+
+**Asymmetric direction.** You upload a zip or a rar and download a zip; you
+cannot make the engine produce a rar. This is deliberate, not a gap.
+
+### The safety model (archives are untrusted input)
+
+- **Nothing outside the destination.** Every entry name is validated through the
+  workspace's own path cleaner; a `..` that escapes, an absolute path or a drive
+  letter is refused with `422 archive_unsafe_entry`. A symlink or hardlink entry
+  is **refused**, never materialized — the engine never has to decide whether a
+  link target is safe, because it never creates one.
+- **No privileged bits.** `setuid`, `setgid` and sticky bits are stripped from
+  every extracted mode; a file that asked for `4755` lands as `0755` (or a safe
+  default when nothing usable remains).
+- **Nothing is written until the whole archive is validated.** The header list is
+  read and every entry is decided **before** the first byte is written, so a
+  refused archive leaves **no** partial tree.
+- **A streaming budget, not a header promise.** The bytes actually written are
+  bounded by `archives.max_total_mb` and `archives.max_file_mb` (and a per-entry
+  ratio guard), so a header that lies about its size cannot overshoot the cap.
+- **A collision is refused, not overwritten.** The default (`overwrite:false`) is
+  `409 archive_entry_exists` with the existing file's content preserved; a request
+  can opt in to replacement with `overwrite:true`.
+
+If a case cannot be made safe, it is **refused** with a stable code. A refused
+extraction is always better than a compliant-looking escape.
+
+### `dry_run`
+
+With `dry_run:true` the archive is validated and the entries are reported
+(`entries_total`, each entry's `rejected`/`skipped` and `reason`), and **nothing
+is written**. A dry run does **not** fail on a rejected entry — previewing a
+hostile archive is exactly its purpose — so it reports `entries_rejected` while
+returning `200`.
+
+### Configuration
+
+| `archives:` key | Default | Meaning |
+|-----------------|---------|---------|
+| `enabled` | `true` | server switch; `false` refuses every archive route with `422 unprocessable`. |
+| `max_entries` | `20000` | entry-count cap (`413 archive_too_many_entries`). |
+| `max_total_mb` | `2048` | total uncompressed budget, streaming (`413 archive_too_large`). |
+| `max_file_mb` | `512` | single-entry uncompressed cap (`413 archive_too_large`). |
+| `max_ratio` | `200` | uncompressed/compressed ratio guard (`413 archive_ratio_exceeded`). |
+| `upload_mb` | `50` | archive upload cap, separate from `caps.upload_mb` (`413 payload_too_large`). |
+| `overwrite` | `false` | default collision policy (`409 archive_entry_exists`). |
+| `skip_junk` | `true` | skip `__MACOSX/`, `.DS_Store`, `._*`, `Thumbs.db`, `desktop.ini`. |
+| `formats` | `["zip","rar"]` | content-detected allowlist. |
+
+```sh
+# extract an uploaded project into /dst (default overwrite:false)
+curl -s -H "Authorization: Bearer $KEY" -F archive=@project.zip -F path=/dst \
+  localhost:8080/v1/workspaces/$WS/files/archive
+# preview what an archive would do, writing nothing
+curl -s -H "Authorization: Bearer $KEY" -F archive=@project.zip -F dry_run=true \
+  localhost:8080/v1/workspaces/$WS/files/archive
+# export a directory as a zip
+curl -s -H "Authorization: Bearer $KEY" -o project.zip \
+  "localhost:8080/v1/workspaces/$WS/files/archive?path=/project"
 ```
 
 ## Lifecycle and limits

@@ -230,6 +230,35 @@ func TestArchiveOverwriteEndpoint(t *testing.T) {
 	}
 }
 
+func TestMetaAdvertisesArchives(t *testing.T) {
+	h := newHarness(t)
+	rec := h.do("GET", "/v1/meta", reqOpts{key: keyA})
+	body := decode[map[string]any](t, rec)
+	cap, ok := body["archives"].(map[string]any)
+	if !ok {
+		t.Fatalf("archives capability missing: %v", body)
+	}
+	if cap["enabled"] != true {
+		t.Fatalf("archives.enabled = %v", cap["enabled"])
+	}
+	formats, ok := cap["formats"].([]any)
+	if !ok || len(formats) != 2 {
+		t.Fatalf("archives.formats = %v", cap["formats"])
+	}
+	limits, ok := cap["limits"].(map[string]any)
+	if !ok {
+		t.Fatalf("archives.limits missing: %v", cap)
+	}
+	// The advertised limits must be the code's real defaults.
+	if limits["max_entries"] != float64(20000) || limits["max_total_mb"] != float64(2048) {
+		t.Fatalf("archives.limits = %v", limits)
+	}
+	codes, ok := cap["refusal_codes"].([]any)
+	if !ok || len(codes) != 8 {
+		t.Fatalf("archives.refusal_codes = %v", cap["refusal_codes"])
+	}
+}
+
 func TestArchiveDisabledEndpoint(t *testing.T) {
 	h := newHarness(t)
 	ws := h.createWorkspace("arch-off")

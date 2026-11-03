@@ -3,7 +3,7 @@ PKG := ./...
 GO ?= go
 CC ?= cc
 
-.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check identity-check egress-decoy-check subscription-check docs-check
+.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check identity-check egress-decoy-check subscription-check archive-check docs-check
 
 all: fmt vet shim build test
 
@@ -121,6 +121,20 @@ egress-decoy-check:
 # the backwards-clock rule, and tick idempotency.
 subscription-check:
 	sudo -E bash scripts/subscription-check.sh
+
+# Native archive acceptance against REAL nsjail and a REAL FUSE disk on the host
+# (needs root, no container). It extracts the COMMITTED
+# internal/archive/testdata fixtures through the real API and asserts the whole
+# security boundary: a normal zip extracts, a traversal / absolute name is
+# refused with nothing written outside, a setuid bit is stripped, a zip bomb and
+# a ratio bomb are refused without the disk growing, an encrypted ZIP/RAR and a
+# multi-volume RAR are refused, a hostile RAR symlink/hardlink escape is refused,
+# random bytes / an empty file / a truncated zip are refused with the daemon
+# alive, dry_run writes nothing, the overwrite collision policy holds, and a zip
+# export is a valid archive. It reads fixtures only from the committed tree, so
+# it cannot pass without them.
+archive-check:
+	sudo -E bash scripts/archive-check.sh
 
 # Documentation-consistency gate. It derives its assertions from the code
 # (router, error constants, test count) rather than the prose, so it fails when
