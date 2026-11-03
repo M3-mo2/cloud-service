@@ -2122,8 +2122,14 @@ The gate previously flaked with grouped `got=` (empty) results, most visibly
 `disk.fill_enospc` and whole groups. The empty `got=` is the **harness silently
 swallowing an API error body**: `exec_py | jsonf "['stdout']"` indexed a missing
 `stdout` key on an error JSON and yielded an empty string. The real engine defect
-behind it was **not** a PUT→exec race (directly tested: 10/10 clean). It was a
-disk-provisioning failure:
+behind it was **not** a PUT→exec race (directly tested: 10/10 clean), and it was
+**not** a create/`/readyz` reporting a workspace usable before its mount and
+curated tree were live: measured, the first exec after creation reliably found
+both present (10/10 fresh workspaces showed the curated `/proc` and a `fuseblk`
+`/workspace` on the very first exec), because the engine materializes the disk
+mount and the curated `/proc` inside the same request that runs the command
+(the `mandatory:true` proc mount means a missing tree aborts the run loudly, it
+cannot be silently absent). The defect was a disk-provisioning failure:
 
 * `fitImage` measured the ext4 total with a **read-write** transient mount.
   `fuse2fs` commits the ext4 superblock asynchronously, so unmount-then-
