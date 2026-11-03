@@ -255,6 +255,13 @@ interception needs a **generated CA trusted inside the workspace**:
 - The same TLS port distinguishes a DNS-over-TLS frame (a 2-byte length prefix)
   from HTTP, so `dig +tls @1.1.1.1` is answered with the decoy too.
 
+The trust-store amendment requires the curated `/etc/ssl/certs` overlay, i.e.
+`identity.hide_provider_tools: true` (the default). If an operator disables
+provider-tool hiding, the host trust store is mounted read-only and cannot be
+amended; the decoy still answers every channel's **body**, but a TLS client
+would see a certificate warning, so enabling the decoy in that state is
+discouraged (the operator can still add the decoy CA to their base image).
+
 The responder chooses a body shape that matches the addressed service — plain
 text, `{"ip":...}`, `ipinfo.io`'s JSON/`/org`, the Cloudflare trace, `ip-api`'s
 line format, a DoH JSON — so the answer looks like it came from that service.
