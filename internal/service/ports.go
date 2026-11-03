@@ -84,3 +84,9 @@ func (s *Service) PortsStatus() (enabled bool, maxPids, maxFDs int, includeUnix 
 	maxPids, maxFDs = s.cfg.Ports.Limits()
 	return s.cfg.Ports.Enabled, maxPids, maxFDs, s.cfg.Ports.IncludeUnix
 }
+
+// PortReads returns how many port-table reads the process has performed. It is a
+// monotonic diagnostic used by a gate to prove the read is on-demand only (it
+// does not move across a metrics tick) while staying non-vacuous (it moves on a
+// /ports request).
+func (s *Service) PortReads() int64 { return s.runner.PortReads() }

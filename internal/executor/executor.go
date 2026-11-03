@@ -223,4 +223,10 @@ type Runner interface {
 	// processes and limits.MaxFDsPerPID fds each) and its result carries an
 	// explicit Complete flag so a partial read is reported as partial.
 	NetTablesForPids(pids []int, limits ports.Limits) ports.NetTables
+
+	// PortReads returns how many port-table reads this process has performed.
+	// It is a monotonic counter exposed so a gate can prove the read is
+	// ON-DEMAND only (it does not move across a metrics tick) while still being
+	// non-vacuous (it does move on a /ports request).
+	PortReads() int64
 }

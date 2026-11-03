@@ -685,6 +685,9 @@ func (r *NsjailRunner) NetTablesForPids(pids []int, limits ports.Limits) ports.N
 	return NetTablesForPids(pids, limits)
 }
 
+// PortReads returns the process-wide port-table read counter.
+func (r *NsjailRunner) PortReads() int64 { return PortReads() }
+
 // ReapOrphans kills and removes every orphaned sandbox cgroup on the host.
 func (r *NsjailRunner) ReapOrphans() int { return ReapOrphans() }
 

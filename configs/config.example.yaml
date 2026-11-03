@@ -467,6 +467,31 @@ metrics:
   # than allowing unbounded goroutines.
   max_subscribers: 1024
 
+# Native per-workspace port/service discovery. GET /v1/workspaces/{id}/ports
+# answers which ports a workspace is listening on and which process serves each
+# one, by reading /proc/<pid>/net/{tcp,tcp6,udp,udp6,unix} for a pid inside the
+# workspace's OWN network namespace and attributing each socket inode to the
+# owning process. It exists because a tenant cannot answer this itself: the
+# curated /proc carries no /proc/net and neither ss nor netstat is installed.
+#
+# It is ON by default, deliberately: it is read-only introspection of the
+# tenant's OWN workspace, and with it off the user has no way to see their own
+# services. It is ON-DEMAND and never part of the metrics tick (one table read is
+# measured at ~4.6 ms). See docs/DECISIONS.md ADR 96.
+ports:
+  # Server-level switch. true (default) serves the route; false refuses it with
+  # 404 ports_disabled and reports it off in /v1/meta.
+  enabled: true
+  # Cap on how many of the workspace's processes are examined for the
+  # socket-inode -> process attribution. Bounds the cost of one request.
+  max_pids: 64
+  # Cap on how many file descriptors are examined per process during
+  # attribution.
+  max_fds_per_pid: 512
+  # Report unix-domain sockets in a SEPARATE `unix` section (never mixed into the
+  # port list, because a unix socket is not a reachable port).
+  include_unix: true
+
 # Static API keys. Each entry maps a key to a principal_id.
 # Multiple keys may share a principal_id.
 keys:

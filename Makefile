@@ -3,7 +3,7 @@ PKG := ./...
 GO ?= go
 CC ?= cc
 
-.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check spread-check tunnel-check identity-check egress-decoy-check subscription-check archive-check metrics-check write-rate-check docs-check
+.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check spread-check tunnel-check identity-check egress-decoy-check subscription-check archive-check metrics-check write-rate-check ports-check docs-check
 
 all: fmt vet shim build test
 
@@ -176,6 +176,19 @@ metrics-check:
 # documented window; and nothing is leaked.
 write-rate-check:
 	sudo -E bash scripts/write-rate-check.sh
+
+# Native port/service discovery acceptance against REAL nsjail on the host
+# (needs root, no container). It asserts the whole contract of GET
+# /v1/workspaces/{id}/ports: a loopback and a wildcard TCP listener and a UDP
+# socket are reported with the right port/protocol/scope/state, the owning
+# process is resolved to the pid the test started, a HOST port never leaks into
+# a workspace's list (the isolation assertion), two workspaces see only their
+# own ports, an empty workspace is an honest empty 200, the list is live (not
+# cached) and deterministically sorted, the endpoint is NOT part of the metrics
+# stream (the read counter does not move on a tick), /v1/meta advertises it, and
+# nothing is leaked.
+ports-check:
+	sudo -E bash scripts/ports-check.sh
 
 # Documentation-consistency gate. It derives its assertions from the code
 # (router, error constants, test count) rather than the prose, so it fails when

@@ -69,6 +69,7 @@ type FakeRunner struct {
 	// limits the service passed, so a test can assert the bound is applied.
 	PortTables     ports.NetTables
 	LastPortLimits ports.Limits
+	portReads      int64
 
 	// cgroupEnsured records the workspace ids EnsureWorkspaceCgroup was called
 	// for, so a service test can assert the provisioning path ran.
@@ -355,11 +356,19 @@ func (f *FakeRunner) NetTablesForPids(pids []int, limits ports.Limits) ports.Net
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.LastPortLimits = limits
+	f.portReads++
 	t := f.PortTables
 	if t.Holders == nil {
 		t.Holders = map[uint64][]int{}
 	}
 	return t
+}
+
+// PortReads returns how many times NetTablesForPids was called on this fake.
+func (f *FakeRunner) PortReads() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.portReads
 }
 
 // SetOrphans configures how many orphans ReapOrphans reports.

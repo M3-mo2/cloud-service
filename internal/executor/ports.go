@@ -5,9 +5,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"sandboxd/internal/ports"
 )
+
+// portReads counts how many times this process has performed a port-table read
+// (NetTablesForPids). It is exposed so a gate can prove the read is
+// ON-DEMAND-ONLY: the counter does not move across a metrics tick (the sampler
+// never calls this path), and it does move on a /ports request (the test is not
+// vacuous).
+var portReads atomic.Int64
+
+// PortReads returns how many port-table reads this process has performed.
+func PortReads() int64 { return portReads.Load() }
 
 // This file implements the host-side reads behind native port discovery. The
 // caller (the service) already knows WHICH pids belong to a workspace from the
@@ -38,6 +49,7 @@ var netTableFiles = []string{"tcp", "tcp6", "udp", "udp6", "unix"}
 // and at most limits.MaxFDsPerPID file descriptors per pid. When a bound is hit,
 // Complete is false and Notes says which one.
 func NetTablesForPids(pids []int, limits ports.Limits) ports.NetTables {
+	portReads.Add(1)
 	if limits.MaxPids <= 0 {
 		limits.MaxPids = ports.DefaultLimits().MaxPids
 	}

@@ -478,6 +478,11 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"routes":          []string{"GET /v1/workspaces/{id}/ports"},
 		"reachability":    "a reported port is listening inside the workspace's private network namespace; it is NOT reachable from outside unless a tunnel publishes it (limits.allow_tunnels AND tunnels.enabled)",
 		"default_note":    "enabled by default: read-only introspection of the tenant's own workspace, which the tenant cannot see from inside (no /proc/net, no ss/netstat)",
+		// reads_total is a monotonic diagnostic counter: how many port-table
+		// reads this process has performed. A gate uses it to prove the read is
+		// on-demand only (it does not move on a metrics tick) while staying
+		// non-vacuous (it does move on a /ports request). It names no tenant.
+		"reads_total": s.svc.PortReads(),
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":       model.Version,
