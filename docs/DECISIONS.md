@@ -1929,6 +1929,20 @@ purge**, and nothing leaks: no `fuse2fs`, no mount, no cgroup, no netns, no orph
 `disk.img` (asserted in the gate). One workspace's failure is logged and the loop
 continues to the others.
 
+**Two observable phases, and the latency between them (measured).** The status a
+client reads flips to `locked` **the instant the stored `ExpiresAt` passes** -- it
+is derived from the stored instants, so a summary can never claim time remains
+while enforcement disagrees -- but the **resource teardown** (stopping the
+workload, unmounting the disk, releasing the `fuse2fs` helper, clearing the
+cgroup/netns) happens on the **next reaper tick**. Measured on this host with
+`reap_interval: 1s`: 0.26s and 1.06s between reading `locked` and the disk
+actually being released. **With the default `reap_interval` of 60s that window is
+therefore up to ~60s.** This is a *release* delay, not a hole: work is refused
+from the first instant the term lapses (`403 subscription_expired`), so a lapsed
+workspace cannot execute or consume anything in that window; only the un-mounting
+trails. An operator who wants the trailing window tighter lowers `reap_interval`;
+the measured trade-off is one tick of scheduling versus mount churn.
+
 **The backwards-clock rule.** A backwards wall-clock jump must not cause a
 delete. Every comparison is against a **stored absolute instant**, never an
 in-memory countdown, so a backwards jump can only *delay* an action. To make that
