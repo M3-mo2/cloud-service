@@ -115,10 +115,6 @@ root_leaves() { ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null | wc -l | tr -d ' '; }
 nested_leaves_for() { ls -d "/sys/fs/cgroup/ws-$1"/NSJAIL.* 2>/dev/null | wc -l | tr -d ' '; }
 fuse_count() { ps -eo comm --no-headers | grep -cx fuse2fs; }
 
-add_int() { # path field -> integer or 0
-  awk '/'"$2"' /{print $2}' "$1" 2>/dev/null || echo 0
-}
-
 # oomcount -> the workspace parent's cumulative OOM count. It reads
 # memory.events (descendant-inclusive: a parent has no processes of its own) and
 # sums oom_kill and oom_group_kill, because with memory.oom.group=1 the group
@@ -235,13 +231,13 @@ start_service() {
   return 1
 }
 if ! start_service; then
-  echo "  SERVICE NOT READY: $READY"; tail -20 "$LOG"; exit 1
+  echo "  SERVICE NOT READY: $(curl -s -m 2 "$BASE/readyz" 2>/dev/null || true)"; tail -20 "$LOG"; exit 1
 fi
-echo "  service ready: $READY"
+echo "  service ready: $(curl -s -m 2 "$BASE/readyz" 2>/dev/null || true)"
 # Prove the daemon we measure is the binary we built.
 echo "  daemon exe hash: $(md5sum "/proc/$SRV/exe" 2>/dev/null | awk '{print $1}')  built: $(md5sum "$BIN" | awk '{print $1}')"
 
-W=$(curl -s -m 15 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d "{\"name\":\"spread\",\"limits\":{\"memory_mb\":$M}}" | jf "['workspace']['id']")
+W=$(curl -s -m 15 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d "{\"name\":\"spread\",\"limits\":{\"memory_mb\":$M,\"allow_unlimited_runs\":true}}" | jf "['workspace']['id']")
 [ -n "$W" ] || { echo "FATAL: no workspace id"; exit 1; }
 echo "  workspace=$W memory_mb=$M"
 FUSE_BASE=$(fuse_count)
@@ -298,19 +294,20 @@ chk "single 2 x memory_mb allocation reads as oom" "oom" "$ST"
 OOM1=$(oomcount "$W")
 chkbool "parent recorded an oom_kill (the ceiling fired)" "yes" "$([ "${OOM1:-0}" -ge 1 ] && echo yes || echo "no($OOM1)")"
 
-# THREE concurrent runs each holding ~0.9 x M: the SUM ~2.7 x M exceeds M, so the
+# THREE concurrent runs, each of 0.9 x M: the SUM ~2.7 x M exceeds M, so the
 # workspace must be killed despite each run fitting alone. Before the fix the
 # three runs would each have had their own M ceiling and all three would succeed.
+# Each run SLEEPS first and allocates second, so all three leaves are live (and
+# observable) before the ceiling can fire.
 echo "  launching three concurrent ~0.9M allocations (SUM exceeds M) ..."
 RIDS=""
 for i in 1 2 3; do
   rid=$(curl -s -m 20 -X POST "$BASE/v1/workspaces/$W/runs" -H "$A" -H "$J" \
-    -d "{\"kind\":\"command\",\"argv\":[\"python3\",\"-c\",\"import time;x=bytearray($((M*9/10))*1024*1024);[x.__setitem__(i,1) for i in range(0,len(x),4096)];print('ALLOC_OK');time.sleep(25)\",\"$NS-sum$i\"],\"no_timeout\":true}" | jf "['run']['id']")
+    -d "{\"kind\":\"command\",\"argv\":[\"python3\",\"-c\",\"import time;time.sleep(4);x=bytearray($((M*9/10))*1024*1024);[x.__setitem__(q,1) for q in range(0,len(x),4096)];print('ALLOC_OK');time.sleep(25)\",\"$NS-sum$i\"],\"no_timeout\":true}" | jf "['run']['id']")
   RIDS="$RIDS $rid"
   sleep 0.2
 done
-# Wait until the SUM has been observed (or the runs end): read the parent's
-# memory.current directly, then the API metric.
+# Observe the leaves while all three runs are alive (before they allocate).
 PEAK=0
 LIVE_SEEN=0
 for _ in $(seq 1 60); do
@@ -321,7 +318,7 @@ for _ in $(seq 1 60); do
   # Stop early once the ceiling has fired (the parent recorded an OOM).
   now=$(oomcount "$W")
   [ "${now:-0}" -gt "${OOM1:-0}" ] && break
-  sleep 0.5
+  sleep 0.3
 done
 chk "parent memory.max == the workspace's memory_mb" "$M_BYTES" "$(cat "/sys/fs/cgroup/ws-$W/memory.max" 2>/dev/null)"
 chk "API ram_limit_bytes == the workspace's memory_mb" "$M_BYTES" "$(snap_ws_field "$W" ram_limit_bytes)"
@@ -437,7 +434,15 @@ echo
 echo "=== leak check: no mount, no fuse2fs growth ==="
 LEFT_MOUNTS=$(findmnt -rno TARGET 2>/dev/null | grep -F "$DATA" | wc -l | tr -d ' ')
 chk "no mount left under the data dir" "0" "$LEFT_MOUNTS"
-chk "no fuse2fs process left for this run" "0" "$(fuse_count)"
+# The workspace disk unmounts on delete; the fuse2fs helper exits as the mount
+# goes away. Wait (bounded) for it to settle back to the baseline.
+FUSE_NOW=$(fuse_count)
+for _ in $(seq 1 20); do
+  [ "${FUSE_NOW:-0}" -le "${FUSE_BASE:-0}" ] && break
+  sleep 0.5; FUSE_NOW=$(fuse_count)
+done
+chkbool "no fuse2fs process left for this run (<= baseline)" "yes" \
+  "$([ "${FUSE_NOW:-0}" -le "${FUSE_BASE:-0}" ] && echo yes || echo "no($FUSE_NOW>${FUSE_BASE})")"
 
 echo
 echo "================ spread acceptance: $PASS passed / $FAIL failed ================"
