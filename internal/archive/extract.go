@@ -170,7 +170,7 @@ func Extract(data []byte, opts Options, destRel string, sink Sink, clean func(st
 		}
 		switch pe.raw.Kind {
 		case KindDir:
-			if err := sink.Mkdir(pe.rel, SanitizeMode(pe.raw.Mode)); err != nil {
+			if err := sink.Mkdir(fullRel(destRel, pe.rel), SanitizeMode(pe.raw.Mode)); err != nil {
 				return res, err
 			}
 			res.EntriesExtracted++
@@ -179,7 +179,7 @@ func Extract(data []byte, opts Options, destRel string, sink Sink, clean func(st
 			if oerr != nil {
 				return res, oerr
 			}
-			wc, werr := sink.Open(pe.rel, SanitizeMode(pe.raw.Mode), lim.overwrite)
+			wc, werr := sink.Open(fullRel(destRel, pe.rel), SanitizeMode(pe.raw.Mode), lim.overwrite)
 			if werr != nil {
 				_ = rc.Close()
 				if errors.Is(werr, ErrEntryExists) {
@@ -352,8 +352,20 @@ func refusalError(code string, plan []planEntry) error {
 func normalizeDest(destRel string) string {
 	destRel = strings.ReplaceAll(destRel, "\\", "/")
 	destRel = strings.Trim(destRel, "/")
-	if destRel == "." {
+	if destRel == "" || destRel == "." {
 		return ""
 	}
 	return path.Clean(destRel)
+}
+
+// fullRel joins a destination directory and an entry's cleaned relative path
+// into the workspace-relative path handed to the sink.
+func fullRel(destRel, rel string) string {
+	if destRel == "" {
+		return rel
+	}
+	if rel == "" {
+		return destRel
+	}
+	return destRel + "/" + rel
 }
