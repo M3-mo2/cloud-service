@@ -152,6 +152,12 @@ func main() {
 	// with no in-memory counters. It is a no-op when subscription.enabled is
 	// false; a workspace without a subscription is never touched.
 	svc.StartReaper()
+	// The opaque build marker lands in the binary so the subscription acceptance
+	// harness can `strings` it and prove the tested artifact is a fresh build of
+	// the intended commit (a positive control against a stale binary). It names
+	// no engine internals and is only ever written to the operator's log.
+	logger.Info("subscription reaper configured", "build_marker", service.ReaperMarker,
+		"enabled", cfg.Subscription.Enabled)
 	authn := auth.New(cfg.Keys)
 	server := api.NewServer(svc, authn, logger)
 

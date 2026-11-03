@@ -3,7 +3,7 @@ PKG := ./...
 GO ?= go
 CC ?= cc
 
-.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check identity-check egress-decoy-check docs-check
+.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check identity-check egress-decoy-check subscription-check docs-check
 
 all: fmt vet shim build test
 
@@ -110,6 +110,17 @@ identity-check:
 # is DEFAULT OFF; this target turns it on only for the check.
 egress-decoy-check:
 	sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin:/usr/sbin" bash scripts/egress-decoy-check.sh
+
+# Subscription acceptance against REAL nsjail and a REAL FUSE disk on the host
+# (needs root, no container). It compresses the clock via config
+# (grace_period=4s, reap_interval=1s) and asserts the whole term lifecycle in
+# seconds: create-with-duration, additive renewal while live, lock-at-expiry
+# with real teardown (process stopped, disk unmounted), renewal-to-unlock,
+# delete-after-grace with the data/disk.img/metadata gone and nothing leaked,
+# manual delete of a locked workspace, an untouched no-subscription workspace,
+# the backwards-clock rule, and tick idempotency.
+subscription-check:
+	sudo -E bash scripts/subscription-check.sh
 
 # Documentation-consistency gate. It derives its assertions from the code
 # (router, error constants, test count) rather than the prose, so it fails when

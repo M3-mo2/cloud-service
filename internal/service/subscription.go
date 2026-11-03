@@ -16,6 +16,12 @@ import (
 // deliberately holds NO in-memory term state: every value is recomputed from the
 // absolute instants stored on the workspace, so a restart is trivially correct.
 
+// ReaperMarker is an opaque build marker embedded in the binary so an acceptance
+// harness can `strings` it and prove the tested artifact is a fresh build of the
+// intended commit (a positive control against a stale binary). It names no
+// engine internals and is only ever written to the operator's log.
+const ReaperMarker = "zcp-subscription-reaper-v0.0.19"
+
 // SubscriptionRequest is the parsed create/extend body: exactly one of duration
 // or expires_at. A pointer distinguishes an absent field from an empty one.
 type SubscriptionRequest struct {
