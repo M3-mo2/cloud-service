@@ -170,7 +170,7 @@ flowchart TD
 | `internal/auth` | `auth.go` | Static bearer keys → `principal_id`, constant-time compare |
 | `internal/api` | `router.go`, `*.go` | chi routes, handlers, DTOs, JSON error envelope, Prometheus metrics, audit log |
 | `internal/service` | `service.go`, `files.go`, `exec.go`, `runs.go`, `control.go`, `packages.go`, `sessions.go` | Orchestration, ownership checks, limits, retention, run and session registries |
-| `internal/workspace` | `fs.go`, `path.go` | Safe rooted filesystem, traversal/symlink defense, disk quota accounting |
+| `internal/workspace` | `fs.go`, `path.go`, `diskfs.go` | Safe rooted filesystem, traversal/symlink defense, disk quota accounting, and the per-workspace fuse2fs ext4 image manager |
 | `internal/storage` | `store.go` | Atomic JSON metadata + run-log/session-output files on disk |
 | `internal/executor` | `executor.go`, `nsjail.go`, `live.go`, `identity.go`, `fake.go`, `pty_relay.py` | nsjail config rendering, UID/GID mapping, one-shot and interactive process lifecycles, capped capture, PTY relay helper |
 | `configs` | `nsjail_python.cfg.tmpl`, `embed.go` | nsjail TextProto template (also compiled into the binary) |
@@ -467,7 +467,8 @@ fly (`configs/nsjail_python.cfg.tmpl`). The rendered sandbox has:
 | Namespaces | `clone_newpid/ns/ipc/uts/user` always; network is always the workspace's **own** namespace (never the host's) | Isolated PID, mount, IPC, UTS, user, network | always |
 | network ns (egress) | `allow_net:false` → private **empty** ns (no egress). `allow_net:true` → own ns reaching the internet only through **chained slirp4netns** over UNIX sockets; the relay blackholes every operator-private range (see §5.6) | Egress without host-network sharing | always; egress fabric itself needs `network.enabled` |
 | mount ns | host `/usr`,`/lib`,`/lib64`,`/bin`,`/sbin` RO; workspace RW at `/workspace`; private `/tmp` | Child sees only the runtime + its own files | always |
-| `/proc` | `mount_proc: false` | Host process table not visible | always |
+| `/proc` | `mount_proc: false`; a CURATED per-workspace `/proc` payload (meminfo/cpuinfo/stat/uptime/loadavg/version/vmstat/mounts) is bound RO over it | Host process/network/kernel view not visible; the workspace sees only its OWN resource facts (`free -h`, `vmstat`, a bare `df` work) | `disk.proc_enabled` (default on) **and** `identity.enabled` |
+| `/workspace` | a real per-workspace ext4 image (fuse2fs, host-side mount) sized to `disk_mb` | `df`/`stat -f`/`os.statvfs()` report the workspace's own allowance; a write past it fails `ENOSPC` (kernel boundary, no overshoot) | `disk.enabled` (default on); falls back to a sampled used-bytes watchdog |
 | cgroup v2 | `cgroup_mem_max` (bytes), `cgroup_pids_max`, `cgroup_cpu_ms_per_sec` | Memory, process-count, CPU throttling | **only with `--cgroupns=host`** |
 | rlimits | `as` (MB), `fsize` (MB), `nofile`, `nproc`, `core=0` | Kernel-enforced ceilings | always |
 | seccomp | default-allow, KILL a dangerous denylist | `mount`, `ptrace`, `bpf`, `kexec_*`, `reboot`, `setns`, `unshare`, modules, keyctl, … | always |
@@ -687,8 +688,9 @@ measured by [`scripts/tunnel-check.sh`](../scripts/tunnel-check.sh); see
 
 ### 5.7 Host-identity masking (the syscall view)
 
-The mount namespace closes the **filesystem** view of the host (no `/proc`, no
-`/sys`), but a set of facts stays reachable by **syscall** and no mount hides
+The mount namespace closes the **filesystem** view of the host (no host
+`/proc`, no `/sys` — `/proc` is a curated per-workspace payload, see §5.2), but a
+set of facts stays reachable by **syscall** and no mount hides
 them: `uname(2)` (the platform kernel fingerprint), `sysconf(3)`/`sysinfo(2)`
 (the host's real core count and total RAM), `sched_getaffinity(2)` (again the
 core count), `getauxval(AT_HWCAP)` (a CPU fingerprint) and
@@ -753,12 +755,26 @@ the masking interposition and see the real host values; a raw `syscall(2)` (but
 not any libc call) also still reaches `/etc/ld.so.preload`, because the hiding
 sits at the libc entry points, not under the kernel ABI. The raw-syscall result
 is **asserted as a known outcome**, not left a surprise. Masking is
-**defense-in-depth, not a security boundary**; the filesystem view stays closed
-by the mount namespace on every path. The *visibility* of the mechanism is closed
+**defense-in-depth, not a security boundary**; the host filesystem view stays
+closed by the mount namespace on every path (`/proc` is a curated per-workspace
+payload, never the real procfs). The *visibility* of the mechanism is closed
 (ADR 79); the narrower "no shim file at all" goal is open and measured
 (ADR 77/80). See [DECISIONS.md](DECISIONS.md) #71–#80,
 [VERIFICATION.md §10](VERIFICATION.md) for the measured numbers, and
 [`scripts/identity-check.sh`](../scripts/identity-check.sh) for the assertions.
+
+### 5.7b Per-workspace limits: the curated `/proc` and the real filesystem
+
+The masking shim answers the **syscall** view with the workspace's own values;
+the curated `/proc` (see §5.2) answers the **file** view with the SAME values,
+so `free -h`, `vmstat` and a bare `df` report the workspace. The two are gated
+together (masking on) so they can never disagree. The disk allowance is a real
+per-workspace ext4 image mounted with `fuse2fs` (`internal/workspace/diskfs.go`,
+`internal/service/disk.go`), host-side, so the filesystem itself is the boundary:
+`df`/`stat -f`/`os.statvfs()` are correct with no syscall interception, and a
+write past the allowance fails `ENOSPC` at the boundary. When FUSE is unavailable
+a used-bytes watchdog stops an over-limit run (real but sampled). See
+[DECISIONS.md](DECISIONS.md) #85/#86 and [VERIFICATION.md §14](VERIFICATION.md).
 
 ### 5.8 Provider identity: workspace profiles and the egress address
 
@@ -836,10 +852,18 @@ flowchart TD
 final component so the link itself (type, target) can be reported, while still
 rejecting a link whose target escapes the root.
 
-Disk quota: `Fs` tracks bytes and `reserve(delta)` rejects writes, uploads, and
-renames that would exceed `disk_mb` with `507 insufficient_storage`. On every
-workspace load, `Recheck()` recomputes usage with a `du` walk so external
-changes can't drift the accounting.
+Disk quota: two layers. (1) A real per-workspace ext4 filesystem image
+(`{wsdir}/disk.img`) sized to `disk_mb` is mounted at the workspace root by the
+orchestrator with `fuse2fs` (`internal/workspace/diskfs.go`), so the filesystem
+itself refuses a write past the allowance (`ENOSPC`) and every reporting channel
+(`df`, `stat -f`, `os.statvfs()`) is the filesystem's own answer; the API file
+path and the sandbox see the same mounted filesystem (`WorkspaceFs` provisions
+it before use). (2) `Fs` additionally tracks bytes and `reserve(delta)` rejects
+writes, uploads and renames that would exceed `disk_mb` with
+`507 insufficient_storage`; `Recheck()` recomputes usage with a bounded walk.
+When the FUSE backend is unavailable a used-bytes watchdog (`disk_watchdog.go`)
+stops an over-limit run — real but sampled (see [DECISIONS.md](DECISIONS.md)
+#85).
 
 ---
 

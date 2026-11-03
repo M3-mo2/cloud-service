@@ -47,7 +47,7 @@ product's job; this service authenticates only static per-principal API keys.
   and the URL is **ephemeral** (never cache it). See
   [docs/DECISIONS.md](docs/DECISIONS.md) #70.
 - **Host-identity masking** — a workspace cannot identify the machine it runs on.
-  No `/proc`, no `/sys`, a generic hostname, no internal DNS, and a preload shim
+  No host `/sys`, a generic hostname, no internal DNS, and a preload shim
   (on by default, `identity.enabled`) that makes `uname`/`sysconf`/`sysinfo`
   report the **workspace's own** cpu and memory rather than the host's real size
   or a platform kernel fingerprint. The shim is reached through a read-only
@@ -70,6 +70,23 @@ product's job; this service authenticates only static per-principal API keys.
   `GET /v1/meta` report `identity_masking`, `provider_tools_hidden` and the
   offered `profiles` truthfully. See [docs/DECISIONS.md](docs/DECISIONS.md)
   #71–#83 and [scripts/identity-check.sh](scripts/identity-check.sh).
+- **Per-workspace limits you can see AND cannot exceed** — a tenant runs `df -h`
+  and sees **their own** disk allowance, runs `free -h` and sees **their own**
+  RAM. What is reported equals what is enforced. Each workspace's `/workspace` is
+  a real per-workspace ext4 filesystem image sized to `disk_mb` (mounted
+  host-side with `fuse2fs`), so `df`/`stat -f`/`os.statvfs()` are correct for
+  free and a write past the allowance fails with `ENOSPC` **at the boundary, with
+  no overshoot**. `/proc` stays the real one off (`mount_proc: false`); a
+  curated, per-workspace `/proc` payload (meminfo, cpuinfo, stat, uptime,
+  loadavg, version, vmstat, a neutral mounts table) is bound over it so `free`,
+  `vmstat`, `uptime` and a bare `df` report the workspace. Two differently-limited
+  workspaces differ on **every** channel (asserted against the hardcoded-value
+  signature). On by default (`disk.enabled`); when the host has no usable FUSE
+  the engine falls back to a used-bytes watchdog that stops an over-limit run —
+  real but **sampled**, with the overshoot measured and stated, never presented
+  as equivalent to the kernel boundary. See
+  [docs/DECISIONS.md](docs/DECISIONS.md) #85/#86 and
+  [docs/VERIFICATION.md](docs/VERIFICATION.md) §14.
 
 See [docs/API.md](docs/API.md) for the full endpoint reference.
 
@@ -161,6 +178,17 @@ Required for every deployment:
 - `nsjail` (the service runs without it, but `/readyz` reports 503 and runs return
   `503 unavailable`)
 - A host user and group named `sandbox` for sandboxed processes
+
+Required for the default per-workspace disk allowance (reports AND enforces
+`disk_mb` as a real filesystem):
+
+- `/dev/fuse`, `fuse2fs`, `mkfs.ext4`, `resize2fs` and `fusermount3`, with
+  `user_allow_other` in `/etc/fuse.conf`. These are present on a stock Ubuntu
+  24.04 host (`apt-get install fuse3 fuse2fs e2fsprogs`) and used by the
+  **orchestrator**, not inside the workspace. When they are absent the engine
+  falls back to a used-bytes watchdog (real but sampled) and `/v1/meta`
+  reports `workspace_limits.mechanism: "counter"`; set `disk.enabled: false`
+  to turn the feature off entirely.
 
 Required only for the opt-in egress and tunnel features:
 
