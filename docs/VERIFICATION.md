@@ -103,7 +103,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **347** (343 unit + 4 `integration`-tagged), including regression
+Test functions: **351** (347 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -1930,22 +1930,130 @@ $ bash scripts/docs-consistency.sh
 passed=<N> failed=0
 ```
 
-## Known limitations
+## 14. Per-workspace limits: reported AND enforced (v0.0.19)
+
+This is the operator's product requirement: a tenant runs `df -h` and sees
+**their own** disk allowance, and `free -h` and sees **their own** RAM, and
+cannot exceed either. What is reported must equal what is enforced.
+
+### 14a. The disk allowance is a real per-workspace filesystem
+
+Each workspace's `/workspace` is the mount point of a real ext4 image file
+(`{data}/workspaces/{id}/disk.img`), sized to `disk_mb` and mounted host-side by
+the orchestrator with `fuse2fs`. The workspace only ever sees the mounted
+result, so it needs neither `/dev/fuse` nor the fuse tools inside the jail.
+
+Measured, from inside a real workspace (two workspaces, limits 512MB/1cpu/256MB
+and 3072MB/2cpu/512MB):
+
+```
+w1 (disk_mb 256):  df -h /workspace  -> 256M total            os.statvfs -> total=268435456
+w2 (disk_mb 512):  df -h /workspace  -> 512M total            os.statvfs -> total=536870912
+stat -f -c %b /workspace -> 65536 (w1), 131072 (w2)   Type: fuseblk
+```
+
+The limit is enforced AT the boundary, with no overshoot:
+
+```
+dd if=/dev/zero of=/workspace/big bs=1M count=300
+  -> 239075328 bytes (228 MiB) copied        (the rest was refused)
+python f.write(300 MiB)   -> OSError: [Errno 28] No space left on device
+10 x 5MiB files into the allowance  -> only the total lands (the TOTAL is capped,
+                                       which rlimit_fsize cannot do)
+```
+
+`/workspace` reports `fuseblk`, never the host's `zfs` type, so the platform's
+100G ZFS volume is no longer visible — the previous behaviour was itself a leak.
+
+### 14b. Memory, cpu, and the curated `/proc`
+
+`mount_proc` stays **false** (the real procfs leaks host process information),
+but a curated, per-workspace `/proc` is bind-mounted read-only over it, carrying
+only the workspace's own facts:
+
+```
+meminfo      MemTotal = the workspace memory ceiling, SwapTotal 0
+cpuinfo      exactly cpu_cores processor entries
+stat         one aggregate cpu line plus one per core (top/vmstat parse it)
+uptime / loadavg / vmstat / version
+filesystems  the workspace's own mount-namespace view
+mounts, self/mounts, tab   a neutral mounts table (source token /dev/workspace)
+self/limits  the workspace's own rlimits
+```
+
+Every channel agrees, and the two differently-limited workspaces DIFFER on every
+one:
+
+```
+                       w1 (512MB/1cpu)      w2 (1024MB/2cpu)
+free -h Mem total      512Mi                1.0Gi
+/proc/meminfo MemTotal 536870912            1073741824
+os.sysconf PHYS_PAGES  536870912            1073741824
+nproc / os.cpu_count   1                    2
+os.statvfs total       268435456            536870912
+```
+
+Identical numbers across differently-limited workspaces (the hardcoded-value
+signature) are asserted against explicitly. `free`, `vmstat` and `uptime` are in
+the profile; `top` and `ps` are deliberately **excluded** (they enumerate
+`/proc/<pid>/*`, which the curated `/proc` does not carry, so they would print a
+confusing "mount -t proc proc /proc" error rather than a truthful view).
+
+### 14c. Gate results for this revision
+
+```
+identity-check.sh               113 passed / 0 failed / 2 skipped   (from 97/0/2)
+  §1  closed.paths_none_readable 0
+  §1b curated.meminfo_memtotal_workspace 262144 ; curated.cpuinfo_cpu_count 1
+      curated.meminfo_swaptotal_zero 0 ; curated.no_host_memory_leak no
+      curated.free_bytes_agree 268435456
+  §1c disk.statvfs_total_workspace 268435456 ; disk.statf_agree 65536
+      disk.df_agree 268435456 ; disk.no_host_fstype no
+      disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
+docs-consistency.sh             172 passed / 0 failed
+go test ./...                   351 test functions (from 347)
+```
+
+`identity-check.sh` §1b and §1c are the new assertions: the curated `/proc`
+reports only the workspace's own limits (with the host memory asserted ABSENT),
+and the disk channels agree with the workspace's allowance while a write past it
+fails with `ENOSPC` at the boundary.
+
+### 14d. The measured fallback (when FUSE is unavailable)
+
+If the host has no usable `/dev/fuse` (or the tools are absent) the engine falls
+back to its used-bytes counter promoted to an authority over running processes:
+a watchdog polls each active run's workspace usage and cancels a run that exceeds
+its allowance. That fallback is REAL but **sampled**: a process already writing
+can overshoot between two polls. The overshoot is bounded by
+`write_rate × counter_poll_ms`; at the default 500 ms poll a fast local writer
+can overshoot by tens of MiB before the run is stopped. This is stated as a
+number and is never presented as equivalent to the kernel boundary. The reported
+allowance is unchanged (the workspace's `disk_mb`); the mechanism is named
+truthfully in `/v1/meta.workspace_limits.mechanism` (`counter`) and its sampled
+nature in `.limits`.
+
+
 
 - SSE log streaming is deferred to v0.1; logs are polled with `offset`/`limit`.
 - **Host-identity masking is defense-in-depth, not a security boundary.** A
   statically-linked binary, a musl runtime, or a raw `syscall(2)` bypasses the
-  preload shim and sees the real host kernel, core count and RAM. The
-  filesystem view (no `/proc`, no `/sys`) is closed on every path regardless;
-  see [DECISIONS.md](DECISIONS.md) #72. This is stated, not hidden.
+  preload shim and sees the real host kernel, core count and RAM. The host
+  filesystem view (no `/sys`, and `/proc` is a CURATED per-workspace payload,
+  not the real procfs) is closed on every path regardless; see
+  [DECISIONS.md](DECISIONS.md) #72 and #85. This is stated, not hidden.
 - Multi-node storage is deferred; storage is local filesystem JSON.
 - DB-backed/dynamic authentication is deferred; keys are static in the config
   (bearer auth itself is exercised by `TestAuth*`).
 - Per-UID-per-workspace isolation is deferred to v0.1 (v0.0.18 uses a shared
   `sandbox` UID/GID with per-run user namespaces and cgroups).
-- `rlimit_fsize` bounds a single file, and `disk_mb` is enforced on the file API
-  path and via a `du` recheck on workspace load; it is not enforced by the
-  kernel against the sandboxed process tree.
+- `rlimit_fsize` bounds a single file. The workspace **directory** allowance is
+  enforced by a real per-workspace ext4 filesystem image mounted with `fuse2fs`
+  (the default `disk.backend`), so the limit is a kernel filesystem boundary: a
+  write past the allowance fails with `ENOSPC` and `df`/`stat -f`/`os.statvfs()`
+  report the workspace's own size. When the FUSE backend is unavailable the
+  engine falls back to a used-bytes watchdog that stops an over-limit run; that
+  fallback is real but **sampled** (overshoot measured, see DECISIONS.md).
 - A managed runtime (e.g. `node`/V8) reserves a large **virtual** address space
   at startup (measured: ~1.1 GiB for V8's CodeRange + heap reservations). The
   engine therefore sets `rlimit_as = memory_mb + 1024` (floored at 2048 MB),
