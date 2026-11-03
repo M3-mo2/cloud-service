@@ -53,21 +53,21 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 ### 2.1 Meta
 
 - `GET /healthz` → 200 `{"status":"ok"}`
-- `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str},"egress_decoy":{"enabled":bool,"ready":bool,"reason":str}}`
-- `GET /v1/meta` → `{"version":"0.0.18","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"egress_decoy":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
+- `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str},"workspace_limits":{"enabled":bool,"mechanism":str,"proc":bool,"proc_files":[str],"reason":str},"egress_decoy":{"enabled":bool,"ready":bool,"reason":str}}`
+- `GET /v1/meta` → `{"version":"0.0.18","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"workspace_limits":{"enabled":bool,"mechanism":str,"reporting":str,"enforcement":str,"limits":str},"egress_decoy":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
 - `GET /metrics` → Prometheus text
 
 #### What a workspace can and cannot observe
 
 This is a security property, stated plainly. A workspace runs inside an nsjail
-sandbox with no `/proc`, no `/sys`, a private mount namespace, an unprivileged
-uid, its own network namespace, and (by default) a host-identity masking shim.
-It **cannot**:
+sandbox with a private mount namespace, an unprivileged uid, its own network
+namespace, and (by default) a host-identity masking shim. It **cannot**:
 
 - read machine identity: `/etc/machine-id`, `/etc/hostname`, `/etc/hosts`,
   `/etc/os-release`, `/etc/hostid`, `/etc/shadow` are not present;
-- read the kernel's view: `/proc/version`, `/proc/meminfo`, `/proc/cpuinfo`,
-  `/proc/net/dev`, `/proc/self/cgroup`, `/proc/self/mountinfo` are not mounted;
+- read the HOST kernel's view: `/proc/net/dev`, `/proc/self/cgroup`,
+  `/proc/self/mountinfo` are not present, and `/proc` is a speculative-free,
+  CURATED per-workspace payload, not the real procfs (see below);
 - read hardware identity: `/sys/class/net` and every `/sys/class/dmi/id/*` are
   not mounted;
 - learn the host name (`socket.gethostname()` returns the generic `sandbox`);
@@ -90,7 +90,11 @@ It **cannot**:
   `dlopen("libc.so.6")` + `dlsym` lookup is answered by the shim, so
   `ctypes.CDLL("libc.so.6").uname` returns the masked value.
 
-It **can**: observe its own cpu/memory limits as configured, run code, read and
+It **can**: observe its OWN cpu, memory and disk limits as configured (`nproc`,
+`free -h`, `/proc/meminfo`, `df -h`, `stat -f` and `os.statvfs()` all report the
+workspace's own values, because `/proc` is a curated per-workspace payload and
+`/workspace` is a real per-workspace filesystem sized to `disk_mb` — see
+[DECISIONS.md](DECISIONS.md) #85/#86), run code, read and
 write its own workspace, and — with `allow_net:true` — reach the public internet,
 presenting a **platform-shared NAT address** (measured `93.185.106.128` this
 session); that address is the platform's egress and names the provider in its

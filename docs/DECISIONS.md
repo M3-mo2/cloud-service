@@ -1583,6 +1583,132 @@ and that `pip download`/github/npm/pypi still succeed. Measured this session:
 `57 passed / 0 failed / 0 skipped`. See [EGRESS-DECOY.md](EGRESS-DECOY.md) for
 the full Part 1 enumeration and Part 2 design.
 
+## Per-workspace limits: what is reported equals what is enforced
+
+The operator's product requirement: a tenant runs `df -h` and sees **their own**
+disk allowance, and `free -h` and sees **their own** RAM, and cannot exceed
+either. The bar is not "print a plausible number": a number that is reported but
+not enforced is a lie. The previous behaviour — a tenant seeing the platform's
+100G ZFS volume and its `zfs` type — was itself a leak of the host filesystem
+identity. Both switches ship **ON**.
+
+### ADR 85 — the disk allowance is a real per-workspace filesystem (kernel boundary), with a sampled counter as the fallback
+
+**Problem.** `disk_mb` was enforced only as `rlimit_fsize` (which caps **one
+file**, not the workspace directory) plus a `du` recheck on the API file path.
+Measured: N files of `disk_mb` each were allowed, `dd 2000MB` inside a workspace
+wrote 1.0G then failed with "File size limit exceeded", and `df` reported the
+platform's 100G volume throughout. Nothing observed the workspace directory as a
+whole, and `df`/`stat -f`/`os.statvfs()` reported the host filesystem.
+
+**Closed by measurement (do not re-litigate).** No loop devices (creating
+`/dev/loopN` is `Operation not permitted`); no ZFS datasets (`zpool list` = no
+pools; the container sees the mountpoint but cannot reach the pool); ext4
+project quota is irrelevant because the filesystem is ZFS. The host DOES support
+FUSE (`/dev/fuse` present, `fuse` in `/proc/filesystems`, `fusermount3`
+installed), and a per-workspace ext4 image mounted with `fuse2fs` works.
+
+**Decision — a real per-workspace filesystem (default).** Each workspace's
+`files` directory is the mount point of an ext4 image file
+(`{data}/workspaces/{id}/disk.img`) sized to its `disk_mb`, mounted **host-side
+by the orchestrator** with `fuse2fs -o allow_other,fakeroot,uid=<sandbox>,gid=<sandbox>`.
+The mount is host-side deliberately: the workspace only ever sees the mounted
+result, so it needs neither `/dev/fuse` nor the fuse tools inside the jail, and
+no device node is created (measured: creating one is `Operation not permitted`).
+`/etc/fuse.conf` carries `user_allow_other` so `allow_other` is accepted.
+
+**Why this is the strongest mechanism.** The mounted filesystem IS the
+allowance, so:
+
+- `df`, `stat -f` (including its `Type:` label), `os.statvfs()` and
+  `os.statvfs().f_blocks*f_frsize` are all correct **for free** — no syscall
+  interception, no shim. The `statvfs` family is never faked.
+- Enforcement is a **kernel filesystem boundary at the boundary**: a write past
+  the allowance fails with `ENOSPC` and **no overshoot**. Measured end-to-end:
+  `dd 300MB` into a 256MB workspace copied 239075328 bytes and was refused the
+  rest; `python f.write(300MiB)` raised `OSError: [Errno 28] No space left on
+  device`; 10×5MiB files land only up to the TOTAL (which `rlimit_fsize` cannot
+  do). The boundary refuses the write rather than sampling afterwards.
+
+**Exact sizing.** ext4's own metadata means the usable `statvfs` total is
+slightly below the image size, so `fitImage` sizes the filesystem so that the
+mounted total equals `disk_mb` **exactly**: it resizes with `resize2fs` to a
+target block count, measures the resulting `statvfs` via a transient mount, and
+corrects (`target += desired − measured`). It converges in ≤4 iterations for
+8 MiB…1 GiB (measured). So a 256MB workspace reports exactly 268435456 bytes on
+every channel.
+
+**The measured trade-off (stated, not hidden).** One image file and one
+`fuse2fs` process per workspace (the helper daemonizes and outlives the
+orchestrator, so it is reaped at startup and unmounted at shutdown). FUSE
+throughput overhead, measured this session: write ~280–340 MB/s through FUSE vs
+~1.3 GB/s native (≈0.25x), read ~1.1 GB/s through FUSE vs ~3.6 GB/s native
+(≈0.3x). At the operator's expected workspace count this is acceptable; the
+per-workspace image is sparse (a 1 GiB image is a few MiB on disk until
+written). The image is created from any pre-existing workspace content (staged
+aside on first mount and copied in), so an upgrade loses nothing.
+
+**The fallback (real but SAMPLED).** When `/dev/fuse` or the tools are
+unavailable, or `disk.backend=counter`, the engine's used-bytes counter is
+promoted to an authority over **running** processes: a watchdog polls each
+active run's workspace usage every `disk.counter_poll_ms` and cancels a run that
+exceeds its allowance. This is REAL but not instantaneous — a process already
+writing can overshoot between two polls. The overshoot is bounded by
+`write_rate × counter_poll_ms`: at the default 500 ms poll a fast local writer
+can overshoot by tens of MiB before the run is stopped. **It is never presented
+as equivalent to the kernel boundary**, and `/v1/meta.workspace_limits.mechanism`
+names which one is in use (`fuse` or `counter`). If neither can run
+(`disk.enabled=false`, `disk.backend=none`) the allowance is neither reported as
+the workspace's own nor enforced, and that is stated.
+
+**`rlimit_fsize` stays consistent.** It remains `disk_mb` per file (a coarse
+per-file backstop); the filesystem now bounds the directory as a whole, so the
+two agree rather than conflict.
+
+### ADR 86 — a curated per-workspace /proc, so free/vmstat/df report the workspace
+
+**Problem.** `mount_proc` is deliberately `false`: the real procfs leaks host
+process, network and kernel-identity information. But `free -h` was absent from
+the profile, `/proc/meminfo` and `/proc/stat` did not exist, and a tool that
+needed them failed.
+
+**Decision — a curated, per-workspace /proc payload, read-only.** The engine
+generates a directory from the workspace's OWN limits and bind-mounts it
+read-only over `/proc` (a curated directory, not the real procfs; `mount_proc`
+stays false). It carries exactly: `meminfo` (MemTotal = the memory ceiling,
+SwapTotal 0), `cpuinfo` (exactly `cpu_cores` processor entries), `stat`,
+`uptime`, `loadavg`, `version` (the same kernel string the shim's `uname`
+returns), `vmstat`, `filesystems`, `mounts`/`self/mounts`/`tab` (a neutral
+mounts table whose source token is `/dev/workspace`, so a bare `df` works and no
+host path or `zfs` type is named), and `self/limits`.
+
+**Why it is gated on masking.** The curated `/proc` and the LD_PRELOAD shim are
+the SAME channel viewed two ways: the shim answers `uname`/`sysconf`/`sysinfo`
+with the workspace's values, and the payload answers `meminfo`/`cpuinfo`/
+`version` with the SAME values. With masking OFF (a diagnostic state) neither is
+mounted, so the channels can never disagree. Every value agrees with the API
+record and with `os.sysconf`/`os.cpu_count`/`os.statvfs`; **two differently
+limited workspaces differ on every channel**, which is asserted explicitly
+because identical numbers across different limits is the hardcoded-value
+signature.
+
+**Config, default ON.** `disk.enabled: true`, `disk.backend: auto` (fuse when
+available, else counter), `disk.proc_enabled: true`. `disk.enabled=false` is the
+off switch and is reported truthfully in `/readyz.workspace_limits` and
+`/v1/meta.workspace_limits` (the honest limits, and the exact `/proc` file list,
+are published there).
+
+**`top`/`ps` are deliberately excluded** from the profile: they enumerate
+`/proc/<pid>/*` for every process, and the curated `/proc` carries no
+per-process entries (the real procfs would leak host process information). They
+would print a confusing "Error, do this: mount -t proc proc /proc" rather than a
+truthful view, so the profile omits them and its `notes` says why.
+
+**Proof.** `scripts/identity-check.sh` §1b/§1c assert the curated `/proc`
+reports only the workspace's own facts (host memory asserted ABSENT) and that
+`df`/`stat -f`/`os.statvfs` agree with the allowance while a write past it fails
+`ENOSPC`; measured `113 passed / 0 failed / 2 skipped` (from 97/0/2).
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.

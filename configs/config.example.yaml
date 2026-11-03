@@ -264,6 +264,46 @@ profiles:
   # Profile a workspace gets when its create request names none. Must be loaded.
   default: "python"
 
+# Per-workspace limits: what a workspace SEES must equal what it is ALLOWED.
+#
+# With this ON (the default), a tenant runs `df -h` and sees its OWN disk
+# allowance and `free -h`/`/proc/meminfo` its OWN memory, and cannot exceed
+# either. During a run, `/workspace` is a real per-workspace ext4 filesystem
+# image sized to the workspace's disk_mb, mounted HOST-SIDE with fuse2fs (the
+# workspace needs no /dev/fuse inside). The limit is a kernel filesystem
+# boundary: a write past it fails with ENOSPC, with no overshoot, and
+# df/stat -f/os.statvfs() are all correct for free because the mounted
+# filesystem IS the allowance. /proc is NOT the real procfs (mount_proc stays
+# false); a curated, per-workspace payload is bound over it carrying only the
+# workspace's own facts.
+disk:
+  # Server switch. true (the default) provisions the per-workspace filesystem
+  # and the curated /proc. false disables both (a diagnostic state in which the
+  # disk allowance is neither reported as the workspace's own nor enforced).
+  enabled: true
+  # Enforcement backend:
+  #   fuse    -- real per-workspace ext4 image (fuse2fs). Kernel boundary; the
+  #              strongest mechanism. Default when available.
+  #   counter -- the engine's used-bytes watchdog. REAL but SAMPLED: a running
+  #              process can overshoot before the next poll (see DECISIONS #85).
+  #   auto    -- fuse when the host supports it, else counter. (default)
+  #   none    -- no disk enforcement.
+  backend: "auto"
+  # Optional overrides for the image tools; empty uses the conventional name on
+  # PATH (fuse2fs, mkfs.ext4, resize2fs, fusermount3).
+  fuse2fs_path: ""
+  mkfs_ext4_path: ""
+  resize2fs_path: ""
+  fusermount_path: ""
+  # How often the counter watchdog audits a workspace's usage and stops an
+  # over-limit run (ms). Smaller is a tighter overshoot bound and more CPU.
+  counter_poll_ms: 500
+  # Serve the curated per-workspace /proc payload (meminfo/cpuinfo/stat/uptime/
+  # loadavg/version/vmstat/mounts plus self/limits), so free -h, uptime and a
+  # bare df report the workspace's own resources. It is mounted only when
+  # host-identity masking is also on, so the two channels can never disagree.
+  proc_enabled: true
+
 # Static API keys. Each entry maps a key to a principal_id.
 # Multiple keys may share a principal_id.
 keys:

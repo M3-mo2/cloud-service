@@ -152,6 +152,7 @@ Readiness probe. Unauthenticated.
   "nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},
   "tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str},
   "provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str},
+  "workspace_limits":{"enabled":bool,"mechanism":str,"proc":bool,"proc_files":[str],"reason":str},
   "egress_decoy":{"enabled":bool,"ready":bool,"reason":str}}`.
 - **Errors:** none; unsuitability is expressed by the 503 and the boolean fields.
 - **Semantics:** `data_dir` is true when a temp file can be created under the
@@ -168,6 +169,12 @@ Readiness probe. Unauthenticated.
   true, `ready` reports whether the decoy CA and profile materialized;
   enabled-but-not-ready makes the probe 503, so a deploy that would serve the
   real identity is never reported ready. See `docs/EGRESS-DECOY.md` and ADR 84.
+  `workspace_limits` reports how a workspace's own disk allowance and memory are
+  made visible and enforced: `enabled` is the `disk.enabled` switch, `mechanism`
+  is the effective backend (`fuse`, `counter`, or `none`), `proc` is whether the
+  curated per-workspace `/proc` is served and `proc_files` lists exactly what it
+  carries. The two-workspace differentiation and the enforcement proof are in
+  `docs/VERIFICATION.md` §14 and ADR 85/86.
 
 ```sh
 curl -s localhost:8080/readyz
@@ -237,6 +244,12 @@ default per-workspace limits.
       "mechanism": "in-namespace stub DNS resolver + stub HTTP/TLS responder, one consistent per-workspace decoy profile, with a generated CA trusted inside the workspace and in-namespace nft rules forcing DNS to the stub",
       "limits": "a decoy layer, NOT a security boundary: a tenant's OWN endpoint (they read the peer address in their own logs) is unfixable; a hardcoded-IP endpoint outside the covered set, intermediate traceroute hops, and MTU/ICMP fingerprinting are out of scope; a knowledgeable tenant can recognise a documentation-range address"
     },
+    "workspace_limits": {
+      "enabled": true, "mechanism": "fuse",
+      "reporting": "real per-workspace ext4 filesystem image (fuse2fs), host-side mounted; df/stat -f/os.statvfs are the filesystem's own answers",
+      "enforcement": "kernel filesystem boundary: a write past the allowance fails with ENOSPC, no overshoot",
+      "limits": "one image file and one fuse2fs process per workspace; FUSE throughput overhead (measured ~0.4x native write, ~0.3x read)"
+    },
     "profiles": {
       "ready": true,
       "default": "python",
@@ -282,6 +295,13 @@ default per-workspace limits.
   **decoy, not a security boundary** (a tenant's own endpoint, traceroute hops,
   and hardcoded-IP endpoints are out of scope). See
   [EGRESS-DECOY.md](EGRESS-DECOY.md) and [DECISIONS.md](DECISIONS.md) ADR 84.
+  `workspace_limits` reports the per-workspace resource visibility and
+  enforcement (`disk.enabled`, default true): `mechanism` is the effective disk
+  backend (`fuse` = a real per-workspace ext4 filesystem, kernel boundary;
+  `counter` = the engine's used-bytes watchdog, real but **sampled**; `none` =
+  neither reported nor enforced), `reporting`/`enforcement`/`limits` state what
+  each backend does and its cost, and `reason` explains a fallback. See
+  [DECISIONS.md](DECISIONS.md) ADR 85/86 and `docs/VERIFICATION.md` §14.
   `profiles` reports the tool profiles a client can choose from: `default` is the
   profile a workspace gets when its create omits one, `ready` is whether the
   registry loaded and the default exists (`reason` explains a `ready:false`), and

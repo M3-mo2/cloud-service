@@ -1259,6 +1259,23 @@ components:
             enabled: { type: boolean }
             ready: { type: boolean }
             reason: { type: string }
+        workspace_limits:
+          type: object
+          description: >-
+            Per-workspace resource visibility and enforcement. `enabled` is the
+            disk.enabled switch (default true); `mechanism` is the effective disk
+            backend (fuse = a real per-workspace ext4 filesystem, kernel boundary;
+            counter = the engine's used-bytes watchdog, real but sampled; none =
+            neither reported nor enforced); `proc` is whether the curated
+            per-workspace /proc is served and `proc_files` lists what it carries.
+          properties:
+            enabled: { type: boolean }
+            mechanism: { type: string }
+            proc: { type: boolean }
+            proc_files:
+              type: array
+              items: { type: string }
+            reason: { type: string }
     Meta:
       type: object
       required: [version, api_version, runtimes, limits_defaults]
@@ -1342,6 +1359,23 @@ components:
             ready: { type: boolean }
             reason: { type: string }
             mechanism: { type: string }
+            limits: { type: string }
+        workspace_limits:
+          type: object
+          description: >-
+            Per-workspace resource visibility and enforcement. `enabled` is the
+            disk.enabled switch (default true); `mechanism` is the effective disk
+            backend (fuse = a real per-workspace ext4 filesystem sized to
+            disk_mb, mounted host-side, a kernel boundary with no overshoot;
+            counter = the engine's used-bytes watchdog, real but sampled; none =
+            neither reported nor enforced); `reporting`/`enforcement`/`limits`
+            state what each backend does and its cost.
+          properties:
+            enabled: { type: boolean }
+            mechanism: { type: string }
+            reason: { type: string }
+            reporting: { type: string }
+            enforcement: { type: string }
             limits: { type: string }
     Limits:
       type: object

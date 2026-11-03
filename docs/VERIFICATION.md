@@ -1930,7 +1930,7 @@ $ bash scripts/docs-consistency.sh
 passed=<N> failed=0
 ```
 
-## 14. Per-workspace limits: reported AND enforced (v0.0.19)
+## 14. Per-workspace limits: reported AND enforced
 
 This is the operator's product requirement: a tenant runs `df -h` and sees
 **their own** disk allowance, and `free -h` and sees **their own** RAM, and
