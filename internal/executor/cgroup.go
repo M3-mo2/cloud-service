@@ -254,26 +254,41 @@ func KillCgroupTreeNested(path string) {
 	removeCgroupTree(path)
 }
 
-// readOOMKill reads the cumulative oom_kill counter of a cgroup's
-// memory.events.local (the events that occurred in THIS cgroup, excluding
-// descendants). It returns -1 when the file cannot be read, so a caller can tell
-// "no counter available" from "counter is zero" and a missing counter never
-// fabricates an OOM.
+// readOOMKill reads the cumulative OOM count of a cgroup from `memory.events`
+// (which INCLUDES descendants): the sum of `oom_kill` and `oom_group_kill`.
+//
+// It deliberately does NOT use `memory.events.local`: a workspace parent has no
+// processes of its own (they live in the leaf cgroups), so with
+// `memory.oom.group=1` the parent's LOCAL counter records `oom_group_kill` and
+// leaves `oom_kill` at 0 (measured). Reading the descendant-inclusive file (and
+// summing both fields) counts either kind of OOM the workspace hit.
+//
+// It returns -1 when the file cannot be read, so a caller can tell "no counter
+// available" from "counter is zero" and a missing counter never fabricates an
+// OOM.
 func readOOMKill(dir string) int64 {
 	if dir == "" {
 		return -1
 	}
-	b, err := os.ReadFile(filepath.Join(dir, "memory.events.local"))
+	b, err := os.ReadFile(filepath.Join(dir, "memory.events"))
 	if err != nil {
 		return -1
 	}
+	var total int64
+	seen := false
 	for _, line := range strings.Split(string(b), "\n") {
-		if v, ok := strings.CutPrefix(line, "oom_kill "); ok {
-			n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-			if err == nil {
-				return n
+		for _, key := range []string{"oom_kill ", "oom_group_kill "} {
+			if v, ok := strings.CutPrefix(line, key); ok {
+				n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+				if err == nil {
+					total += n
+					seen = true
+				}
 			}
 		}
 	}
-	return -1
+	if !seen {
+		return -1
+	}
+	return total
 }

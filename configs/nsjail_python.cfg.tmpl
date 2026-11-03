@@ -33,7 +33,7 @@ use_cgroupv2: true
 # be pointed here at launch. Empty (a host without engine-managed cgroups, or a
 # legacy record) omits the field and nsjail uses its default root layout.
 {{- if .Cgroupv2Mount }}
-cgroupv2_mount: {{ .Cgroupv2Mount }}
+cgroupv2_mount: "{{ .Cgroupv2Mount }}"
 {{- end }}
 
 # Do not mount /proc: it leaks host process information.

@@ -115,8 +115,18 @@ root_leaves() { ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null | wc -l | tr -d ' '; }
 nested_leaves_for() { ls -d "/sys/fs/cgroup/ws-$1"/NSJAIL.* 2>/dev/null | wc -l | tr -d ' '; }
 fuse_count() { ps -eo comm --no-headers | grep -cx fuse2fs; }
 
-add_int() { # path -> integer or 0
+add_int() { # path field -> integer or 0
   awk '/'"$2"' /{print $2}' "$1" 2>/dev/null || echo 0
+}
+
+# oomcount -> the workspace parent's cumulative OOM count. It reads
+# memory.events (descendant-inclusive: a parent has no processes of its own) and
+# sums oom_kill and oom_group_kill, because with memory.oom.group=1 the group
+# kill is recorded as oom_group_kill (measured).
+oomcount() {
+  local f="/sys/fs/cgroup/ws-$1/memory.events"
+  [ -r "$f" ] || { echo 0; return; }
+  awk '/^oom_kill /{a=$2} /^oom_group_kill /{g=$2} END{print a+g+0}' "$f"
 }
 
 # snap_ws_field WS FIELD -> a field of the workspace's one-shot metrics frame.
@@ -285,7 +295,7 @@ done
 chk "single 2 x memory_mb allocation is refused (status != exited)" "yes" \
   "$([ "$ST" != "exited" ] && echo yes || echo "no($ST)")"
 chk "single 2 x memory_mb allocation reads as oom" "oom" "$ST"
-OOM1=$(add_int "/sys/fs/cgroup/ws-$W/memory.events.local" "oom_kill")
+OOM1=$(oomcount "$W")
 chkbool "parent recorded an oom_kill (the ceiling fired)" "yes" "$([ "${OOM1:-0}" -ge 1 ] && echo yes || echo "no($OOM1)")"
 
 # THREE concurrent runs each holding ~0.9 x M: the SUM ~2.7 x M exceeds M, so the
@@ -309,7 +319,7 @@ for _ in $(seq 1 60); do
   n=$(nested_leaves_for "$W")
   [ "${n:-0}" -ge 2 ] && LIVE_SEEN=1
   # Stop early once the ceiling has fired (the parent recorded an OOM).
-  now=$(add_int "/sys/fs/cgroup/ws-$W/memory.events.local" "oom_kill")
+  now=$(oomcount "$W")
   [ "${now:-0}" -gt "${OOM1:-0}" ] && break
   sleep 0.5
 done
@@ -322,7 +332,7 @@ chkbool "ram_used <= ram_limit under load" "yes" \
 PCT=$(snap_ws_field "$W" ram_percent); PCT=${PCT:-0}
 chkbool "ram_percent <= 100 under load" "yes" \
   "$(awk "BEGIN{exit !($PCT <= 100)}" && echo yes || echo "no(pct=$PCT)")"
-OOM2=$(add_int "/sys/fs/cgroup/ws-$W/memory.events.local" "oom_kill")
+OOM2=$(oomcount "$W")
 chkbool "the SUM ceiling fired an oom_kill" "yes" "$([ "${OOM2:-0}" -gt "${OOM1:-0}" ] && echo yes || echo "no($OOM1->$OOM2)")"
 # At least one of the concurrent runs must read as oom (not a clean exit).
 for _ in $(seq 1 60); do
@@ -371,18 +381,18 @@ echo "=== 4b) the disk budget is the workspace's own allowance ==="
 # the engine's reported disk limit. This pins the disk mechanism (already
 # correct) so it cannot silently regress.
 DF_LIMIT=$(curl -s -X POST "$BASE/v1/workspaces/$W/exec" -H "$A" -H "$J" \
-  -d '{"cmd":["sh","-c","df -B1 /workspace | tail -1 | awk \"{print \\\$2}\""]}' | jf "['stdout']" | tr -d '\n')
+  --data-binary '{"cmd":["sh","-c","df -B1 --output=size /workspace | tail -1"]}' | jf "['stdout']" | tr -d ' \n')
 chk "workspace df size equals disk_mb" "$((64 * 1024 * 1024))" "$DF_LIMIT"
 # Write 100 MiB: must fail (the allowance is 64 MiB).
 OVER=$(curl -s -X POST "$BASE/v1/workspaces/$W/exec" -H "$A" -H "$J" \
-  -d '{"cmd":["sh","-c","dd if=/dev/zero of=/workspace/over.bin bs=1M count=100 2>&1; echo RC=$?"]}' | jf "['stdout']")
+  --data-binary '{"cmd":["sh","-c","dd if=/dev/zero of=/workspace/over.bin bs=1M count=100 2>&1; echo RC=$?"]}' | jf "['stdout']")
 chkbool "a write past disk_mb is refused (No space left / non-zero)" "yes" \
   "$(printf '%s' "$OVER" | grep -qiE 'No space left|RC=[1-9]' && echo yes || echo "no($OVER)")"
 # The engine's reported disk limit matches the allowance.
 DL=$(snap_ws_field "$W" disk_limit_bytes)
 chk "reported disk_limit_bytes == disk_mb" "$((64 * 1024 * 1024))" "$DL"
 curl -s -X POST "$BASE/v1/workspaces/$W/exec" -H "$A" -H "$J" \
-  -d '{"cmd":["sh","-c","rm -f /workspace/over.bin"]}' >/dev/null 2>&1 || true
+  --data-binary '{"cmd":["sh","-c","rm -f /workspace/over.bin"]}' >/dev/null 2>&1 || true
 
 # ---- 5) a setsid()-escaped process is still killed on stop ----
 echo "=== 5) setsid()-escaped process is still killed (the kill path survived) ==="
@@ -414,7 +424,7 @@ chk "setsid-escaped process killed by the workspace stop" "gone" "$ALIVE"
 # ---- 6) delete removes the parent cgroup and leaves nothing behind ----
 echo "=== 6) delete removes the parent cgroup and leaves nothing behind ==="
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 40 -X DELETE "$BASE/v1/workspaces/$W" -H "$A")
-chk "workspace delete" "200" "$CODE"
+chk "workspace delete" "204" "$CODE"
 GONE="no"
 for _ in $(seq 1 20); do
   [ ! -d "/sys/fs/cgroup/ws-$W" ] && { GONE="yes"; break; }; sleep 0.3

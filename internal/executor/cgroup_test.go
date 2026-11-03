@@ -87,19 +87,28 @@ func TestEnsureWorkspaceCgroupRejectsEmptyID(t *testing.T) {
 	}
 }
 
-// TestReadOOMKill proves the OOM counter is parsed from memory.events.local, and
-// that a missing file yields -1 (no counter) rather than a fabricated 0.
+// TestReadOOMKill proves the OOM counter is parsed from memory.events (the
+// descendant-inclusive file), summing oom_kill and oom_group_kill, and that a
+// missing file yields -1 (no counter) rather than a fabricated 0.
 func TestReadOOMKill(t *testing.T) {
 	dir := t.TempDir()
 	if got := readOOMKill(dir); got != -1 {
 		t.Fatalf("missing events file = %d, want -1", got)
 	}
-	events := "low 0\nhigh 0\nmax 37\noom 1\noom_kill 2\noom_group_kill 1\n"
-	if err := os.WriteFile(filepath.Join(dir, "memory.events.local"), []byte(events), 0o644); err != nil {
+	// A group kill records oom_group_kill (with oom_kill left at 0); both must
+	// count, because the workspace parent's own processes live in the leaf.
+	events := "low 0\nhigh 0\nmax 37\noom 1\noom_kill 0\noom_group_kill 1\n"
+	if err := os.WriteFile(filepath.Join(dir, "memory.events"), []byte(events), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := readOOMKill(dir); got != 2 {
-		t.Fatalf("oom_kill = %d, want 2", got)
+	if got := readOOMKill(dir); got != 1 {
+		t.Fatalf("oom count = %d, want 1 (oom_group_kill)", got)
+	}
+	// Both fields sum.
+	both := "oom_kill 2\noom_group_kill 3\n"
+	os.WriteFile(filepath.Join(dir, "memory.events"), []byte(both), 0o644)
+	if got := readOOMKill(dir); got != 5 {
+		t.Fatalf("oom count = %d, want 5 (2 + 3)", got)
 	}
 	if got := readOOMKill(""); got != -1 {
 		t.Fatalf("empty dir = %d, want -1", got)
