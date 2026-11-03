@@ -125,7 +125,7 @@ func TestResponderBodiesConsistent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewResponder(cfg, ca, "ws-xyz")
+	r := NewResponder(cfg, ca, "ws-xyz", nil)
 	p := r.Profile
 	cases := []struct {
 		host, path, wantIP, wantOrg string
@@ -164,7 +164,7 @@ func TestResponderBodiesConsistent(t *testing.T) {
 func TestResponderCloudflareTraceFields(t *testing.T) {
 	cfg := Defaults()
 	ca, _ := NewCA(cfg.Org)
-	r := NewResponder(cfg, ca, "ws-t")
+	r := NewResponder(cfg, ca, "ws-t", nil)
 	_, _, body := r.Respond(httpReq{Host: "www.cloudflare.com", Path: "/cdn-cgi/trace"}, "www.cloudflare.com")
 	for _, needle := range []string{"ip=", "loc=", "colo=", "warp=", "h="} {
 		if !strings.Contains(body, needle) {
@@ -179,7 +179,7 @@ func TestResponderCloudflareTraceFields(t *testing.T) {
 func TestResponderDoHJSON(t *testing.T) {
 	cfg := Defaults()
 	ca, _ := NewCA(cfg.Org)
-	r := NewResponder(cfg, ca, "ws-doh")
+	r := NewResponder(cfg, ca, "ws-doh", nil)
 	_, _, body := r.Respond(httpReq{Host: "cloudflare-dns.com", Path: "/dns-query", Query: "name=myip.opendns.com&type=A"}, "cloudflare-dns.com")
 	var v struct {
 		Answer []struct {

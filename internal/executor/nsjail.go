@@ -19,6 +19,7 @@ import (
 
 	"sandboxd/configs"
 	"sandboxd/internal/config"
+	"sandboxd/internal/decoy"
 	"sandboxd/internal/model"
 	"sandboxd/internal/profile"
 )
@@ -94,6 +95,11 @@ func (r *NsjailRunner) WarmProfiles() error {
 
 // Profiles returns the loaded profile registry (nil when it failed to load).
 func (r *NsjailRunner) Profiles() *profile.Registry { return r.profiles }
+
+// SetDecoyCA attaches the egress-decoy CA to the trust-store overlay so the
+// stub TLS responder is trusted inside every workspace. It must be called
+// before the first run (the overlay is materialized once).
+func (r *NsjailRunner) SetDecoyCA(ca *decoy.CA) { r.mask.SetDecoyCA(ca) }
 
 // ProfileStatus reports the profile registry capability truthfully. ready is
 // false when the configured profiles could not be loaded or the configured

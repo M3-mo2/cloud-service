@@ -28,6 +28,11 @@ type Resolver struct {
 	Profile  Profile
 	Upstream []string
 	Port     int
+	// CA, when set, also serves DNS-over-TLS on Port+? so a client that uses
+	// DoT (port 853) gets the same controlled answers instead of a failure.
+	CA *CA
+	// DOTPort is the DNS-over-TLS listener port (0 disables DoT).
+	DOTPort int
 
 	mu       sync.Mutex
 	counters map[string]uint64
@@ -57,12 +62,23 @@ func (r *Resolver) Serve(ctx context.Context) error {
 		uc.Close()
 		return fmt.Errorf("decoy resolver: tcp bind: %w", err)
 	}
-	go r.serveUDP(ctx, uc)
-	go r.serveTCP(ctx, tc)
-	<-ctx.Done()
-	uc.Close()
-	tc.Close()
-	return nil
+	defer uc.Close()
+	defer tc.Close()
+	return r.serveBound(ctx, uc, tc)
+}
+
+// serveBound runs the resolver over already-bound listeners so the helper can
+// bind synchronously and signal readiness before any traffic arrives.
+func (r *Resolver) serveBound(ctx context.Context, uc *net.UDPConn, tc *net.TCPListener) error {
+	done := make(chan struct{}, 2)
+	go func() { r.serveUDP(ctx, uc); done <- struct{}{} }()
+	go func() { r.serveTCP(ctx, tc); done <- struct{}{} }()
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-done:
+		return nil
+	}
 }
 
 func (r *Resolver) serveUDP(ctx context.Context, c *net.UDPConn) {

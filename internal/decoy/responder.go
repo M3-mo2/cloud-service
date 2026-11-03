@@ -3,6 +3,7 @@ package decoy
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,11 +24,16 @@ type Responder struct {
 	CA       *CA
 	HTTPPort int
 	TLS      bool
+	// dot is the shared resolver used to answer a DNS-over-TLS frame that
+	// arrives on the TLS port (the nft rules redirect port 853 there), so
+	// `kdig +tls @1.1.1.1` gets the decoy too.
+	dot *Resolver
 }
 
-// NewResponder builds a responder for one workspace.
-func NewResponder(cfg Config, ca *CA, workspaceID string) *Responder {
-	return &Responder{cfg: cfg, Profile: cfg.Derive(workspaceID), CA: ca, HTTPPort: cfg.HTTPPort}
+// NewResponder builds a responder for one workspace. res, when non-nil, lets
+// the TLS port answer DNS-over-TLS frames as well.
+func NewResponder(cfg Config, ca *CA, workspaceID string, res *Resolver) *Responder {
+	return &Responder{cfg: cfg, Profile: cfg.Derive(workspaceID), CA: ca, HTTPPort: cfg.HTTPPort, dot: res}
 }
 
 // Serve runs both the plain-HTTP and the TLS listener until ctx is cancelled.
@@ -43,6 +49,14 @@ func (r *Responder) Serve(ctx context.Context) error {
 		httpLn.Close()
 		return fmt.Errorf("decoy responder: https bind: %w", err)
 	}
+	defer httpLn.Close()
+	defer tlsLn.Close()
+	return r.serveBound(ctx, httpLn, tlsLn)
+}
+
+// serveBound runs the responder over already-bound listeners so the helper can
+// bind synchronously and signal readiness first.
+func (r *Responder) serveBound(ctx context.Context, httpLn, tlsLn net.Listener) error {
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -53,12 +67,17 @@ func (r *Responder) Serve(ctx context.Context) error {
 			return r.CA.Leaf(host)
 		},
 	}
-	go r.acceptLoop(ctx, httpLn, false)
-	go r.acceptLoop(ctx, tls.NewListener(tlsLn, tlsCfg), true)
-	<-ctx.Done()
-	httpLn.Close()
-	tlsLn.Close()
-	return nil
+	// Bind the wrapped TLS listener up front so a client never races a nil.
+	wrapped := tls.NewListener(tlsLn, tlsCfg)
+	done := make(chan struct{}, 2)
+	go func() { r.acceptLoop(ctx, httpLn, false); done <- struct{}{} }()
+	go func() { r.acceptLoop(ctx, wrapped, true); done <- struct{}{} }()
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-done:
+		return nil
+	}
 }
 
 func (r *Responder) acceptLoop(ctx context.Context, ln net.Listener, isTLS bool) {
@@ -89,7 +108,21 @@ func (r *Responder) handle(conn net.Conn, isTLS bool) {
 		}
 		host = strings.TrimSuffix(tc.ConnectionState().ServerName, ".")
 	}
-	req, err := readRequest(conn)
+	// Peek the first bytes to distinguish HTTP from DNS-over-TLS on the same
+	// TLS port. A DNS-over-TLS frame starts with a 2-byte big-endian length
+	// whose first byte is 0x00 for any query under 256 bytes; an HTTP request
+	// starts with an ASCII method. This lets one listener answer both without a
+	// second port, so `kdig +tls @1.1.1.1` gets the decoy too.
+	var lead [1]byte
+	n, err := conn.Read(lead[:])
+	if err != nil || n == 0 {
+		return
+	}
+	if looksLikeDNSFrame(lead[0]) {
+		r.handleDoT(conn, lead[0])
+		return
+	}
+	req, err := readRequestWithLead(conn, lead[0])
 	if err != nil {
 		return
 	}
@@ -102,6 +135,37 @@ func (r *Responder) handle(conn net.Conn, isTLS bool) {
 	conn.Write([]byte(resp))
 }
 
+// looksLikeDNSFrame reports whether a leading byte begins a DNS-over-TLS frame
+// (a 2-byte length prefix whose high byte is 0). HTTP methods all start with a
+// letter (G, P, H, O, D, ...), never NUL.
+func looksLikeDNSFrame(b byte) bool { return b == 0 }
+
+// handleDoT reads one DNS-over-TLS frame (2-byte length + message), answers it
+// with the same logic as the UDP/TCP resolver, and writes the response.
+func (r *Responder) handleDoT(conn net.Conn, first byte) {
+	var lenBuf [2]byte
+	lenBuf[0] = first
+	if _, err := readFull(conn, lenBuf[1:]); err != nil {
+		return
+	}
+	n := int(binary.BigEndian.Uint16(lenBuf[:]))
+	if n <= 0 || n > 4096 {
+		return
+	}
+	msg := make([]byte, n)
+	if _, err := readFull(conn, msg); err != nil {
+		return
+	}
+	if r.dot == nil {
+		return
+	}
+	resp := r.dot.answer(msg)
+	out := make([]byte, 2+len(resp))
+	binary.BigEndian.PutUint16(out, uint16(len(resp)))
+	copy(out[2:], resp)
+	conn.Write(out)
+}
+
 // httpReq is the minimal request view the responder needs.
 type httpReq struct {
 	Method string
@@ -111,9 +175,18 @@ type httpReq struct {
 }
 
 func readRequest(c net.Conn) (httpReq, error) {
+	return readRequestWithLead(c, 0)
+}
+
+// readRequestWithLead reads a request whose first byte has already been consumed
+// (lead != 0), so the DNS/HTTP discriminator does not lose it.
+func readRequestWithLead(c net.Conn, lead byte) (httpReq, error) {
 	buf, err := io.ReadAll(io.LimitReader(c, 1<<16))
 	if err != nil {
 		return httpReq{}, err
+	}
+	if lead != 0 {
+		buf = append([]byte{lead}, buf...)
 	}
 	text := string(buf)
 	lines := strings.Split(text, "\r\n")

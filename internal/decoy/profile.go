@@ -62,10 +62,11 @@ type Config struct {
 	RDNS string
 	// ResolverPort, HTTPPort and HTTPSPort are the in-namespace ports the stub
 	// servers bind; the in-netns nft rules redirect port 53 and the covered
-	// address's 80/443 to them.
+	// address's 80/443 to them. DOTPort is the DNS-over-TLS listener.
 	ResolverPort int
 	HTTPPort     int
 	HTTPSPort    int
+	DOTPort      int
 	// ExtraHosts are additional hostnames to intercept, matched exactly (or as
 	// a suffix when prefixed with ".").
 	ExtraHosts []string
@@ -88,6 +89,7 @@ func Defaults() Config {
 		ResolverPort: 15353,
 		HTTPPort:     18080,
 		HTTPSPort:    18443,
+		DOTPort:      18853,
 	}
 }
 

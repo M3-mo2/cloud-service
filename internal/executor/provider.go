@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"sandboxd/internal/config"
+	"sandboxd/internal/decoy"
 )
 
 // This file implements the "provider identity" part of host masking: hiding the
@@ -350,6 +351,38 @@ func buildFilteredAccountFile(src, dst string, denied func(string) bool) error {
 		out = append(out, '\n')
 	}
 	return os.WriteFile(dst, out, 0o644)
+}
+
+// amendCertsWithDecoy adds the egress-decoy CA to the materialized curated
+// trust store, so the stub TLS responder's certificates verify inside the
+// workspace and NO certificate warning is shown (a warning is worse than
+// nothing: it tells the tenant the environment is tampered with). The CA
+// certificate is appended to the concatenated bundle at ca-certificates.crt
+// (which is what curl, python's ssl, and the OpenSSL default paths read) and
+// also installed under its OpenSSL hashed name for a capath lookup. It is a
+// no-op when the overlay did not materialize a trust store.
+func amendCertsWithDecoy(certsDir string, ca *decoy.CA) error {
+	if certsDir == "" || ca == nil {
+		return nil
+	}
+	const bundle = "ca-certificates.crt"
+	bp := filepath.Join(certsDir, bundle)
+	if raw, err := os.ReadFile(bp); err == nil {
+		if !bytes.Contains(raw, ca.CertPEM) {
+			out := append(append([]byte(nil), raw...), '\n')
+			out = append(out, ca.CertPEM...)
+			if err := os.WriteFile(bp, out, 0o644); err != nil {
+				return err
+			}
+		}
+	} else if os.IsNotExist(err) {
+		if err := os.WriteFile(bp, ca.CertPEM, 0o644); err != nil {
+			return err
+		}
+	} else {
+		return err
+	}
+	return os.WriteFile(filepath.Join(certsDir, ca.FileName()), ca.CertPEM, 0o644)
 }
 
 // providerNamesProviderSource reports whether a /etc/ssl/certs symlink target

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -16,6 +17,7 @@ import (
 	"sandboxd/internal/api"
 	"sandboxd/internal/auth"
 	"sandboxd/internal/config"
+	"sandboxd/internal/decoy"
 	"sandboxd/internal/executor"
 	"sandboxd/internal/model"
 	"sandboxd/internal/network"
@@ -34,6 +36,22 @@ func mustPrefix(s string) netip.Prefix {
 }
 
 func main() {
+	// The egress-decoy helper is a re-exec of THIS binary inside a workspace's
+	// network namespace (`nsenter --net=<ws> sandboxd __decoy-serve <spec>`).
+	// It is a hidden subcommand, not a normal operator verb, and must be
+	// dispatched before flag parsing so `--config` is not required.
+	if len(os.Args) > 1 && os.Args[1] == decoy.ServeSubcommand {
+		specPath := ""
+		if len(os.Args) > 2 {
+			specPath = os.Args[2]
+		}
+		if err := decoy.ServeFromSpecFile(specPath); err != nil {
+			fmt.Fprintln(os.Stderr, "decoy-serve:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	configPath := flag.String("config", "config.yaml", "path to the YAML configuration file")
 	flag.Parse()
 
@@ -73,6 +91,18 @@ func main() {
 	if cfg.Network.Enabled {
 		if err := netMgr.EnsureRelay(); err != nil {
 			logger.Error("network relay setup failed; allow_net workspaces will have no egress", "error", err)
+		}
+	}
+	// Egress-decoy layer, when the operator turns it on: trust the generated
+	// CA inside every workspace (added to the materialized trust store) so the
+	// stub TLS responder presents a valid certificate and no warning is shown.
+	// It must be attached before the runner materializes the trust overlay.
+	if netMgr.DecoyEnabled() {
+		ca, err := netMgr.DecoyCA()
+		if err != nil {
+			logger.Error("egress decoy CA unavailable; refusing to serve a decoy that would warn", "error", err)
+		} else {
+			runner.SetDecoyCA(ca)
 		}
 	}
 	svc.SetNetwork(netMgr)

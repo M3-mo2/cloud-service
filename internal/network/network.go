@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"sandboxd/internal/config"
+	"sandboxd/internal/decoy"
 )
 
 // Fixed names/values for the engine-owned relay namespace. The relay is a peer
@@ -81,6 +82,10 @@ type Manager struct {
 
 	// tunnels holds the live tunnel processes keyed by tunnel id.
 	tunnels map[string]*tunnelProc
+
+	// decoy owns the egress-decoy layer (stub resolver + TLS responder + CA +
+	// in-netns rules). nil when no decoy manager was built.
+	decoy *decoyManager
 }
 
 // NewManager constructs a manager over the real host.
@@ -95,7 +100,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 }
 
 func newManagerWithSystem(cfg ManagerConfig, sys system) *Manager {
-	return &Manager{
+	m := &Manager{
 		sys:       sys,
 		cfg:       cfg,
 		alloc:     newAllocator(cfg.WorkspaceSubnet.Addr(), 1<<8),
@@ -103,6 +108,14 @@ func newManagerWithSystem(cfg ManagerConfig, sys system) *Manager {
 		slirpCmds: map[string]*os.Process{},
 		tunnels:   map[string]*tunnelProc{},
 	}
+	if cfg.Network.Decoy.Enabled {
+		caDir := ""
+		if cfg.ResolverDir != "" {
+			caDir = filepath.Join(cfg.ResolverDir, "egress-decoy")
+		}
+		m.decoy = newDecoyManager(cfg.Network.Decoy, cfg.Network.Resolver, caDir)
+	}
+	return m
 }
 
 // Available reports whether the host has the tools this layer needs.
@@ -127,6 +140,33 @@ func (m *Manager) toolHint() string {
 
 // EgressEnabled reports whether the egress layer is configured on.
 func (m *Manager) EgressEnabled() bool { return m.cfg.Network.Enabled }
+
+// DecoyEnabled reports whether the egress-decoy layer is configured on.
+func (m *Manager) DecoyEnabled() bool { return m != nil && m.decoy != nil && m.decoy.Enabled() }
+
+// DecoyCA returns the decoy certificate authority (nil when the layer is off),
+// so the executor can trust it inside the workspace's trust store.
+func (m *Manager) DecoyCA() (*decoy.CA, error) {
+	if m == nil || m.decoy == nil {
+		return nil, nil
+	}
+	return m.decoy.CA()
+}
+
+// DecoyStatus reports the decoy layer truthfully: enabled, ready (the CA
+// materialized), and a note on any failure.
+func (m *Manager) DecoyStatus() (enabled, ready bool, note string) {
+	if m == nil || m.decoy == nil || !m.decoy.Enabled() {
+		return false, false, "network.decoy.enabled is false"
+	}
+	if _, err := m.decoy.CA(); err != nil {
+		return true, false, err.Error()
+	}
+	if _, err := m.decoy.decoyConfig(); err != nil {
+		return true, false, err.Error()
+	}
+	return true, true, ""
+}
 
 // EnsureRelay creates the relay namespace and connects it to the host with one
 // slirp4netns instance, then installs the private-range blackholes. It is
@@ -312,6 +352,17 @@ func (m *Manager) buildWorkspaceEgress(alloc *Allocation) error {
 		return fmt.Errorf("connect workspace to relay: %w", err)
 	}
 	m.slirpCmds[alloc.WorkspaceID] = proc
+	// Egress-decoy layer, when configured: start the stubs inside this very
+	// namespace and install the in-namespace redirect. A failure is returned so
+	// the workspace is refused rather than silently serving the real address.
+	if m.DecoyEnabled() {
+		if err := m.decoy.StartFor(alloc.WorkspaceID, m.netnsPath(name)); err != nil {
+			_ = proc.Kill()
+			m.destroyNetns(name)
+			delete(m.slirpCmds, alloc.WorkspaceID)
+			return fmt.Errorf("start egress decoy: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -339,6 +390,9 @@ func (m *Manager) ReleaseWorkspace(wsID string) {
 	if p := m.slirpCmds[wsID]; p != nil {
 		_ = p.Kill()
 		delete(m.slirpCmds, wsID)
+	}
+	if m.DecoyEnabled() {
+		m.decoy.StopFor(wsID, m.netnsPath(m.wsNetnsName(wsID)))
 	}
 	m.destroyNetns(m.wsNetnsName(wsID))
 	delete(m.applied, wsID)
@@ -383,6 +437,11 @@ func (m *Manager) ReapOrphans(live map[string]bool) int {
 	for wsID, p := range m.slirpCmds {
 		_ = p.Kill()
 		delete(m.slirpCmds, wsID)
+	}
+	// Decoy helpers are engine-owned children; kill the ones this process
+	// tracked and any orphan matched by argv, before their namespaces go.
+	if m.DecoyEnabled() {
+		m.decoy.ReapOrphans()
 	}
 	if m.relayCmd != nil {
 		_ = m.relayCmd.Kill()
@@ -465,6 +524,10 @@ func (m *Manager) Stop() {
 		m.relayCmd = nil
 	}
 	m.relayApplied = false
+	// Stop every decoy helper this process started, before its namespace goes.
+	if m.DecoyEnabled() {
+		m.decoy.ReapOrphans()
+	}
 	// Tear down EVERY engine-owned namespace under NetnsDir, not only those
 	// that had an inner slirp: an allow_net:false workspace has an empty
 	// namespace with no slirp process, and it must not be left behind either.
@@ -583,8 +646,15 @@ func (m *Manager) WriteResolverConf(alloc *Allocation) (string, error) {
 	}
 	path := filepath.Join(m.cfg.ResolverDir, "egress-resolv-"+shortID(alloc.WorkspaceID)+".conf")
 	var b strings.Builder
-	for _, ns := range m.cfg.Network.Resolver {
-		b.WriteString("nameserver " + ns + "\n")
+	if m.DecoyEnabled() {
+		// With the decoy layer on, name the in-namespace stub resolver. The
+		// nft redirect forces every port-53 query to it anyway, but naming it
+		// here makes the workspace behave normally even before the redirect.
+		b.WriteString("nameserver 127.0.0.1\n")
+	} else {
+		for _, ns := range m.cfg.Network.Resolver {
+			b.WriteString("nameserver " + ns + "\n")
+		}
 	}
 	b.WriteString("options timeout:2 attempts:2\n")
 	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {

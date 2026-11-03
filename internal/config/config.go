@@ -158,6 +158,44 @@ type NetworkConfig struct {
 	// ignores the proxy environment variables, or reaches an address directly,
 	// is not constrained by it.
 	EgressProxy string `koanf:"egress_proxy"`
+	// Decoy is the egress-decoy layer: an in-namespace stub resolver and
+	// stub HTTP/TLS responder that answer a workspace's attempts to learn its
+	// own public IP with a plausible invented identity. DEFAULT OFF, so no
+	// existing gate changes unless an operator turns it on. It is a decoy
+	// layer, not a security boundary: see docs/EGRESS-DECOY.md and ADR 84.
+	Decoy DecoyConfig `koanf:"decoy"`
+}
+
+// DecoyConfig controls the egress-decoy layer. Every field has a safe default;
+// turning the layer on is a single `network.decoy.enabled: true`.
+type DecoyConfig struct {
+	// Enabled turns the whole layer on. When false nothing is started and the
+	// workspace's resolv.conf names the configured public resolvers as before.
+	Enabled bool `koanf:"enabled"`
+	// AddressRange is the CIDR decoy addresses are drawn from. Documentation
+	// ranges (198.51.100.0/24, 203.0.113.0/24, 192.0.2.0/24) are the safe
+	// default; a knowledgeable tenant can recognise them, so an operator may
+	// prefer a range he owns. See the ADR.
+	AddressRange string `koanf:"address_range"`
+	// Org / ASN / City / Country / Region / RDNS are the shared decoy profile
+	// fields served by every channel.
+	Org     string `koanf:"org"`
+	ASN     string `koanf:"asn"`
+	City    string `koanf:"city"`
+	Country string `koanf:"country"`
+	Region  string `koanf:"region"`
+	RDNS    string `koanf:"rdns"`
+	// ResolverPort / HTTPPort / HTTPSPort / DOTPort are the in-namespace ports
+	// the stubs bind; the nft rules redirect 53/80/443/853 to them.
+	ResolverPort int `koanf:"resolver_port"`
+	HTTPPort     int `koanf:"http_port"`
+	HTTPSPort    int `koanf:"https_port"`
+	DOTPort      int `koanf:"dot_port"`
+	// ExtraHosts / ExtraPatterns add hostnames or regular expressions to the
+	// intercepted set (the built-in shape patterns already cover the common
+	// services and invented variants).
+	ExtraHosts    []string `koanf:"extra_hosts"`
+	ExtraPatterns []string `koanf:"extra_patterns"`
 }
 
 // TunnelsConfig controls quick Cloudflare tunnels (cloudflared), exposing one
@@ -390,6 +428,29 @@ func (s SandboxConfig) KillGrace() time.Duration {
 	return time.Duration(s.KillGraceSec) * time.Second
 }
 
+// DefaultDecoy returns the neutral, DISABLED egress-decoy configuration. The
+// documentation range 198.51.100.0/24 is the safe default; the ADR notes that a
+// knowledgeable tenant can recognise it, so an operator may prefer a range he
+// owns.
+func DefaultDecoy() DecoyConfig {
+	return DecoyConfig{
+		Enabled:       false,
+		AddressRange:  "198.51.100.0/24",
+		Org:           "Example Transit Networks",
+		ASN:           "AS64500",
+		City:          "Frankfurt",
+		Country:       "DE",
+		Region:        "Hesse",
+		RDNS:          "example-transit.net",
+		ResolverPort:  15353,
+		HTTPPort:      18080,
+		HTTPSPort:     18443,
+		DOTPort:       18853,
+		ExtraHosts:    nil,
+		ExtraPatterns: nil,
+	}
+}
+
 // Default returns a configuration populated with safe defaults.
 func Default() Config {
 	return Config{
@@ -454,6 +515,7 @@ func Default() Config {
 			Resolver:       []string{"1.1.1.1", "8.8.8.8"},
 			StartTimeoutMS: 5000,
 			EgressProxy:    "",
+			Decoy:          DefaultDecoy(),
 		},
 		Tunnels: TunnelsConfig{
 			Enabled:         false,
@@ -626,6 +688,45 @@ func (c *Config) applyDefaults() {
 	if net.StartTimeoutMS <= 0 {
 		net.StartTimeoutMS = d.Network.StartTimeoutMS
 	}
+	// Egress decoy: fill every unset field from the neutral defaults so a
+	// partial `network.decoy` block (e.g. only `enabled: true`) still yields a
+	// complete, safe profile. Enabled is deliberately NOT defaulted here: it
+	// lives in rawDefaults so an explicit `enabled: true` survives.
+	dec := &net.Decoy
+	dd := d.Network.Decoy
+	if dec.AddressRange == "" {
+		dec.AddressRange = dd.AddressRange
+	}
+	if dec.Org == "" {
+		dec.Org = dd.Org
+	}
+	if dec.ASN == "" {
+		dec.ASN = dd.ASN
+	}
+	if dec.City == "" {
+		dec.City = dd.City
+	}
+	if dec.Country == "" {
+		dec.Country = dd.Country
+	}
+	if dec.Region == "" {
+		dec.Region = dd.Region
+	}
+	if dec.RDNS == "" {
+		dec.RDNS = dd.RDNS
+	}
+	if dec.ResolverPort <= 0 || dec.ResolverPort > 65535 {
+		dec.ResolverPort = dd.ResolverPort
+	}
+	if dec.HTTPPort <= 0 || dec.HTTPPort > 65535 {
+		dec.HTTPPort = dd.HTTPPort
+	}
+	if dec.HTTPSPort <= 0 || dec.HTTPSPort > 65535 {
+		dec.HTTPSPort = dd.HTTPSPort
+	}
+	if dec.DOTPort <= 0 || dec.DOTPort > 65535 {
+		dec.DOTPort = dd.DOTPort
+	}
 	tun := &c.Tunnels
 	if tun.MaxPerWorkspace <= 0 {
 		tun.MaxPerWorkspace = d.Tunnels.MaxPerWorkspace
@@ -711,6 +812,21 @@ network:
   resolver: ["1.1.1.1", "8.8.8.8"]
   start_timeout_ms: 5000
   egress_proxy: ""
+  decoy:
+    enabled: false
+    address_range: "198.51.100.0/24"
+    org: "Example Transit Networks"
+    asn: "AS64500"
+    city: "Frankfurt"
+    country: "DE"
+    region: "Hesse"
+    rdns: "example-transit.net"
+    resolver_port: 15353
+    http_port: 18080
+    https_port: 18443
+    dot_port: 18853
+    extra_hosts: []
+    extra_patterns: []
 tunnels:
   enabled: false
   max_per_workspace: 2

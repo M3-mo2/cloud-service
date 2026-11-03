@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"sandboxd/internal/config"
+	"sandboxd/internal/decoy"
 	"sandboxd/internal/profile"
 )
 
@@ -89,6 +90,12 @@ type masker struct {
 	overlayNote  string
 	overlays     providerOverlays
 
+	// decoy, when set, is the egress-decoy layer. When it is enabled the
+	// materialized curated CA bundle is amended with the decoy CA certificate,
+	// so the stub TLS responder is trusted inside the workspace and no
+	// certificate warning is ever shown. nil when the layer is off.
+	decoy *decoy.CA
+
 	// profileSourceRoot is the filesystem root per-profile trees are read from
 	// (empty or "/" means the real host; a fixture path is used by unit tests).
 	profileSourceRoot string
@@ -134,6 +141,13 @@ func (m *masker) profileTree(p *profile.Profile) (profileOverlay, error) {
 
 // Enabled reports whether masking is turned on by configuration.
 func (m *masker) Enabled() bool { return m.cfg.Enabled }
+
+// SetDecoyCA attaches the egress-decoy CA so the curated trust store mounted
+// into every workspace also trusts the decoy responder's certificates. It must
+// be called before the first run (prepare() caches the materialized bundle).
+func (m *masker) SetDecoyCA(ca *decoy.CA) {
+	m.decoy = ca
+}
 
 // shimHostPath returns the host path of the materialized shim. The materialized
 // file is given an opaque name so it never appears (in a diagnostic or a mount
@@ -207,6 +221,14 @@ func (m *masker) prepareProviderOverlays() {
 		return
 	}
 	m.overlays = overlays
+	// When the egress-decoy layer is on, trust its CA inside the workspace by
+	// adding it to the materialized bundle. A failure only means the stub's
+	// certificate would warn (worse than nothing), so it is recorded loudly.
+	if m.decoy != nil {
+		if err := amendCertsWithDecoy(overlays.CertsDir, m.decoy); err != nil {
+			m.overlayNote = "egress-decoy CA not trusted: " + err.Error()
+		}
+	}
 	m.overlayReady = true
 }
 
