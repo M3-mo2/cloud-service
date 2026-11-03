@@ -43,8 +43,8 @@ type subscriptionJSON struct {
 }
 
 // summaryJSON is the derived workspace view. remaining_sec is clamped at 0 and
-// is never negative; state disambiguates a 0 (unlimited vs locked vs the last
-// second of a live term).
+// rounded up, so a live term never reports 0: it is 0 exactly when the term is
+// locked (an unlimited workspace carries no subscription object).
 type summaryJSON struct {
 	State          string            `json:"state"`
 	AgeSec         int64             `json:"age_sec"`

@@ -342,8 +342,8 @@ type WorkspaceSummary struct {
 	Subscription   *SubscriptionSummary
 }
 
-// SubscriptionSummary is the derived term view. remaining_sec is clamped at 0
-// and NEVER negative; State disambiguates a 0.
+// SubscriptionSummary is the derived term view. remaining_sec is clamped at 0,
+// never negative, and rounded up, so it is 0 exactly when the term is locked.
 type SubscriptionSummary struct {
 	State        string
 	ExpiresAt    time.Time

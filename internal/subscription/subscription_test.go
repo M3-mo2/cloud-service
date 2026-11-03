@@ -211,6 +211,26 @@ func TestDerivationsStates(t *testing.T) {
 	}
 }
 
+// TestRemainingZeroImpliesLocked pins the hard invariant: a live term NEVER
+// reports remaining_sec 0, so "remaining_sec == 0" always means locked.
+func TestRemainingZeroImpliesLocked(t *testing.T) {
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	s := &model.Subscription{GrantedAt: now, ExpiresAt: now.Add(10 * time.Second)}
+	// A live term in its final HALF second must round up to 1, not floor to 0.
+	state, _, rem, _, _, _ := Derivations(s.ExpiresAt.Add(-500*time.Millisecond), s)
+	if state == StateLocked {
+		t.Fatalf("live term reported locked before expiry")
+	}
+	if rem != 1 {
+		t.Fatalf("remaining = %d, want 1 (never 0 while live)", rem)
+	}
+	// Exactly at expiry -> locked, 0.
+	state, _, rem, _, _, _ = Derivations(s.ExpiresAt, s)
+	if state != StateLocked || rem != 0 {
+		t.Fatalf("at expiry state=%s rem=%d, want locked/0", state, rem)
+	}
+}
+
 // TestDerivationsShortTermNotAlwaysExpiringSoon checks the window has no floor:
 // a 10s term is not "expiring_soon" for its whole life.
 func TestDerivationsShortTermNotAlwaysExpiringSoon(t *testing.T) {

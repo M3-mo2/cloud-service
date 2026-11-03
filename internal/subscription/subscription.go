@@ -208,9 +208,9 @@ func expiringSoonWindow(term time.Duration) time.Duration {
 
 // Derivations returns the cheap, derived numbers for a workspace's term at now.
 // It performs no I/O: every value comes from the stored subscription and now.
-// remaining_sec is clamped at 0 and NEVER negative; state disambiguates a 0 that
-// means "no limit" (unlimited) from a 0 that means "expired" (locked) from a 0
-// that merely means "the last instant" (active with < 1s left, reported 0).
+// remaining_sec is clamped at 0, never negative, and rounded UP to whole
+// seconds, so a live term never reports 0: remaining_sec == 0 is exactly the
+// locked state (an unlimited workspace has no subscription summary at all).
 func Derivations(now time.Time, sub *model.Subscription) (state string, expiresAt time.Time, remainingSec int64, graceEndsAt, lockedAt time.Time, extensions int) {
 	if !sub.HasExpiry() {
 		return StateUnlimited, time.Time{}, 0, time.Time{}, time.Time{}, 0
@@ -232,5 +232,10 @@ func Derivations(now time.Time, sub *model.Subscription) (state string, expiresA
 	if term > 0 && remaining <= expiringSoonWindow(term) {
 		st = StateExpiringSoon
 	}
-	return st, sub.ExpiresAt, int64(remaining / time.Second), graceEnds, sub.LockedAt, sub.Extensions
+	// Round UP to whole seconds so a live term never reports 0: this makes
+	// "remaining_sec == 0 => locked" a hard invariant (a locked term reports 0;
+	// a live one reports >= 1). An unlimited workspace has no subscription
+	// summary at all.
+	secs := int64((remaining + time.Second - 1) / time.Second)
+	return st, sub.ExpiresAt, secs, graceEnds, sub.LockedAt, sub.Extensions
 }

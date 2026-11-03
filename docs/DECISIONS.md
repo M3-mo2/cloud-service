@@ -1951,7 +1951,7 @@ advertised in `GET /v1/meta` under `subscriptions`. It carries `state`
 `runs{total,active}`, `disk{used_bytes,limit_bytes}` and `profile`. `disk.used`
 is a single `statvfs` of the already-mounted filesystem (0 when not mounted — it
 never walks). `remaining_sec` is clamped at 0 and is **never negative**; `state`
-disambiguates a 0 (unlimited vs locked vs the last second of a live term). The
+is 0 exactly when the term is locked (rounded up, so a live term never reports 0). The
 numbers agree with enforcement because both read the same pure function.
 
 **Status derivation.** The API renders the **derived** status (`DeriveStatus`),

@@ -174,10 +174,11 @@ and is never touched by the reaper; that is the default.
   walk: `state` (`active`/`expiring_soon`/`locked`/`unlimited`, threshold
   `min(10% of the term, 24h)`), `age_sec`/`created_at`, `last_activity_at`,
   `runs{total,active}`, `disk{used_bytes,limit_bytes}`, `profile`, and
-  `subscription{state,expires_at,remaining_sec,grace_ends_at,extensions,locked_at}`.
-  `remaining_sec` is clamped at 0 and is never negative; `state` disambiguates a
-  0. The numbers agree with enforcement: `remaining_sec: 0` with `state:locked`
-  means the workspace really is refusing compute.
+ `subscription{state,expires_at,remaining_sec,grace_ends_at,extensions,locked_at}`.
+ `remaining_sec` is clamped at 0 and rounded up, so it is `0` **exactly when**
+ the term is `locked` (a live term never reports 0; an unlimited workspace has no
+ subscription object). The numbers agree with enforcement: `remaining_sec: 0`
+ means the workspace really is locked and refusing compute.
 
 **`PATCH` — runtime-mutable settings.** All fields are optional; an absent field
 **or an explicit `null`** keeps the current value (a `null` never resets a field

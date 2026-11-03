@@ -2314,10 +2314,12 @@ each list item), computed from stored fields with **no directory walk**:
 | `summary.subscription.locked_at` | when the reaper locked it (absent when never) |
 
 The threshold for `expiring_soon` is `min(10% of the granted term, 24 h)`.
-`remaining_sec` is `0` for `unlimited` (no limit), for `locked` (expired), and
-for a live term in its final second; `state` disambiguates. **The numbers agree
-with enforcement**: if the summary says `remaining_sec` is `0` with
-`state:locked`, the workspace is actually refusing compute.
+`remaining_sec` is rounded **up** to whole seconds, so a live term never reports
+`0`: `remaining_sec` is `0` **exactly when** the term is `locked` (or, for a
+workspace with no term, the summary carries no subscription object at all). This
+makes `remaining_sec: 0` a hard signal of a lock. **The numbers agree with
+enforcement**: if the summary says `remaining_sec` is `0` the workspace is
+actually locked and refusing compute.
 
 ### Enforcement: lock, refuse, delete
 

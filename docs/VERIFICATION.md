@@ -104,7 +104,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **393** (389 unit + 4 `integration`-tagged), including regression
+Test functions: **394** (390 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -151,6 +151,7 @@ including the boundary instants exactly at expiry and exactly at grace end:
 `TestDecideBoundaries`, `TestDecideBackwardsClockNeverDeletes`,
 `TestDecideGraceFromStoredGraceEndsAt`, `TestDerivationsUnlimited`,
 `TestDerivationsStates`, `TestDerivationsShortTermNotAlwaysExpiringSoon`,
+`TestRemainingZeroImpliesLocked`,
 `TestExpiringSoonWindow`, `TestApproximationConstants`; and the lifecycle with an
 injected clock: `TestCreateWithDurationSetsExpiry`,
 `TestCreateWithNoSubscriptionIsUnlimited`, `TestCreateDefaultDurationConfig`,
@@ -173,7 +174,7 @@ file (the same measure `scripts/docs-consistency.sh` asserts against):
 
 ```
 $ find . -name '*_test.go' -exec grep -hE '^func Test' {} + | wc -l
-393
+394
 ```
 
 ## 2. Probes
@@ -2026,7 +2027,7 @@ What each group proves:
 instant: exactly at expiry, exactly at grace end; the backwards-clock rule) and
 the derivations (unlimited, active, expiring-soon, locked, clamped-at-0); the
 service adds the whole lifecycle with an injected clock; the API adds the
-request/response contract. Suite total `393` test functions (see §1).
+request/response contract. Suite total `394` test functions (see §1).
 
 ## 10. Decisions
 
@@ -2217,7 +2218,7 @@ identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/
       disk.df_bare_workspace_1k 262144
       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
 docs-consistency.sh             193 passed / 0 failed
-go test ./...                  393 test functions (from 353)
+go test ./...                  394 test functions (from 353)
 ```
 
 The full gate set re-run for this revision, one gate at a time (concurrent runs
@@ -2231,7 +2232,7 @@ scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped   (real quick 
 scripts/identity-check.sh       131 passed / 0 failed / 2 skipped
 scripts/egress-decoy-check.sh    58 passed / 0 failed / 0 skipped
 scripts/subscription-check.sh    61 passed / 0 failed             (compressed clock; see §9l)
-go test ./...                    393 test functions; go vet ./... clean
+go test ./...                    394 test functions; go vet ./... clean
 ```
 
 `identity-check.sh` §1b and §1c are the new assertions: the curated `/proc`

@@ -1529,7 +1529,7 @@ components:
       properties:
         state: { type: string, enum: [active, expiring_soon, locked, unlimited] }
         expires_at: { type: string, format: date-time }
-        remaining_sec: { type: integer, format: int64, description: "Whole seconds until expiry, CLAMPED AT 0 and never negative. state disambiguates a 0 (unlimited vs locked vs the last second of a live term)." }
+        remaining_sec: { type: integer, format: int64, description: "Whole seconds until expiry, CLAMPED AT 0 and never negative, rounded UP so a live term never reports 0 (0 exactly when locked)." }
         grace_ends_at: { type: string, format: date-time }
         extensions: { type: integer }
         locked_at: { type: string, format: date-time }
