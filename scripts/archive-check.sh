@@ -308,7 +308,7 @@ CODE=$(upload "$FIX/zip/normal.zip" "$W" "/dst")
 chk "normal.zip extract status" "200" "$CODE"
 chk "normal format" "zip" "$(jbody '.format')"
 chk "normal entries_rejected" "0" "$(jbody '.entries_rejected')"
-chk "normal main.py content" "print(1)" "$(content "$W" /dst/src/main.py)"
+chk "normal main.py content" 'print("hello")' "$(content "$W" /dst/src/main.py)"
 chk "normal nested dir listing" "200" "$(statcode "$W" /dst/src/util)"
 chk "normal empty file exists" "200" "$(statcode "$W" /dst/src/empty.txt)"
 chk "normal empty file size" "0" "$(statsize "$W" /dst/src/empty.txt)"
@@ -414,10 +414,10 @@ chk "seed extraction status" "200" "$CODE"
 CODE=$(upload "$FIX/zip/normal.zip" "$W" "/ow")
 chk "collision refused 409" "409" "$CODE"
 chk "collision code" "archive_entry_exists" "$(err_code)"
-chk "collision preserved content" "print(1)" "$(content "$W" /ow/src/main.py)"
+chk "collision preserved content" 'print("hello")' "$(content "$W" /ow/src/main.py)"
 CODE=$(upload "$FIX/zip/normal.zip" "$W" "/ow" -F "overwrite=true")
 chk "overwrite:true status" "200" "$CODE"
-chk "overwrite replaced content" "print(1)" "$(content "$W" /ow/src/main.py)"
+chk "overwrite replaced content" 'print("hello")' "$(content "$W" /ow/src/main.py)"
 
 echo "=== 16) in-place extract on an uploaded archive ==="
 up=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
