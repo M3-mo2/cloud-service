@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -94,6 +95,66 @@ func TestDiskManagerDistinctPerWorkspace(t *testing.T) {
 }
 
 func isENOSPC(err error) bool { return errors.Is(err, syscall.ENOSPC) }
+
+// TestDiskManagerHidesLostFound proves the ext4-internal /lost+found is removed
+// from a workspace's visible root on BOTH the fresh-create path and the
+// e2fsck-repair path (the case a one-shot removal at image creation misses: a
+// repair recreates the directory). It is skipped when the host has no usable
+// FUSE backend.
+func TestDiskManagerHidesLostFound(t *testing.T) {
+	dm := NewDiskManager(DiskManagerConfig{})
+	if ok, reason := dm.Available(); !ok {
+		t.Skipf("fuse backend unavailable: %s", reason)
+	}
+	if _, err := exec.LookPath("debugfs"); err != nil {
+		t.Skip("debugfs not available to dirty the image")
+	}
+	root := filepath.Join(t.TempDir(), "files")
+	if err := dm.Ensure(root, 64); err != nil {
+		t.Skipf("fuse mount not permitted here: %v", err)
+	}
+	defer func() { _ = dm.Remove(root) }()
+	lf := filepath.Join(root, "lost+found")
+	if _, err := os.Lstat(lf); !os.IsNotExist(err) {
+		t.Fatalf("fresh workspace root still has lost+found (err=%v)", err)
+	}
+	// The image still carries the directory inside (the user's requirement is
+	// that it not be VISIBLE, not that it not exist); prove it is there in the
+	// image so the removal is a real removal, not a no-op on an absent dir.
+	img := imagePath(root)
+	if err := dm.Release(root); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	// Put the directory back and dirty the superblock, exactly the state a
+	// repair leaves and an interrupted write leaves.
+	if out, err := exec.Command("debugfs", "-w", "-R", "mkdir /lost+found", img).CombinedOutput(); err != nil {
+		t.Fatalf("debugfs mkdir lost+found: %v: %s", err, out)
+	}
+	if out, err := exec.Command("debugfs", "-w", "-R", "ssv state 0", img).CombinedOutput(); err != nil {
+		t.Fatalf("debugfs dirty: %v: %s", err, out)
+	}
+	if !debugfsHasLostFound(t, img) {
+		t.Fatal("precondition failed: image does not contain /lost+found before reprovision")
+	}
+	// Re-provision at a different size: resize2fs refuses the dirty superblock,
+	// so the engine runs e2fsck (which recreates /lost+found) and retries.
+	if err := dm.Ensure(root, 96); err != nil {
+		t.Fatalf("Ensure on a dirty image did not self-heal: %v", err)
+	}
+	if _, err := os.Lstat(lf); !os.IsNotExist(err) {
+		t.Fatalf("after the repair the visible root still has lost+found (err=%v)", err)
+	}
+}
+
+// debugfsHasLostFound reports whether an image's root contains lost+found.
+func debugfsHasLostFound(t *testing.T, img string) bool {
+	t.Helper()
+	out, err := exec.Command("debugfs", "-R", "ls -p /", img).Output()
+	if err != nil {
+		t.Fatalf("debugfs ls: %v", err)
+	}
+	return strings.Contains(string(out), "/lost+found")
+}
 
 // TestDiskManagerResizeRepairsDirtyImage proves the self-healing path: an image
 // left with a dirty ext4 superblock (which makes resize2fs refuse with "Please

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // DiskBackend selects how a workspace's disk allowance is enforced.
@@ -127,6 +128,11 @@ func (d *DiskManager) Ensure(root string, sizeMB int) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if st, ok := d.state[root]; ok && st.mounted && st.sizeMB == sizeMB {
+		if st.mountErr == nil {
+			if err := clearLostFound(root); err != nil {
+				return err
+			}
+		}
 		return st.mountErr
 	}
 	if sizeMB < 1 {
@@ -145,6 +151,13 @@ func (d *DiskManager) Ensure(root string, sizeMB int) error {
 	// resized offline).
 	if mountedFuse(root) {
 		if cur, err := fsTotalMB(root); err == nil && cur == int64(sizeMB) {
+			// Already mounted at the right size: still converge the visible
+			// root (an image repaired by e2fsck regains /lost+found even when
+			// no resize is needed).
+			if err := clearLostFound(root); err != nil {
+				d.state[root] = &diskState{image: img, mounted: true, sizeMB: sizeMB, mountErr: err}
+				return err
+			}
 			d.state[root] = &diskState{image: img, mounted: true, sizeMB: sizeMB}
 			return nil
 		}
@@ -158,7 +171,78 @@ func (d *DiskManager) Ensure(root string, sizeMB int) error {
 		d.state[root] = &diskState{image: img, mounted: false, sizeMB: sizeMB, mountErr: err}
 		return err
 	}
+	// The workspace is now mounted but not yet usable: hide the ext4-internal
+	// /lost+found before recording the disk ready. This runs AFTER mkfs.ext4 and
+	// AFTER any e2fsck repair, so it converges for a NEW image and for an image
+	// e2fsck has just repaired. See clearLostFound and docs/DECISIONS.md ADR 98.
+	if err := clearLostFound(root); err != nil {
+		d.state[root] = &diskState{image: img, mounted: true, sizeMB: sizeMB, mountErr: err}
+		return err
+	}
 	d.state[root] = &diskState{image: img, mounted: true, sizeMB: sizeMB}
+	return nil
+}
+
+// clearLostFound removes the ext4-internal `/lost+found` from a MOUNTED
+// workspace root so the tenant's visible root contains only what the tenant put
+// there. It is called on every provisioning path, AFTER mkfs.ext4 and AFTER any
+// e2fsck repair, so it converges for a new image and for an image a repair has
+// just re-marked.
+//
+// WHY IT IS NEEDED (a property of ext4, not of this codebase). `mkfs.ext4`
+// creates `/lost+found` in every new filesystem, and `e2fsck` RECREATES it
+// whenever it runs (measured: `e2fsck -p -f` on an image whose directory was
+// removed prints `/lost+found not found.  CREATED.` and puts it back, exit 1).
+// The engine runs e2fsck on an image it finds dirty, so a one-shot removal at
+// image creation is not enough: the directory returns the first time a repair
+// runs. Removing it on every provisioning path, mounted, is what makes the fix
+// hold.
+//
+// REMOVAL THROUGH THE MOUNTED ROOT, in one place. The image root is mounted
+// read-write at the workspace root already (the workspace's own mount), so a
+// plain rmdir of `{root}/lost+found` is the mechanism; no extra tool and no
+// second read-write mount is introduced. It is idempotent: a missing directory
+// is not an error.
+//
+// THE TRADE-OFF, stated honestly. `/lost+found` is where fsck reconnects
+// ORPHANED inodes after a corruption. Removing it leaves a repair with nowhere
+// to put such files. This is normally empty (mkfs.ext4 creates it empty; the
+// measured `e2fsck -p -f` that recreates it recreates it empty), and an empty
+// directory holds nothing, so nothing of the tenant's is lost: the tenant's
+// INTACT files are untouched, because e2fsck never moves a reachable file into
+// lost+found. What is lost is only the recovery of orphaned inodes on a
+// genuinely corrupt image. So that the safety net is not destroyed silently, a
+// NON-empty `/lost+found` is LEFT IN PLACE rather than deleted: the only way it
+// becomes non-empty is a repair that actually reconnected orphaned inodes, and
+// deleting it then would destroy exactly the data it exists to hold. In that
+// rare, corruption-only case the directory stays visible (the tenant can see
+// and recover the recovered files), rather than being hidden at the cost of
+// their contents.
+func clearLostFound(root string) error {
+	lf := filepath.Join(root, "lost+found")
+	fi, err := os.Lstat(lf)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	// Only the ext4 directory itself is a candidate. A differently-typed entry
+	// (e.g. a symlink or a regular file the tenant created) is left alone: the
+	// mechanism must not remove anything the tenant put in the workspace.
+	if !fi.IsDir() {
+		return nil
+	}
+	if err := os.Remove(lf); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
+			// A repair reconnected orphaned inodes; keep them.
+			return nil
+		}
+		return err
+	}
 	return nil
 }
 

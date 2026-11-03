@@ -46,7 +46,8 @@ reports `"cgroups":true`.
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/archive-check.sh` → `102 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/metrics-check.sh` → `56 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/spread-check.sh` → `32 passed / 0 failed`
-> - `bash scripts/docs-consistency.sh` → `258 passed / 0 failed`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/lostfound-check.sh` → `27 passed / 0 failed`
+> - `bash scripts/docs-consistency.sh` → `401 passed / 0 failed`
 >
 > The unprivileged suites (`gofmt`, `go build`, `go vet`, `go test ./...`, the
 > handler-level assertions and the sandbox-config render tests) were re-run and
@@ -107,7 +108,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **522** (517 unit + 4 `integration`-tagged), including regression
+Test functions: **523** (519 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -2397,7 +2398,7 @@ binary's.
 
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **96** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **98** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -2606,15 +2607,15 @@ identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/
        disk.dfh_root_ok ok ; disk.dfh_root_has_row yes
        disk.df_bare_workspace_1k 262144
        disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
- docs-consistency.sh             294 passed / 0 failed
- go test ./...                   522 test functions
+  docs-consistency.sh             401 passed / 0 failed   (389 before the lost+found additions)
+  go test ./...                   523 test functions
 ```
 
 The full gate set re-run for this revision, one gate at a time (concurrent runs
 corrupt the `docs-consistency` tally), all green:
 
 ```
-scripts/docs-consistency.sh     294 passed / 0 failed   (272 before the ports additions)
+scripts/docs-consistency.sh     401 passed / 0 failed   (389 before the lost+found additions)
 scripts/acceptance.sh           113 passed / 0 failed
 scripts/process-stop-check.sh    30 passed / 0 failed
 scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped   (real quick tunnel)
@@ -2626,8 +2627,16 @@ scripts/metrics-check.sh         56 passed / 0 failed
 scripts/spread-check.sh          32 passed / 0 failed
 scripts/write-rate-check.sh      29 passed / 0 failed             (write-rate ceiling; see §9p; 1 transient 28/1 on a loaded host, then 29/0 on re-runs)
 scripts/ports-check.sh           49 passed / 0 failed             (native port discovery; see §9q)
-go test ./...                    522 test functions; go vet ./... clean
+scripts/lostfound-check.sh       27 passed / 0 failed             (hiding the ext4-internal lost+found; see §9r; red-proof 16/11 with the fix disabled)
+go test ./...                    523 test functions; go vet ./... clean
 ```
+
+`scripts/lostfound-check.sh` is the new gate for this revision: it drives the
+real service against the host's real nsjail and a real FUSE disk and proves the
+ext4-internal `/lost+found` is absent from the visible root on both the
+fresh-create path **and** the `e2fsck`-repair path (it dirties a real image and
+restarts), that an existing workspace converges with no file loss, and that the
+disk boundary is unchanged. See §9r.
 
 `scripts/ports-check.sh` is the new gate for this revision: it drives the real
 service against the host's real nsjail and asserts the whole port-discovery
@@ -2866,6 +2875,111 @@ nature in `.limits`.
   bare-host run fails writing `uid_map`; this is a host restriction, not a bug in
   sandboxd. Verification therefore runs the service in a privileged container
   with `--cgroupns=host`.
+
+## 9r. Hiding the ext4-internal `lost+found` from the workspace root (this revision)
+
+The operator ran `ls` in a fresh workspace and found only `lost+found`, which
+looks like leftover junk in his product. The requirement, in his words: *the
+directory may exist inside the image; it must not appear in what the workspace
+user sees at the root* (`«خليه موجود عادي بس في ~/ مش داخل ~/workspace»`).
+
+**Why it was there (measured — a property of ext4, not of this codebase).** A
+workspace's disk is a real ext4 image (`mkfs.ext4`, mounted host-side with
+`fuse2fs` at the workspace root). `mkfs.ext4` creates `/lost+found` in **every**
+new filesystem, and the engine mounts the image root at the workspace root, so
+the image's `/lost+found` is exactly what the tenant's `ls` shows. The inode's
+`ctime` equals the image's own write time to the second.
+
+**The rejected route (measured — do not re-litigate).** Mounting a subdirectory
+of the image as the workspace root (`fuse2fs -o subdir=/home …`) is **not
+available here**: this build links FUSE library **2.9.9** and rejects the option
+(`fuse: unknown option 'subdir=/home'`), even though `fuse2fs --helpfull` lists
+it. A design that mounts a subdirectory as the workspace root is therefore not
+available.
+
+**Why a one-shot removal fails (measured).** Removing `/lost+found` from the
+image works (the mount still succeeds and the root is clean), **but `e2fsck`
+puts it back every time**. Measured, with a plain check, a forced check (`-f`)
+and a forced repair (`-fy`):
+
+```
+Pass 3: Checking directory connectivity
+/lost+found not found.  Create? yes
+```
+
+After any of them the directory is present again. This matters because the
+engine runs `e2fsck` on an image it finds **dirty** (a workspace whose sandbox
+was killed mid-write), so the mechanism must be removal that is **re-applied at
+the right point in the lifecycle**, not a one-shot edit at image creation.
+
+**The fix.** `clearLostFound` removes `{root}/lost+found` from the **mounted**
+workspace root — a plain `os.Remove` through the workspace's own read-write mount
+(no new mount, no second read-write mount; the `diskfs.go` read-write warning is
+about the transient probe in `fitImage` and is untouched) — and `DiskManager.
+Ensure` calls it on **every** provisioning path, including the already-mounted-
+at-the-right-size early return. So it runs **after `mkfs.ext4`** and **after any
+`e2fsck` repair**, and it is idempotent (a missing directory is not an error). A
+non-directory entry at that name (something the tenant created) is left alone.
+
+**The trade-off, stated honestly.** `/lost+found` is where `fsck` reconnects
+**orphaned inodes** after a corruption. It is normally empty: `mkfs.ext4` creates
+it empty and the measured `e2fsck -p -f` recreates it empty, and an empty
+directory holds nothing. `e2fsck` never moves a **reachable** file into
+`lost+found`, so removing an empty one loses **none of the tenant's intact
+files**. The only thing lost is the recovery of **orphaned inodes on a genuinely
+corrupt image**. To keep that safety net from being destroyed silently, a
+**non-empty** `/lost+found` is left in place rather than deleted — the only way
+it becomes non-empty is a repair that actually reconnected orphaned inodes, and
+deleting it then would destroy exactly the files it exists to hold — so in that
+rare, corruption-only case the directory stays visible and the tenant can recover
+the recovered files. This is stated, not hidden.
+
+**The disk boundary is unchanged.** Measured in the gate: two workspaces with
+different allowances each report their **own** `df -B1` size (67108864 and
+134217728), a write past the allowance is refused (`No space left`), and after
+the removal the mounted total is still exactly `disk_mb`.
+
+### 9r.1 The real-nsjail + real-FUSE acceptance
+
+`scripts/lostfound-check.sh` drives the REAL service, real nsjail and a real FUSE
+disk (bounded: three workspaces, torn down in phases, with a leak check; this
+check must not hammer the host). It asserts:
+
+- a **freshly created** workspace's visible root contains no `lost+found`, for
+  **two** fresh workspaces, and `stat /lost+found` is **404**;
+- the **repair path** (the case a one-shot fix fails): it writes a user file,
+  stops the service, dirties the image (`debugfs -w -R "ssv state 0"`) **and puts
+  `/lost+found` back**, proves the image is `not clean` and the directory present,
+  proves a plain `resize2fs` **refuses** the dirty image (`Please run 'e2fsck -f …
+  first`) so the engine must run its `e2fsck` self-heal and retry, restarts, and
+  asserts the repaired root has **no** `lost+found`, lists only the user file, and
+  that the user file's **sha256 and size** are intact;
+- an **existing** workspace **converges**: its subdirectory listing (names **and
+  sizes**) is identical before and after, the root keeps the user file with no
+  `lost+found`, and the file content is byte-identical;
+- the **disk boundary unchanged**: two workspaces report their own **different**
+  sizes via `df`, a write past `disk_mb` is refused (`ENOSPC`), and the mounted
+  total equals `disk_mb` after the removal; and
+- nothing is leaked (no mount, no `fuse2fs`, no orphan `disk.img`).
+
+`TestDiskManagerHidesLostFound` is the unit half: it proves the fresh root has no
+`lost+found`, then dirties the image and re-adds the directory, re-provisions
+(forcing the `e2fsck` path), and asserts the directory is absent again.
+
+Measured **27 passed / 0 failed**, three consecutive runs. The gate **bites**:
+with `clearLostFound` deliberately short-circuited (`return nil`), the same gate
+reports **16 passed / 11 failed** — the fresh-root assertions see `lost+found`
+and the repair-path assertions cascade (the daemon then returns 500 on the dirty
+image). Restoring the correct code returns it to **27 passed / 0 failed**. Both
+tallies were recorded on this host.
+
+**Why the restart genuinely exercises `e2fsck` (measured).** The engine's
+graceful shutdown (`ReleaseAllDisks`) unmounts every workspace, so after the
+`kill` in the gate **zero** FUSE mounts and **zero** `fuse2fs` processes remain
+under the data dir; the next access re-provisions the dirty image, which cannot
+succeed without the `e2fsck` self-heal (`resize2fs` refuses it). The mount would
+otherwise survive a `SIGKILL`, but the gate stops the daemon with `SIGTERM`,
+which runs the release path.
 
 ## 9s. A staged-content restore must not read a FIFO (defect found in production, fixed)
 

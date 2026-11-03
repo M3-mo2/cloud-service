@@ -3,7 +3,7 @@ PKG := ./...
 GO ?= go
 CC ?= cc
 
-.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check spread-check tunnel-check identity-check egress-decoy-check subscription-check archive-check metrics-check write-rate-check ports-check docs-check
+.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check spread-check tunnel-check identity-check egress-decoy-check subscription-check archive-check metrics-check write-rate-check ports-check lostfound-check docs-check
 
 all: fmt vet shim build test
 
@@ -189,6 +189,17 @@ write-rate-check:
 # nothing is leaked.
 ports-check:
 	sudo -E bash scripts/ports-check.sh
+
+# lost+found-hiding acceptance against REAL nsjail and a REAL FUSE disk on the
+# host (needs root, no container). It asserts the ext4-internal /lost+found is
+# absent from a workspace's visible root on BOTH the fresh-create path AND the
+# e2fsck-repair path (it dirties a real workspace image, restarts the service,
+# and asserts the directory is gone AFTER the repair — the case a one-shot
+# removal at image creation fails), that an existing workspace converges with no
+# file loss, and that the disk boundary is unchanged (two workspaces report their
+# own different disk_mb and a write past the allowance still fails ENOSPC).
+lostfound-check:
+	sudo -E bash scripts/lostfound-check.sh
 
 # Documentation-consistency gate. It derives its assertions from the code
 # (router, error constants, test count) rather than the prose, so it fails when

@@ -2672,3 +2672,72 @@ left the data there.
 top-level and a nested FIFO, runs the restore on a goroutine with a ten-second deadline,
 then asserts both FIFOs came back as FIFOs and the file's bytes survived. It fails on the
 previous implementation by hanging.
+
+### ADR 98 — hide the ext4-internal `lost+found` from the workspace's visible root, on every provisioning path
+
+**Decision.** A workspace's disk is a real ext4 image (`mkfs.ext4`) mounted host-side with
+`fuse2fs` at the workspace root. `mkfs.ext4` creates `/lost+found` in **every** new
+filesystem and `e2fsck` **recreates** it whenever it runs, so a fresh workspace's visible
+root showed only `lost+found` (the operator's report: `ls` in a new workspace returned
+nothing but that directory, looking like leftover junk). The engine therefore removes
+`/lost+found` from a **mounted** workspace root on **every** provisioning path, in one
+place, **after** `mkfs.ext4` and **after** any `e2fsck` repair. The directory may exist
+inside the image; it must not appear in what the tenant sees at the workspace root.
+
+**Why it is there (so the wrong cause is not chased).** It is a property of ext4, **not** of
+this codebase: `mkfs.ext4` creates it, and the engine mounts the image root at the workspace
+root, so the image's `/lost+found` is exactly what the tenant's `ls` shows. Measured: the
+inode's `ctime` equals the image's own write time to the second.
+
+**Why the fix must be a LIFECYCLE step, not a one-shot edit.** Measured on this host:
+`e2fsck -p -f` on an image whose `/lost+found` was removed prints
+`/lost+found not found.  CREATED.` and puts it back (exit 1). The engine runs `e2fsck` on an
+image it finds dirty (a workspace whose sandbox was killed mid-write), so removing the
+directory at image creation would be undone by the first repair. The removal is re-applied
+after the repair instead.
+
+**The mechanism, and the one rejected one (measured — do not re-derive).** Removal is a
+plain `os.Remove` of `{root}/lost+found` through the **already-mounted** workspace root, in
+`clearLostFound`, called from `Ensure` on each path (including the already-mounted-at-the-
+right-size early return, so a repaired image that needs no resize still converges). It is
+idempotent: a missing directory is not an error. Mounting a **subdirectory** of the image as
+the workspace root (`fuse2fs -o subdir=`) was **rejected**: it is not available here, because
+this build links FUSE library 2.9.9 and the option is rejected
+(`fuse: unknown option 'subdir=/home'`), so a design that mounts the image's `/home` (or any
+subdir) as the workspace root is not available. No new mount and no second read-write mount
+is introduced: the workspace's own mount is already read-write.
+
+**The trade-off, stated honestly.** `/lost+found` is where `fsck` reconnects **orphaned
+inodes** after a corruption. Removing it leaves a repair with nowhere to put such files.
+This is normally empty: `mkfs.ext4` creates it empty and the measured `e2fsck -p -f` that
+recreates it recreates it empty, and an empty directory holds nothing. So **an empty
+`lost+found` is removed and no data of the tenant's is lost**: `e2fsck` never moves a
+reachable file into `lost+found`, so the tenant's **intact** files are untouched. The only
+thing lost is the recovery of **orphaned inodes on a genuinely corrupt image** (files that
+were already unreachable before the repair). To keep the safety net from being destroyed
+silently, a **non-empty** `/lost+found` is left in place rather than deleted: the only way
+it becomes non-empty is a repair that actually reconnected orphaned inodes, and deleting it
+then would destroy exactly the data it exists to hold. In that rare, corruption-only case
+the directory stays visible so the tenant can recover the recovered files, rather than being
+hidden at the cost of their contents.
+
+**One edge case, stated.** The removal is by name (`{root}/lost+found`), so a tenant who
+deliberately creates an **empty** directory with exactly that name is indistinguishable from
+the ext4 one and it is removed too; a **non-empty** one is left. Creating that name at the
+workspace root is vanishingly unlikely, and the operator's requirement is explicit that the
+root show only the tenant's real content, so name-based removal is accepted rather than
+matching on inode/ownership (which the `uid=`/`fakeroot` mount makes indistinguishable from
+the tenant's own files anyway).
+
+**Boundary and behaviour unchanged.** The removal does not change the image file's size or
+the `rlimit_fsize` ceiling, and it does not change the mounted total: `df`/`stat -f`/
+`os.statvfs()` inside a workspace still report the workspace's own `disk_mb`, and a write
+past it still fails with `ENOSPC`. No workspace loses a file. The removal runs only through
+`DiskManager.Ensure` under the manager's own lock, on a mount the manager created or
+verified, and never touches a live workspace outside that lock.
+
+**Files.** `internal/workspace/diskfs.go` (`clearLostFound` and its call sites in `Ensure`)
+and the gate `scripts/lostfound-check.sh` (real nsjail + a real FUSE disk; asserts the fresh
+path, the **repair** path — it dirties a real image, restarts, and asserts the directory is
+absent *after* `e2fsck` — existing-workspace convergence with no file loss, the unchanged
+disk boundary, and a no-leak check). `TestDiskManagerHidesLostFound` is the unit half.

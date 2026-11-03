@@ -797,6 +797,74 @@ else
   fail "ports.disabled-code" "the ports_disabled refusal code is missing from errors.go or docs/API.md"
 fi
 
+# --- 4d-decies. hiding the ext4-internal lost+found and its harness ------------
+# The workspace's real ext4 image carries /lost+found from mkfs.ext4, and e2fsck
+# recreates it on every repair, so the engine removes it from the MOUNTED root on
+# every provisioning path (after mkfs and after e2fsck). The behavior change, its
+# trade-off, the rejected subdir route and the repair-path coverage must all be
+# documented and wired, and the harness must be named + wired into the Makefile,
+# so none can silently regress.
+if grep -qF 'func clearLostFound' internal/workspace/diskfs.go && grep -qF 'clearLostFound(root)' internal/workspace/diskfs.go; then
+  ok "lostfound.mechanism"
+else
+  fail "lostfound.mechanism" "the lost+found remover (clearLostFound) or its call in Ensure is missing from internal/workspace/diskfs.go"
+fi
+if grep -qF 'ADR 98' docs/DECISIONS.md; then
+  ok "lostfound.adr"
+else
+  fail "lostfound.adr" "docs/DECISIONS.md is missing ADR 98 (hiding lost+found)"
+fi
+if grep -qiF 'orphaned inode' docs/DECISIONS.md && grep -qiF 'non-empty' docs/DECISIONS.md && grep -qiF 'trade-off' docs/DECISIONS.md; then
+  ok "lostfound.adr-tradeoff"
+else
+  fail "lostfound.adr-tradeoff" "ADR 98 must state the trade-off (orphaned inodes) and the non-empty keep rule"
+fi
+if grep -qiF 'e2fsck' docs/DECISIONS.md && grep -qiF 'recreates' docs/DECISIONS.md; then
+  ok "lostfound.adr-repair-path"
+else
+  fail "lostfound.adr-repair-path" "ADR 98 must record that e2fsck recreates /lost+found (the repair path)"
+fi
+if grep -qF 'subdir=' docs/DECISIONS.md && grep -qF '2.9.9' docs/DECISIONS.md; then
+  ok "lostfound.adr-subdir-rejected"
+else
+  fail "lostfound.adr-subdir-rejected" "ADR 98 must record the rejected fuse2fs subdir= route (FUSE 2.9.9)"
+fi
+if [ -f scripts/lostfound-check.sh ]; then
+  ok "lostfound-harness.exists"
+else
+  fail "lostfound-harness.exists" "scripts/lostfound-check.sh is missing"
+fi
+if [ -x scripts/lostfound-check.sh ]; then
+  ok "lostfound-harness.executable"
+else
+  fail "lostfound-harness.executable" "scripts/lostfound-check.sh is not executable"
+fi
+if grep -qF 'lostfound-check.sh' docs/VERIFICATION.md; then
+  ok "lostfound-harness.documented"
+else
+  fail "lostfound-harness.documented" "docs/VERIFICATION.md does not mention scripts/lostfound-check.sh"
+fi
+if grep -qE '^lostfound-check:' Makefile; then
+  ok "makefile.target.lostfound-check"
+else
+  fail "makefile.target.lostfound-check" "Makefile has no 'lostfound-check:' target"
+fi
+if grep -qE 'bash scripts/lostfound-check.sh' Makefile; then
+  ok "makefile.sudo.lostfound-check"
+else
+  fail "makefile.sudo.lostfound-check" "Makefile's 'lostfound-check' target does not run scripts/lostfound-check.sh"
+fi
+if grep -qE '^\.PHONY:.*\blostfound-check\b' Makefile; then
+  ok "makefile.phony.lostfound-check"
+else
+  fail "makefile.phony.lostfound-check" "'lostfound-check' is not in .PHONY"
+fi
+if grep -qF 'dirty' scripts/lostfound-check.sh && grep -qF 'img_state' scripts/lostfound-check.sh; then
+  ok "lostfound-harness.repair-path"
+else
+  fail "lostfound-harness.repair-path" "scripts/lostfound-check.sh does not cover the e2fsck repair path"
+fi
+
 # The masking shim source and the embedded artifact must both be present, so a
 # stale or missing .so cannot silently disable the mask.
 if [ -f internal/executor/hostmask/hostmask.c ]; then
