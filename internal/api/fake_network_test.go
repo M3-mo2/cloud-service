@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"sandboxd/internal/config"
+	"sandboxd/internal/decoy"
 	"sandboxd/internal/network"
 )
 
@@ -40,6 +41,10 @@ type fakeNetwork struct {
 
 	// running holds the live tunnels keyed by tunnel id -> workspace id.
 	running map[string]string
+
+	// decoyEnabled / decoyCA control the egress-decoy capability.
+	decoyEnabled bool
+	decoyCA      *decoy.CA
 }
 
 func newFakeNetwork() *fakeNetwork {
@@ -151,6 +156,18 @@ func (f *fakeNetwork) TunnelsReady() (bool, string) {
 func (f *fakeNetwork) TunnelsConfig() config.TunnelsConfig {
 	return config.TunnelsConfig{Enabled: f.tunnelsEnabled, MaxPerWorkspace: 2, URLTimeoutSec: 1}
 }
+
+// Decoy surface: off by default in the fake, so no existing API test changes.
+func (f *fakeNetwork) DecoyEnabled() bool { return f.decoyEnabled }
+
+func (f *fakeNetwork) DecoyStatus() (bool, bool, string) {
+	if !f.decoyEnabled {
+		return false, false, "network.decoy.enabled is false"
+	}
+	return true, true, ""
+}
+
+func (f *fakeNetwork) DecoyCA() (*decoy.CA, error) { return f.decoyCA, nil }
 
 // tunnelCount returns how many tunnels are live.
 func (f *fakeNetwork) tunnelCount() int {

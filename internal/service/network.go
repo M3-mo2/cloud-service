@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"sandboxd/internal/config"
+	"sandboxd/internal/decoy"
 	"sandboxd/internal/executor"
 	"sandboxd/internal/model"
 	"sandboxd/internal/network"
@@ -40,6 +41,11 @@ type Network interface {
 	TunnelsEnabled() bool
 	TunnelsReady() (bool, string)
 	TunnelsConfig() config.TunnelsConfig
+
+	// Egress decoy.
+	DecoyEnabled() bool
+	DecoyStatus() (enabled, ready bool, note string)
+	DecoyCA() (*decoy.CA, error)
 }
 
 // SetNetwork attaches the networking implementation. It is called once at
@@ -53,6 +59,20 @@ func (s *Service) NetworkEnabled() bool { return s.net != nil }
 // EgressEnabled reports whether the userspace egress fabric is configured on.
 func (s *Service) EgressEnabled() bool {
 	return s.net != nil && s.net.EgressEnabled()
+}
+
+// DecoyEnabled reports whether the egress-decoy layer is configured on.
+func (s *Service) DecoyEnabled() bool {
+	return s.net != nil && s.net.DecoyEnabled()
+}
+
+// DecoyStatus reports the egress-decoy capability truthfully. When the layer is
+// off it returns (false, false, "network.decoy.enabled is false").
+func (s *Service) DecoyStatus() (enabled, ready bool, note string) {
+	if s.net == nil {
+		return false, false, "network layer not configured"
+	}
+	return s.net.DecoyStatus()
 }
 
 // NetworkStatus reports the isolated-egress capability truthfully.

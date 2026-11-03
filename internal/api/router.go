@@ -149,6 +149,11 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	// (or the configured default profile is missing) the service cannot give a
 	// workspace the allowlist it was promised, so readiness is not claimed.
 	profileReady, profileNote := s.svc.Runner().ProfileStatus()
+	// The egress-decoy layer is reported truthfully too: when it is enabled but
+	// the CA or profile cannot be materialized, readiness is not claimed, so an
+	// operator sees a deploy that would serve the real identity rather than a
+	// silent one.
+	decoyEnabled, decoyReady, decoyNote := s.svc.DecoyStatus()
 	status := http.StatusOK
 	if !dataOK || !nsjailOK || !cgroupsOK {
 		status = http.StatusServiceUnavailable
@@ -166,6 +171,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusServiceUnavailable
 	}
 	if !profileReady {
+		status = http.StatusServiceUnavailable
+	}
+	if decoyEnabled && !decoyReady {
 		status = http.StatusServiceUnavailable
 	}
 	body := map[string]any{
@@ -194,6 +202,10 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 			"ready":   profileReady,
 			"default": s.cfg.Profiles.Default,
 		},
+		"egress_decoy": map[string]any{
+			"enabled": decoyEnabled,
+			"ready":   decoyReady,
+		},
 	}
 	if netReason != "" {
 		body["network"].(map[string]any)["reason"] = netReason
@@ -209,6 +221,9 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	}
 	if profileNote != "" {
 		body["profiles"].(map[string]any)["reason"] = profileNote
+	}
+	if decoyNote != "" {
+		body["egress_decoy"].(map[string]any)["reason"] = decoyNote
 	}
 	writeJSON(w, status, body)
 }
@@ -273,6 +288,20 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	} else {
 		profileCap["ready"] = true
 	}
+	// Egress-decoy capability, reported truthfully: with it on, a workspace's
+	// attempts to learn its own public IP are answered with a consistent
+	// invented identity. It is a DECOY, not a security boundary; the honest
+	// limits are enumerated in docs/EGRESS-DECOY.md and ADR 84.
+	decoyEnabled, decoyReady, decoyNote := s.svc.DecoyStatus()
+	decoyCap := map[string]any{
+		"enabled":   decoyEnabled,
+		"ready":     decoyReady,
+		"mechanism": "in-namespace stub DNS resolver + stub HTTP/TLS responder, one consistent per-workspace decoy profile, with a generated CA trusted inside the workspace and in-namespace nft rules forcing DNS to the stub",
+		"limits":    "a decoy layer, NOT a security boundary: a tenant's OWN endpoint (they read the peer address in their own logs) is unfixable; a hardcoded-IP endpoint outside the covered set, intermediate traceroute hops, and MTU/ICMP fingerprinting are out of scope; a knowledgeable tenant can recognise a documentation-range address",
+	}
+	if decoyNote != "" {
+		decoyCap["reason"] = decoyNote
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":     model.Version,
 		"api_version": model.APIVersion,
@@ -301,6 +330,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"network":               netCap,
 		"identity_masking":      maskCap,
 		"provider_tools_hidden": overlayCap,
+		"egress_decoy":          decoyCap,
 		"interpreters":          model.SupportedInterpreters(),
 		"runnable_extensions":   model.SupportedExtensions(),
 	})
