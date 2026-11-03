@@ -45,10 +45,77 @@ func TestSyntheticProcReportsWorkspaceLimits(t *testing.T) {
 	if !strings.Contains(string(mounts), procMountSource) {
 		t.Fatalf("synthetic mounts lacks the neutral device token:\n%s", mounts)
 	}
+	// /proc/self/mountinfo must exist (coreutils `df` reads it; without it a
+	// bare `df -h` errors), be in the real mountinfo format, and name the
+	// workspace's own mount with a neutral device token.
+	mi, err := os.ReadFile(filepath.Join(dir, "self", "mountinfo"))
+	if err != nil {
+		t.Fatalf("self/mountinfo missing (df -h would break): %v", err)
+	}
+	mis := string(mi)
+	if !strings.Contains(mis, " - fuse.ext4 "+procMountSource+" ") {
+		t.Fatalf("mountinfo lacks the workspace fuse.ext4 mount:\n%s", mis)
+	}
+	if strings.Contains(strings.ToLower(mis), "zfs") {
+		t.Fatalf("mountinfo names the host filesystem:\n%s", mis)
+	}
+	// Every mountinfo line must have the mandatory fields: id parent maj:min
+	// root mount_point options then " - " then fstype source super_options.
+	for _, line := range strings.Split(strings.TrimSpace(mis), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 10 {
+			t.Fatalf("mountinfo line too short (%d fields): %q", len(f), line)
+		}
+		sep := -1
+		for i, x := range f {
+			if x == "-" {
+				sep = i
+				break
+			}
+		}
+		if sep < 6 || sep+4 != len(f) {
+			t.Fatalf("mountinfo line has wrong shape around '-': %q", line)
+		}
+	}
 	// The self/limits file must agree with the same memory and disk values.
 	lim, _ := os.ReadFile(filepath.Join(dir, "self", "limits"))
 	if !strings.Contains(string(lim), "536870912") { // 512 MiB
 		t.Fatalf("self/limits does not carry the memory ceiling:\n%s", lim)
+	}
+}
+
+// TestSyntheticProcMountsAndMountinfoAgree proves the two mount views are
+// rendered from one list: every target in /proc/mounts appears in
+// /proc/self/mountinfo with the same fstype and device token, so they can never
+// disagree (which is the property the fix relies on).
+func TestSyntheticProcMountsAndMountinfoAgree(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := writeSyntheticProc(dir, 1, 256, 256, "0.0.0-sandbox"); err != nil {
+		t.Fatal(err)
+	}
+	mounts, _ := os.ReadFile(filepath.Join(dir, "mounts"))
+	mi, _ := os.ReadFile(filepath.Join(dir, "self", "mountinfo"))
+	for _, line := range strings.Split(strings.TrimSpace(string(mounts)), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 {
+			t.Fatalf("mounts line too short: %q", line)
+		}
+		target := f[1]
+		// The mountinfo line for this target must carry the same fstype/source.
+		found := false
+		for _, ml := range strings.Split(strings.TrimSpace(string(mi)), "\n") {
+			mf := strings.Fields(ml)
+			if len(mf) < 10 {
+				continue
+			}
+			if mf[4] == target && strings.Contains(ml, " "+f[2]+" "+f[0]+" ") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("mounts entry %q has no matching mountinfo row:\n%s", line, mi)
+		}
 	}
 }
 

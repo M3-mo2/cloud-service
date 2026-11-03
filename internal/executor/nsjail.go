@@ -869,6 +869,13 @@ type tmplData struct {
 	ProcEnabled bool
 	ProcRoot    string
 	ProcJail    string
+	// ProcMtab is the host path bound over /etc/mtab so tools that read the
+	// legacy mount table (mount(8), some scripts) see the workspace's curated
+	// mount list. `df` itself does NOT read it (coreutils df opens only
+	// /proc/self/mountinfo, measured); it is provided because the conventional
+	// /etc/mtab is a symlink to /proc/mounts and a workspace should have the
+	// same view. Empty omits the mount.
+	ProcMtab string
 
 	// Host-identity masking (see mask.go). When MaskEnabled is true the shim
 	// and its ld.so.preload list are bind-mounted read-only and MaskEnv carries
@@ -1029,6 +1036,7 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 	procEnabled := r.cfg.Disk.ProcEnabled && mask.Enabled
 	procRoot := ""
 	procJail := ""
+	procMtab := ""
 	if procEnabled {
 		procRoot = filepath.Join(runTmp, ".proc")
 		cpuCount := mask.CPUs
@@ -1043,6 +1051,10 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 			return "", fmt.Errorf("synthetic proc: %w", err)
 		}
 		procJail = "/proc"
+		// /etc/mtab is the conventional read-only view of the same curated
+		// mount table (normally a symlink to /proc/self/mounts). It is a
+		// separate one-file mount because /etc is not the curated /proc tree.
+		procMtab = filepath.Join(procRoot, "tab")
 	}
 
 	data := tmplData{
@@ -1091,6 +1103,7 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		ProcEnabled: procEnabled,
 		ProcRoot:    procRoot,
 		ProcJail:    procJail,
+		ProcMtab:    procMtab,
 
 		OverlayEnabled: mask.OverlayEnabled,
 		UsrRoot:        mask.UsrRoot,

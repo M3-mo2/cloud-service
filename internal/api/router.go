@@ -235,7 +235,7 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		"enabled":    diskEnabled,
 		"mechanism":  diskMech,
 		"proc":       s.cfg.Disk.ProcEnabled,
-		"proc_files": []string{"meminfo", "cpuinfo", "stat", "uptime", "loadavg", "version", "vmstat", "filesystems", "mounts", "self/mounts", "self/limits"},
+		"proc_files": []string{"meminfo", "cpuinfo", "stat", "uptime", "loadavg", "version", "vmstat", "filesystems", "mounts", "self/mounts", "self/mountinfo", "self/limits"},
 	}
 	if diskNote != "" {
 		body["workspace_limits"].(map[string]any)["reason"] = diskNote

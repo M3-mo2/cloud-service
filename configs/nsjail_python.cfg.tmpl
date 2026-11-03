@@ -271,6 +271,22 @@ mount {
   rw: false
   mandatory: true
 }
+{{- if .ProcMtab }}
+
+# The conventional /etc/mtab view of the same curated mount list (normally a
+# symlink to /proc/self/mounts). Earlier this was omitted on the assumption
+# that the curated tree's own /proc/mounts was enough; a workspace should see
+# the same table at the conventional path. It is a plain read-only one-file
+# bind. mandatory:false: /etc/mtab is not load-bearing for coreutils `df`
+# (which reads /proc/self/mountinfo), so a failure here must not abort a run.
+mount {
+  src: "{{ .ProcMtab }}"
+  dst: "/etc/mtab"
+  is_bind: true
+  rw: false
+  mandatory: false
+}
+{{- end }}
 {{- end }}
 
 {{- if .MaskEnabled }}
