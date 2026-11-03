@@ -205,6 +205,12 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	// Close every metrics stream FIRST: an SSE handler blocks until its
+	// subscriber channel closes, so stopping the metrics sampler unblocks the
+	// long-lived connections and lets http.Server.Shutdown drain promptly rather
+	// than waiting on them. It also stops the sampler goroutine and the metrics
+	// reconcile loop, so nothing is left running.
+	svc.ShutdownMetrics()
 	if err := httpServer.Shutdown(ctx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
 		os.Exit(1)
