@@ -215,14 +215,11 @@ func Derivations(now time.Time, sub *model.Subscription) (state string, expiresA
 	if !sub.HasExpiry() {
 		return StateUnlimited, time.Time{}, 0, time.Time{}, time.Time{}, 0
 	}
+	// term drives the expiring-soon window. GraceEndsAt is persisted by the
+	// engine at grant/extension; a record without it is only possible for a
+	// hand-edited file, and the zero value is reported as-is.
 	term := sub.ExpiresAt.Sub(sub.GrantedAt)
 	graceEnds := sub.GraceEndsAt
-	if graceEnds.IsZero() {
-		// GraceEndsAt is persisted by the engine at grant/extension; a record
-		// without it is only possible for a hand-edited file. Derive nothing
-		// here (the caller knows the configured grace); report the stored value.
-		graceEnds = sub.GraceEndsAt
-	}
 	locked := !sub.LockedAt.IsZero() || !now.Before(sub.ExpiresAt)
 	if locked {
 		return StateLocked, sub.ExpiresAt, 0, graceEnds, sub.LockedAt, sub.Extensions

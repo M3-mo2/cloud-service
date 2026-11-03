@@ -267,6 +267,79 @@ sessions:
 	}
 }
 
+func TestSubscriptionDefaults(t *testing.T) {
+	d := Default()
+	if !d.Subscription.Enabled {
+		t.Fatal("subscription.enabled should default true")
+	}
+	if d.Subscription.DefaultDuration != "" {
+		t.Fatalf("default_duration = %q, want empty (no expiry by default)", d.Subscription.DefaultDuration)
+	}
+	if d.Subscription.MaxDuration != "365d" || d.Subscription.GracePeriod != "168h" || d.Subscription.ReapInterval != "60s" {
+		t.Fatalf("subscription defaults = %+v", d.Subscription)
+	}
+	// Parsers apply documented defaults and parse the grammar.
+	if _, ok, err := d.Subscription.DefaultDurationValue(); ok || err != nil {
+		t.Fatalf("empty default_duration should be (0,false,nil): ok=%v err=%v", ok, err)
+	}
+	if max, err := d.Subscription.MaxDurationValue(); err != nil || max.Hours() != 365*24 {
+		t.Fatalf("max = %v err=%v", max, err)
+	}
+	if g, err := d.Subscription.GracePeriodValue(); err != nil || g.Hours() != 168 {
+		t.Fatalf("grace = %v err=%v", g, err)
+	}
+	if ri, err := d.Subscription.ReapIntervalValue(); err != nil || ri.Seconds() != 60 {
+		t.Fatalf("reap = %v err=%v", ri, err)
+	}
+}
+
+func TestLoadSubscription(t *testing.T) {
+	p := writeTemp(t, `
+subscription:
+  enabled: false
+  default_duration: "7d"
+  max_duration: "90d"
+  grace_period: "24h"
+  reap_interval: "5s"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Subscription.Enabled {
+		t.Fatal("explicit enabled:false must survive")
+	}
+	if d, ok, err := cfg.Subscription.DefaultDurationValue(); err != nil || !ok || d.Hours() != 7*24 {
+		t.Fatalf("default = %v ok=%v err=%v", d, ok, err)
+	}
+	if max, _ := cfg.Subscription.MaxDurationValue(); max.Hours() != 90*24 {
+		t.Fatalf("max = %v", max)
+	}
+	if g, _ := cfg.Subscription.GracePeriodValue(); g.Hours() != 24 {
+		t.Fatalf("grace = %v", g)
+	}
+	if ri, _ := cfg.Subscription.ReapIntervalValue(); ri.Seconds() != 5 {
+		t.Fatalf("reap = %v", ri)
+	}
+}
+
+func TestLoadSubscriptionPartialKeepsDefaults(t *testing.T) {
+	p := writeTemp(t, `
+subscription:
+  default_duration: "1d"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.Subscription.Enabled {
+		t.Fatal("enabled default should survive")
+	}
+	if cfg.Subscription.MaxDuration != "365d" || cfg.Subscription.GracePeriod != "168h" || cfg.Subscription.ReapInterval != "60s" {
+		t.Fatalf("subscription defaults lost: %+v", cfg.Subscription)
+	}
+}
+
 func TestLoadSessionsPartialKeepsDefaults(t *testing.T) {
 	p := writeTemp(t, `
 sessions:
