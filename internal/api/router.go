@@ -225,6 +225,21 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if decoyNote != "" {
 		body["egress_decoy"].(map[string]any)["reason"] = decoyNote
 	}
+	// Per-workspace resource visibility/enforcement: with it on, a workspace
+	// sees its OWN disk allowance (df/stat -f/os.statvfs) and memory (free,
+	// /proc/meminfo), enforced by a real per-workspace filesystem (kernel
+	// boundary) and the cgroup. It is default ON. The synthetic /proc is
+	// reported alongside so an operator can see exactly which files it carries.
+	diskEnabled, diskMech, diskNote := s.svc.DiskStatus()
+	body["workspace_limits"] = map[string]any{
+		"enabled":    diskEnabled,
+		"mechanism":  diskMech,
+		"proc":       s.cfg.Disk.ProcEnabled,
+		"proc_files": []string{"meminfo", "cpuinfo", "stat", "uptime", "loadavg", "version", "vmstat", "filesystems", "mounts", "self/mounts", "self/limits"},
+	}
+	if diskNote != "" {
+		body["workspace_limits"].(map[string]any)["reason"] = diskNote
+	}
 	writeJSON(w, status, body)
 }
 
@@ -302,6 +317,31 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	if decoyNote != "" {
 		decoyCap["reason"] = decoyNote
 	}
+	// Per-workspace resource visibility + enforcement. With it on (the
+	// default), a workspace sees ITS OWN disk allowance and memory on every
+	// channel, and cannot exceed the disk allowance (kernel boundary) or the
+	// memory ceiling (cgroup). The mechanism is named truthfully.
+	diskEnabled, diskMech, diskNote := s.svc.DiskStatus()
+	diskCap := map[string]any{
+		"enabled":   diskEnabled,
+		"mechanism": diskMech,
+	}
+	if diskMech == "fuse" {
+		diskCap["reporting"] = "real per-workspace ext4 filesystem image (fuse2fs), host-side mounted; df/stat -f/os.statvfs are the filesystem's own answers"
+		diskCap["enforcement"] = "kernel filesystem boundary: a write past the allowance fails with ENOSPC, no overshoot"
+		diskCap["limits"] = "one image file and one fuse2fs process per workspace; FUSE throughput overhead (measured ~0.4x native write, ~0.3x read)"
+	} else if diskMech == "counter" {
+		diskCap["reporting"] = "the API usage endpoint and the run watchdog"
+		diskCap["enforcement"] = "engine used-bytes watchdog (real but SAMPLED; a running process can overshoot before the next poll)"
+		diskCap["limits"] = "the sampled overshoot is stated in docs/DECISIONS.md; not equivalent to the kernel boundary"
+	} else {
+		diskCap["reporting"] = "none"
+		diskCap["enforcement"] = "none"
+		diskCap["limits"] = "disk.enabled=false: the allowance is neither reported as the workspace's own nor enforced"
+	}
+	if diskNote != "" {
+		diskCap["reason"] = diskNote
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":     model.Version,
 		"api_version": model.APIVersion,
@@ -331,6 +371,7 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"identity_masking":      maskCap,
 		"provider_tools_hidden": overlayCap,
 		"egress_decoy":          decoyCap,
+		"workspace_limits":      diskCap,
 		"interpreters":          model.SupportedInterpreters(),
 		"runnable_extensions":   model.SupportedExtensions(),
 	})

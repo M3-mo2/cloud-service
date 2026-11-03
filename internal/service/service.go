@@ -98,7 +98,6 @@ func (s *Service) DiskStatus() (enabled bool, mechanism, note string) {
 	return true, "fuse", "per-workspace fuse2fs ext4 image sized to disk_mb (kernel boundary, no overshoot)"
 }
 
-
 // Config returns the service configuration.
 func (s *Service) Config() config.Config { return s.cfg }
 

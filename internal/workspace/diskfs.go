@@ -14,18 +14,18 @@ import (
 // DiskBackend selects how a workspace's disk allowance is enforced.
 //
 //   - "fuse"    — a real per-workspace ext4 filesystem image, mounted with
-//                 fuse2fs. This is a KERNEL-enforced boundary: a write past the
-//                 allowance fails with ENOSPC at the boundary, with no
-//                 overshoot, and `df`/`stat -f`/os.statvfs() report the
-//                 workspace's own size because the mounted filesystem IS that
-//                 size. This is the default and the strongest mechanism.
+//     fuse2fs. This is a KERNEL-enforced boundary: a write past the
+//     allowance fails with ENOSPC at the boundary, with no
+//     overshoot, and `df`/`stat -f`/os.statvfs() report the
+//     workspace's own size because the mounted filesystem IS that
+//     size. This is the default and the strongest mechanism.
 //   - "counter" — the engine's own used-bytes counter, promoted to an authority
-//                 over running processes (the API file path plus a run-stopping
-//                 check). Real but SAMPLED: a process already running can
-//                 overshoot the allowance before the next check terminates it.
-//                 The measured overshoot is documented in docs/DECISIONS.md.
+//     over running processes (the API file path plus a run-stopping
+//     check). Real but SAMPLED: a process already running can
+//     overshoot the allowance before the next check terminates it.
+//     The measured overshoot is documented in docs/DECISIONS.md.
 //   - "none"    — no disk enforcement. Nothing is reported as an allowance and
-//                 nothing is enforced (the honest state).
+//     nothing is enforced (the honest state).
 type DiskBackend string
 
 // Disk backends.
