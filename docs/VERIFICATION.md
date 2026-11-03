@@ -1863,7 +1863,7 @@ adds `11` test functions (net `347`, from `336`), and
 
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **84** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **86** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -1895,6 +1895,11 @@ canonicalization family answering `EACCES` and the `rlimit_as`-vs-`memory_mb`
 finding, and **#83** replaces the denylist tool model with named workspace
 profiles (an explicit allowlist), the entry-set decision (binaries vs trees), the
 per-profile materialization choice, and what a profile can and cannot promise.
+**#84** records the egress decoy (a plausible invented public IP, not a security
+boundary; see §9k), **#85** records the per-workspace disk allowance as a real
+filesystem (kernel boundary) with a sampled counter as the documented fallback,
+and **#86** records the curated per-workspace `/proc` so `free`/`vmstat`/`df`
+report the workspace's own limits (see §14).
 
 ## 11. OpenAPI
 
@@ -1943,24 +1948,38 @@ Each workspace's `/workspace` is the mount point of a real ext4 image file
 the orchestrator with `fuse2fs`. The workspace only ever sees the mounted
 result, so it needs neither `/dev/fuse` nor the fuse tools inside the jail.
 
-Measured, from inside a real workspace (two workspaces, limits 512MB/1cpu/256MB
-and 3072MB/2cpu/512MB):
+Measured, from inside two real workspaces with different limits (w1
+256MB/1cpu/256MB-disk, w2 1024MB/2cpu/512MB-disk):
 
 ```
-w1 (disk_mb 256):  df -h /workspace  -> 256M total            os.statvfs -> total=268435456
-w2 (disk_mb 512):  df -h /workspace  -> 512M total            os.statvfs -> total=536870912
-stat -f -c %b /workspace -> 65536 (w1), 131072 (w2)   Type: fuseblk
+                    w1 (disk_mb 256)        w2 (disk_mb 512)
+os.statvfs total    268435456               536870912
+stat -f -c %b       65536                   131072        (S=4096, Type: fuseblk)
+df -B1 size         268435456               536870912
+df fstype           -                       -
 ```
 
-The limit is enforced AT the boundary, with no overshoot:
+`df` in the curated profile is the busybox-style `df` whose `fstype` column is
+`-` (it does not name a host filesystem), and `stat -f %T` reports `fuseblk` —
+never the host's `zfs`. The three size channels agree with the allowance exactly.
+
+The limit is enforced AT the boundary, with no overshoot. Raw probe against a
+256 MiB allowance (write in 4 MiB chunks until the kernel refuses):
 
 ```
-dd if=/dev/zero of=/workspace/big bs=1M count=300
-  -> 239075328 bytes (228 MiB) copied        (the rest was refused)
-python f.write(300 MiB)   -> OSError: [Errno 28] No space left on device
-10 x 5MiB files into the allowance  -> only the total lands (the TOTAL is capped,
-                                       which rlimit_fsize cannot do)
+before:  statvfs total 268435456   df size 268435456
+write:   statvfs/df unchanged at 268435456  (the mounted filesystem IS the allowance)
+result:  {"statvfs_before":268435456,"df_before":268435456,
+          "errno":28,"landed_bytes":239075328,
+          "statvfs_after":268435456,"df_after":268435456}
 ```
+
+That is: the writer landed 239075328 bytes (228 MiB — the ext4 filesystem's
+usable capacity, the rest being its own metadata) and the next chunk failed with
+`OSError: [Errno 28] No space left on device` (ENOSPC). The reported total did
+not move: it was always the allowance. A previous `dd`/`python f.write` probe to
+the same effect is recorded in §14a's history and in
+[DECISIONS.md](DECISIONS.md) ADR 85.
 
 `/workspace` reports `fuseblk`, never the host's `zfs` type, so the platform's
 100G ZFS volume is no longer visible — the previous behaviour was itself a leak.
@@ -1982,15 +2001,22 @@ self/limits  the workspace's own rlimits
 ```
 
 Every channel agrees, and the two differently-limited workspaces DIFFER on every
-one:
+one (raw values measured from inside each workspace, w1 = 256MB/1cpu/256MB-disk,
+w2 = 1024MB/2cpu/512MB-disk):
 
 ```
-                       w1 (512MB/1cpu)      w2 (1024MB/2cpu)
-free -h Mem total      512Mi                1.0Gi
-/proc/meminfo MemTotal 536870912            1073741824
-os.sysconf PHYS_PAGES  536870912            1073741824
-nproc / os.cpu_count   1                    2
-os.statvfs total       268435456            536870912
+channel                             w1 (256MB/1cpu)   w2 (1024MB/2cpu)   differ
+free -h Mem total                   256Mi             1.0Gi              yes
+free -b total bytes                 268435456         1073741824         yes
+/proc/meminfo MemTotal kB           262144            1048576            yes
+/proc/meminfo SwapTotal kB          0                 0                  same
+os.sysconf PHYS_PAGES x PAGESIZE    268435456         1073741824         yes
+nproc                               1                 2                  yes
+os.cpu_count / SC_NPROCESSORS_ONLN  1                 2                  yes
+/proc/cpuinfo processor count       1                 2                  yes
+os.statvfs total                    268435456         536870912          yes
+stat -f -c %b                       65536             131072             yes
+df -B1 size                         268435456         536870912          yes
 ```
 
 Identical numbers across differently-limited workspaces (the hardcoded-value
@@ -2010,8 +2036,21 @@ identity-check.sh               113 passed / 0 failed / 2 skipped   (from 97/0/2
   §1c disk.statvfs_total_workspace 268435456 ; disk.statf_agree 65536
       disk.df_agree 268435456 ; disk.no_host_fstype no
       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
-docs-consistency.sh             172 passed / 0 failed
+docs-consistency.sh             173 passed / 0 failed
 go test ./...                   351 test functions (from 347)
+```
+
+The full gate set re-run for this revision, one gate at a time (concurrent runs
+corrupt the `docs-consistency` tally), all green:
+
+```
+scripts/docs-consistency.sh     173 passed / 0 failed
+scripts/acceptance.sh           113 passed / 0 failed
+scripts/process-stop-check.sh    25 passed / 0 failed
+scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped
+scripts/identity-check.sh       113 passed / 0 failed / 2 skipped
+scripts/egress-decoy-check.sh    58 passed / 0 failed / 0 skipped
+go test ./...                    351 test functions; go vet ./... clean
 ```
 
 `identity-check.sh` §1b and §1c are the new assertions: the curated `/proc`
@@ -2026,11 +2065,30 @@ back to its used-bytes counter promoted to an authority over running processes:
 a watchdog polls each active run's workspace usage and cancels a run that exceeds
 its allowance. That fallback is REAL but **sampled**: a process already writing
 can overshoot between two polls. The overshoot is bounded by
-`write_rate × counter_poll_ms`; at the default 500 ms poll a fast local writer
-can overshoot by tens of MiB before the run is stopped. This is stated as a
-number and is never presented as equivalent to the kernel boundary. The reported
-allowance is unchanged (the workspace's `disk_mb`); the mechanism is named
-truthfully in `/v1/meta.workspace_limits.mechanism` (`counter`) and its sampled
+`write_rate × counter_poll_ms`; the measured value on this host is **not** "tens
+of MiB" — it is the writer's throughput over one poll.
+
+Measured directly (`disk.backend=counter`, `disk_mb=64`, `counter_poll_ms=500`,
+a writer creating 4 MiB files so `rlimit_fsize`, which bounds ONE file, never
+binds; the watchdog cancelled the run in every sample):
+
+```
+sample   overshoot over the 64 MiB allowance
+1         52 MiB
+2        360 MiB
+3        172 MiB
+4         48 MiB
+5         72 MiB
+6       1224 MiB      (a fast FUSE-less local writer; ~20x the allowance)
+```
+
+So the sampled fallback overshot by **48 MiB to ~1.2 GiB** across six runs on
+this host — up to ~20× the allowance — and the cancelled run left the bytes it
+had already written. The kernel FUSE boundary (the default) refuses the crossing
+write outright, so it **never** overshoots. This is stated as a number and is
+never presented as equivalent to the kernel boundary. The reported allowance is
+unchanged (the workspace's `disk_mb`); the mechanism is named truthfully in
+`/v1/meta.workspace_limits.mechanism` (`fuse` or `counter`) and its sampled
 nature in `.limits`.
 
 

@@ -1594,6 +1594,27 @@ identity. Both switches ship **ON**.
 
 ### ADR 85 — the disk allowance is a real per-workspace filesystem (kernel boundary), with a sampled counter as the fallback
 
+**The two mechanisms, named plainly.** There are exactly two enforcement
+mechanisms for `disk_mb`, and they are not equivalent:
+
+- **KERNEL-ENFORCED — the filesystem boundary (default; `disk.backend: auto` →
+  `fuse`).** Each workspace's `/workspace` IS a real per-workspace ext4
+  filesystem sized to its allowance, mounted host-side with `fuse2fs`. A write
+  past the allowance is refused by the kernel at the crossing write with
+  `ENOSPC`; there is **no overshoot** — the reported total is the enforced total,
+  because they are the same filesystem.
+- **SAMPLED — the used-bytes counter watchdog (fallback; `disk.backend:
+  counter`, or when FUSE is unavailable).** A watchdog polls every
+  `disk.counter_poll_ms` and cancels a run once the directory exceeds the
+  allowance. It does NOT refuse the crossing write; it notices afterwards and
+  kills the offender. The overshoot is real and **measured on this host at
+  48 MiB – 1.2 GiB on a 64 MiB allowance** (six runs; see below). It is never
+  presented as equivalent to the kernel boundary.
+
+Which mechanism is live is published truthfully in
+`/readyz.workspace_limits.mechanism` and `/v1/meta.workspace_limits.mechanism`
+(`fuse`, `counter`, or `none`).
+
 **Problem.** `disk_mb` was enforced only as `rlimit_fsize` (which caps **one
 file**, not the workspace directory) plus a `du` recheck on the API file path.
 Measured: N files of `disk_mb` each were allowed, `dd 2000MB` inside a workspace
@@ -1654,12 +1675,19 @@ promoted to an authority over **running** processes: a watchdog polls each
 active run's workspace usage every `disk.counter_poll_ms` and cancels a run that
 exceeds its allowance. This is REAL but not instantaneous — a process already
 writing can overshoot between two polls. The overshoot is bounded by
-`write_rate × counter_poll_ms`: at the default 500 ms poll a fast local writer
-can overshoot by tens of MiB before the run is stopped. **It is never presented
-as equivalent to the kernel boundary**, and `/v1/meta.workspace_limits.mechanism`
-names which one is in use (`fuse` or `counter`). If neither can run
-(`disk.enabled=false`, `disk.backend=none`) the allowance is neither reported as
-the workspace's own nor enforced, and that is stated.
+`write_rate × counter_poll_ms`, and it is **measured**, not merely bounded:
+with `disk_mb=64`, `counter_poll_ms=500` and a writer creating 4 MiB files (so
+`rlimit_fsize`, which bounds ONE file, never binds), six runs on this host
+overshot by **48 MiB, 52 MiB, 72 MiB, 172 MiB, 360 MiB and 1224 MiB** before the
+watchdog cancelled them — the FUSE-less local filesystem is fast enough that the
+overshoot is the writer's throughput over one poll, up to ~20× the allowance,
+and the cancelled run keeps the bytes it already wrote. The kernel-boundary
+backend, by contrast, refuses the crossing write outright and never overshoots.
+**The fallback is never presented as equivalent to the kernel boundary**, and
+`/v1/meta.workspace_limits.mechanism` names which one is in use (`fuse` or
+`counter`). If neither can run (`disk.enabled=false`, `disk.backend=none`) the
+allowance is neither reported as the workspace's own nor enforced, and that is
+stated.
 
 **`rlimit_fsize` stays consistent.** It remains `disk_mb` per file (a coarse
 per-file backstop); the filesystem now bounds the directory as a whole, so the
