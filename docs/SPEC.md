@@ -1,4 +1,4 @@
-# sandboxd specification (v0.0.19)
+# sandboxd specification (v0.0.20)
 
 This document is the canonical specification for the sandboxd service. It is a
 faithful copy of the project brief, retained in-repo so implementation and
@@ -15,9 +15,9 @@ belong to the separate frontend product, §2.6.)
 
 - Language: Go 1.22 (the brief targeted 1.22; `go.mod` requires Go 1.23 because
   the mandated koanf YAML parser declares a `go 1.23` floor — see
-  [DECISIONS.md](DECISIONS.md)). The service version string is `0.0.19`
+  [DECISIONS.md](DECISIONS.md)). The service version string is `0.0.20`
   (`model.Version`): it is the highest feature group resolved in DECISIONS.md
-  (which runs to v0.0.19), not the `/v1` API contract version. The two move
+  (which runs to v0.0.20), not the `/v1` API contract version. The two move
   independently — the API prefix changes only on a breaking contract change.
 - OS: Ubuntu Noble (24.04), x86_64.
 - Router: `github.com/go-chi/chi/v5`.
@@ -30,12 +30,12 @@ belong to the separate frontend product, §2.6.)
 - Lint: `golangci-lint` if available; otherwise `go vet ./...` must pass.
 - Sandbox: `nsjail` (may or may not be installed on the host — the service must
   detect and report via `/readyz`, never crash).
-- No external DB. Storage is filesystem JSON under `./data/` in v0.0.19.
+- No external DB. Storage is filesystem JSON under `./data/` in v0.0.20.
 - The service version string (`model.Version`) tracks the highest feature group
-  resolved in [DECISIONS.md](DECISIONS.md) (currently v0.0.19), **not** the `/v1`
+  resolved in [DECISIONS.md](DECISIONS.md) (currently v0.0.20), **not** the `/v1`
   API contract version: the API prefix changes only on a breaking contract
   change, so the two are deliberately decoupled. The decision log's own
-  per-group labels (v0.0.6 … v0.0.19) are the version history this number
+  per-group labels (v0.0.6 … v0.0.20) are the version history this number
   follows.
 - Everything must build with `go build ./...` and pass `go test ./...`.
 - Generate OpenAPI 3.1 spec at `api/openapi.yaml` — it is the source of truth
@@ -54,7 +54,7 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 
 - `GET /healthz` → 200 `{"status":"ok"}`
 - `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str},"workspace_limits":{"enabled":bool,"mechanism":str,"proc":bool,"proc_files":[str],"reason":str},"egress_decoy":{"enabled":bool,"ready":bool,"reason":str}}`
-- `GET /v1/meta` → `{"version":"0.0.19","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"workspace_limits":{"enabled":bool,"mechanism":str,"reporting":str,"enforcement":str,"limits":str},"egress_decoy":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"write_rate":{"enabled":bool,"server_max_mb_s":int,"default_mb_s":int,"samples":int,"outcome":str,"refusal_code":str,"mechanism":str,"limits":str},"archives":{"enabled":bool,"formats":[str],"read_only":[str],"limits":{...},"routes":[str],"refusal_codes":[str],"semantics":str}}`
+- `GET /v1/meta` → `{"version":"0.0.20","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"workspace_limits":{"enabled":bool,"mechanism":str,"reporting":str,"enforcement":str,"limits":str},"egress_decoy":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"write_rate":{"enabled":bool,"server_max_mb_s":int,"default_mb_s":int,"samples":int,"outcome":str,"refusal_code":str,"mechanism":str,"limits":str},"archives":{"enabled":bool,"formats":[str],"read_only":[str],"limits":{...},"routes":[str],"refusal_codes":[str],"semantics":str},"ports":{"enabled":bool,"max_pids":int,"max_fds_per_pid":int,"include_unix":bool,"mechanism":str,"routes":[str],"reachability":str,"default_note":str,"reads_total":int}}`
 - `GET /metrics` → Prometheus text
 
 #### What a workspace can and cannot observe
@@ -244,6 +244,37 @@ sandbox is running, including processes started from a session:
   cgroup — so a workload that called `os.setsid()` and left its process group is
   still stopped — and returns `404` for an id that does not name a process in
   this workspace, `403` across principals/workspaces.
+
+**Port/service discovery.** A workspace exposes the ports its processes are
+listening on, and which process serves each one:
+
+- `GET /v1/workspaces/{id}/ports` → 200
+  `{"workspace_id","ports":[{...}],"count","unix":[{...}],"unix_count",
+  "complete","notes","pids_scanned","fds_scanned","reachability"}`. Each port
+  entry carries `port`, `protocol` (`tcp`/`tcp6`/`udp`/`udp6`), `address`, a
+  derived `scope` (`loopback` for `127.0.0.1`/`::1`, `wildcard` for
+  `0.0.0.0`/`::`, else `specific`), `state` (`LISTEN` for TCP; a UDP socket has
+  **no** listen state, so its `state` is empty rather than an invented value),
+  and — when resolvable — the owning `pid`, `kind` and a short `label` (the
+  `argv[0]` basename plus args, truncated), plus `argv` and `owners`. An entry
+  whose owner cannot be resolved is still reported with `attributed:false`,
+  never dropped and never guessed. The list is sorted deterministically by
+  `(port, protocol)` and is **live** on every call (no cache); a port that
+  appears after the first call is reported on the next, and one whose process
+  exited disappears. Unix-domain sockets are reported in the **separate**
+  `unix` array and never mixed into the port list, because a unix socket is not
+  a reachable port. `complete` is `false` (with a `notes` entry) when a bounded
+  scan cap was hit, so a partial list is never shown as total.
+- **A reported port is listening inside the workspace's private network
+  namespace; it does NOT mean it is reachable from outside.** Publishing a port
+  to the internet is a separate feature (tunnels, which require
+  `limits.allow_tunnels` **and** `tunnels.enabled`), so a client must never tell
+  a user their app is public merely because it appears here. Every response
+  carries that statement in `reachability`.
+- An empty workspace is `{"ports":[],"count":0,"complete":true}` with a 200,
+  never an error; a foreign principal gets **403**; the route reads as **404
+  `ports_disabled`** when `ports.enabled` is false. This endpoint is
+  **on-demand only** and is deliberately **not** part of the metrics stream.
 
 **No leaks.** When a run or session ends (any reason) the engine removes the
 cgroup it caused nsjail to create, so `NSJAIL.*` cgroups do not accumulate. On
@@ -730,7 +761,7 @@ What is **still not implemented** (the honest non-goal):
 
 Stated precisely: **stop-everything for a workspace exists natively now;
 supervision (desired-state restart/autostart) remains a documented non-goal for
-this version** (v0.0.19). Where such a capability would belong if built — an
+this version** (v0.0.20). Where such a capability would belong if built — an
 engine-level supervisor versus the frontend restarting runs — is recorded in
 [DECISIONS.md](DECISIONS.md) #61. **It is deliberately not implemented in this
 version.**

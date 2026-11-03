@@ -111,6 +111,7 @@ NEW_PATHS=(
   "/v1/metrics/stream"
   "/v1/workspaces/{id}/metrics"
   "/v1/workspaces/{id}/metrics/stream"
+  "/v1/workspaces/{id}/ports"
 )
 for p in "${NEW_PATHS[@]}"; do
   # SPEC.md uses the {id} spelling; accept the {workspaceID} spelling too.
@@ -691,6 +692,109 @@ if grep -qF 'write_rate_mb_s' docs/API.md && grep -qF 'write_rate_exceeded' docs
   ok "write-rate.api-documented"
 else
   fail "write-rate.api-documented" "write_rate_mb_s / write_rate_exceeded are not documented in docs/API.md"
+fi
+
+# --- 4d-nonies. native port/service discovery and its harness ---------------
+# The endpoint answers which ports a workspace is listening on and which process
+# serves each one. It must exist, be documented (why the tenant cannot see its
+# own sockets, why /proc/<pid>/net and not ip netns exec, the measured cost, the
+# inode->process rule, the loopback/wildcard/specific distinction, the separate
+# unix section, the default-ON reasoning and the complete/honesty rule), be
+# advertised in /v1/meta, and its harness must not silently rot.
+if [ -f scripts/ports-check.sh ]; then
+  ok "ports-harness.exists"
+else
+  fail "ports-harness.exists" "scripts/ports-check.sh is missing"
+fi
+if [ -x scripts/ports-check.sh ]; then
+  ok "ports-harness.executable"
+else
+  fail "ports-harness.executable" "scripts/ports-check.sh is not executable"
+fi
+if grep -qF 'ports-check.sh' docs/VERIFICATION.md; then
+  ok "ports-harness.documented"
+else
+  fail "ports-harness.documented" "docs/VERIFICATION.md does not mention scripts/ports-check.sh"
+fi
+if grep -qE '^ports-check:' Makefile; then
+  ok "makefile.target.ports-check"
+else
+  fail "makefile.target.ports-check" "Makefile has no 'ports-check:' target"
+fi
+if grep -qE 'bash scripts/ports-check.sh' Makefile; then
+  ok "makefile.sudo.ports-check"
+else
+  fail "makefile.sudo.ports-check" "Makefile's 'ports-check' target does not run scripts/ports-check.sh"
+fi
+if grep -qE '^\.PHONY:.*\bports-check\b' Makefile; then
+  ok "makefile.phony.ports-check"
+else
+  fail "makefile.phony.ports-check" "'ports-check' is not in .PHONY"
+fi
+if grep -qF 'PortsConfig struct' internal/config/config.go && grep -qF 'Ports PortsConfig' internal/config/config.go; then
+  ok "ports.config"
+else
+  fail "ports.config" "the config.PortsConfig type / Ports field is missing from internal/config/config.go"
+fi
+if grep -qF 'ports:' configs/config.example.yaml && grep -qF 'enabled: true' configs/config.example.yaml; then
+  ok "ports.config-example"
+else
+  fail "ports.config-example" "the ports: block (default on) is missing from configs/config.example.yaml"
+fi
+if grep -qF 'ADR 96' docs/DECISIONS.md; then
+  ok "ports.adr"
+else
+  fail "ports.adr" "docs/DECISIONS.md is missing ADR 96 (native port/service discovery)"
+fi
+if grep -qiF 'no /proc/net' docs/DECISIONS.md || grep -qiF 'does not exist' docs/DECISIONS.md; then
+  ok "ports.adr-tenant-cannot-see"
+else
+  fail "ports.adr-tenant-cannot-see" "ADR 96 must record that the tenant has no /proc/net and no ss/netstat"
+fi
+if grep -qF '4.6 ms' docs/DECISIONS.md && grep -qiF 'metrics tick' docs/DECISIONS.md; then
+  ok "ports.adr-cost-and-tick"
+else
+  fail "ports.adr-cost-and-tick" "ADR 96 must record the measured 4.6 ms cost and why it is NOT on the metrics tick"
+fi
+if grep -qiF 'ip netns exec' docs/DECISIONS.md && grep -qiF 'inode' docs/DECISIONS.md; then
+  ok "ports.adr-netns-and-inode"
+else
+  fail "ports.adr-netns-and-inode" "ADR 96 must record why /proc/<pid>/net (not ip netns exec) and the socket-inode attribution"
+fi
+if grep -qiF 'loopback' docs/DECISIONS.md && grep -qiF 'wildcard' docs/DECISIONS.md && grep -qiF 'complete' docs/DECISIONS.md; then
+  ok "ports.adr-scope-and-complete"
+else
+  fail "ports.adr-scope-and-complete" "ADR 96 must record the loopback/wildcard/specific scope, the unix section and the complete/honesty rule"
+fi
+if grep -qF 'GET /v1/workspaces/{workspaceID}/ports' docs/API.md && grep -qiF 'reachable from outside' docs/API.md; then
+  ok "ports.api-documented"
+else
+  fail "ports.api-documented" "GET .../ports or its not-reachable-from-outside statement is missing from docs/API.md"
+fi
+if grep -qF '/v1/workspaces/{workspaceId}/ports' api/openapi.yaml && grep -qF 'PortList' api/openapi.yaml; then
+  ok "ports.openapi"
+else
+  fail "ports.openapi" "the ports path/schema is missing from api/openapi.yaml"
+fi
+if grep -qF 'reads_total' internal/api/router.go && grep -qF 'portsCap' internal/api/router.go; then
+  ok "ports.meta-advertised"
+else
+  fail "ports.meta-advertised" "GET /v1/meta does not advertise the ports capability (portsCap) with the reads_total counter"
+fi
+if [ -f internal/ports/parse.go ] && grep -qF 'func ParseTable(' internal/ports/parse.go && grep -qF 'func Build(' internal/ports/discover.go; then
+  ok "ports.pure-parser"
+else
+  fail "ports.pure-parser" "the pure internal/ports parser (ParseTable/Build) is missing"
+fi
+if grep -qF 'NetTablesForPids' internal/executor/ports.go && grep -qF 'socket:[' internal/executor/ports.go; then
+  ok "ports.host-read"
+else
+  fail "ports.host-read" "the bounded /proc/<pid>/net read + socket-inode attribution is missing from internal/executor/ports.go"
+fi
+if grep -qF 'ports_disabled' internal/model/errors.go && grep -qF 'ports_disabled' docs/API.md; then
+  ok "ports.disabled-code"
+else
+  fail "ports.disabled-code" "the ports_disabled refusal code is missing from errors.go or docs/API.md"
 fi
 
 # The masking shim source and the embedded artifact must both be present, so a

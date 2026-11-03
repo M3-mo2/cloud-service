@@ -103,7 +103,7 @@ KEY=dev-key-please-rotate
 A="Authorization: Bearer $KEY"
 J="Content-Type: application/json"
 BASE="http://127.0.0.1:$PORT"
-MARKER=zcp-metrics-stream-v0.0.19
+MARKER=zcp-metrics-stream-v0.0.20
 PASS=0
 FAIL=0
 

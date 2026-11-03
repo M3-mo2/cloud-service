@@ -1,6 +1,6 @@
 # Verification
 
-Results for sandboxd v0.0.19 against the acceptance criteria in the spec.
+Results for sandboxd v0.0.20 against the acceptance criteria in the spec.
 
 Environment:
 
@@ -107,7 +107,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **489** (485 unit + 4 `integration`-tagged), including regression
+Test functions: **521** (517 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -1911,12 +1911,12 @@ The tested binary is a **fresh build of the committed tree** and carries a
 $ go build -o /tmp/sbx-verify ./cmd/sandboxd
 $ md5sum /tmp/sbx-verify
 09d022b48b89e98ab948bd39bf42765b  /tmp/sbx-verify
-$ grep -aoF 'zcp-subscription-reaper-v0.0.19' /tmp/sbx-verify
-zcp-subscription-reaper-v0.0.19
+$ grep -aoF 'zcp-subscription-reaper-v0.0.20' /tmp/sbx-verify
+zcp-subscription-reaper-v0.0.20
 ```
 
 The gate itself performs this check (`grep -aF "$MARKER" "$BIN"`) and reports
-`PASS build marker present (zcp-subscription-reaper-v0.0.19)`. It also confirms
+`PASS build marker present (zcp-subscription-reaper-v0.0.20)`. It also confirms
 the port is free before starting, and proves the daemon owns it (`ss -ltnp`
 shows `pid=<SRV>`), so the "two daemons on one port" failure cannot masquerade as
 broken code.
@@ -2050,8 +2050,8 @@ cannot pass the gate:
 
 ```
 $ go build -o /tmp/sbx-archive ./cmd/sandboxd
-$ grep -aoF 'zcp-archive-native-v0.0.19' /tmp/sbx-archive
-zcp-archive-native-v0.0.19
+$ grep -aoF 'zcp-archive-native-v0.0.20' /tmp/sbx-archive
+zcp-archive-native-v0.0.20
 ```
 
 ### 9m.2 The real-nsjail acceptance
@@ -2152,7 +2152,7 @@ disk. Every wait is bounded and at most two workspaces run concurrently (this
 check is about resource cost, so it must not itself hammer the host). Measured
 `51 passed / 0 failed` across four consecutive runs:
 
-- the build marker is present (`zcp-metrics-stream-v0.0.19`) and the daemon's
+- the build marker is present (`zcp-metrics-stream-v0.0.20`) and the daemon's
   `/proc/<pid>/exe` hash equals the built image;
 - both stream routes return `text/event-stream` and deliver an initial frame
   promptly (bounded wait, no bare sleep); a stream of 3 frames is parseable JSON
@@ -2332,9 +2332,72 @@ Measured **29 passed / 0 failed**. The gate's own daemon-exe hash equals the
 built binary's; writers are explicitly bounded and cleaned, and the leak phase
 waits (bounded) for the `fuse2fs` helper to exit as the mount goes away.
 
+## 9q. Native port/service discovery
+
+### 9q.1 The mechanism (measured on this host — do not re-derive)
+
+- **The tenant cannot answer "which ports am I listening on?" itself.** Inside a
+  workspace, `ls /proc/net` → `No such file or directory` (the curated `/proc`
+  ships only chosen files, ADR 86), and `/bin/ss`, `/usr/bin/ss`, `/usr/sbin/ss`
+  and `/bin/netstat` are all **absent** from the profile. A user's app can bind a
+  port and the user has no way to see it from inside.
+- **The correct host-side read is `/proc/<pid>/net/{tcp,tcp6,udp,udp6,unix}` for
+  a pid inside the workspace.** A listener on `127.0.0.1:8080` appeared as
+  `0: 0100007F:1F90 00000000:0000 0A … inode` — `0A` is LISTEN, addresses are
+  little-endian hex (`0100007F` = `127.0.0.1`) and the port is hex (`1F90` =
+  8080).
+- **`ip netns exec <ns> ss` is the WRONG route (measured).** The workspace
+  namespace is created by slirp (`sbxdws-<hex>` plus `sbxdrelay`); the run's
+  process reports `net:[4026554106]` and `ip netns exec net:[4026554106] ss`
+  fails with `Cannot open network namespace: No such file or directory`. Reading
+  `/proc/<pid>/net/*` needs no namespace handling at all, because the pid is
+  already inside it.
+- **Cost, and therefore on-demand, NOT on the tick.** A direct open of
+  `/proc/<pid>/net/tcp` from a root process measured **4.6 ms** (15 ms through
+  `sudo`, so the read never shells out). That is fine for one request and far too
+  expensive for the 3-second stream (4.6 ms × 1000 workspaces = 4.6 s/tick), so
+  it is kept **out of `internal/metrics`** (ADR 96).
+
+### 9q.2 The real-nsjail acceptance
+
+`scripts/ports-check.sh` drives the REAL service against the host's real nsjail
+(bounded: three workspaces, one host listener, torn down after; it starts a
+listener inside the workspace, not on the operator's ports). It asserts:
+
+- a TCP listener on `127.0.0.1` is reported with the right **port**, `protocol`
+  `tcp` and **`loopback`** scope (and address/state);
+- a TCP listener on `0.0.0.0` is reported with **`wildcard`** scope;
+- a **UDP** socket is reported and is **NOT** called `LISTEN` (its state is the
+  empty no-listen value);
+- the **owning process** is resolved to the exact pid the test started, with a
+  `kind` and a label whose argv carries the run's unique token;
+- **THE ISOLATION ASSERTION**: a listener started on the **HOST** never appears
+  in a workspace's list (checked as a port and as a raw string in the whole
+  payload) — without it the endpoint could leak the host's and other tenants'
+  services;
+- **cross-tenant**: two workspaces binding the **same** port number each report
+  **only** their own, attributed to their own pid, and neither shows the other's
+  ports;
+- an **empty** workspace returns `{"ports":[],"count":0,"complete":true}` with a
+  **200**, not an error;
+- **no stale cache**: a port that appears after the first call is reported on the
+  next call, and a port whose process is stopped **disappears**;
+- `complete` is true in the normal case and the list is **deterministically
+  sorted** by `(port, protocol)` (two consecutive reads agree);
+- the endpoint is **NOT** in the metrics stream: the metrics payload carries no
+  port number and no `ports` key, and the monotonic `ports.reads_total` counter
+  does **not** move across metrics ticks while it **does** move on a `/ports`
+  request (so the assertion is not vacuous);
+- `/v1/meta` advertises the capability (switch, caps, reachability note); and
+- nothing is leaked (no engine netns, no `NSJAIL.*` cgroup, no `ws-*` parent, no
+  mount, no `fuse2fs`, no orphan image, no marked workload).
+
+Measured **49 passed / 0 failed**. The gate's daemon-exe hash equals the built
+binary's.
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **95** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **96** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -2390,7 +2453,15 @@ invalid-attempt caveat), why a Go-side bucket covers only the API path, why the
 sampled-growth mechanism is the one chosen, the overshoot NUMBER, the
 sustained-vs-instantaneous rule, the default-OFF decision, the distinct
 `rate_limited` outcome, and the note that DISK/RAM/CPU are kernel-enforced while
-this is sampled (see §9p).
+this is sampled (see §9p). **#96** records native port/service discovery: why
+the endpoint must exist (the tenant has no `/proc/net` and no `ss`/`netstat` —
+with the measurement), why `/proc/<pid>/net/*` and not `ip netns exec` (with the
+failure), the measured 4.6 ms cost and therefore why it is on-demand and NOT on
+the metrics tick, the socket-inode → process attribution rule and its ambiguity
+handling (multiple owners, a vanished pid, an unresolved inode), the
+loopback/wildcard/specific distinction and why it matters to a user who wants to
+publish a port, the separate unix-socket section, the default-**ON** reasoning,
+and the bound/`complete` honesty rule (see §9q).
 
 ## 11. OpenAPI
 

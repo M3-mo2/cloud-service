@@ -86,7 +86,7 @@ OTHER_KEY=other-key
 A="Authorization: Bearer $KEY"
 J="Content-Type: application/json"
 BASE="http://127.0.0.1:$PORT"
-MARKER=zcp-subscription-reaper-v0.0.19
+MARKER=zcp-subscription-reaper-v0.0.20
 PASS=0
 FAIL=0
 # The compressed clock. grace_period is global; each workspace's duration is set

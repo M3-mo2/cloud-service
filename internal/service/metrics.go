@@ -14,7 +14,7 @@ import (
 // startup. An acceptance harness greps the built binary for it as a positive
 // control, proving the tested artifact is a fresh build of the intended commit.
 // It names no engine.
-const MetricsMarker = "zcp-metrics-stream-v0.0.19"
+const MetricsMarker = "zcp-metrics-stream-v0.0.20"
 
 // metricsProvider supplies the metrics sampler with its candidate set. It joins
 // three cheap, in-memory sources per tick:

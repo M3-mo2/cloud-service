@@ -2502,6 +2502,127 @@ violation; idle adds one statfs and zero cgroup reads; the engine's own write
 path is refused 429; advertised == enforced; the overshoot is inside the
 documented window; a rate above `disk_mb` is refused; and nothing is leaked.
 
+## v0.0.20 — native port/service discovery (what a workspace is listening on)
+
+One feature, on-demand: `GET /v1/workspaces/{id}/ports` answers **which ports a
+workspace is listening on and which process serves each one**, so the separate
+bot product can tell a user "your app is live on port 8080". It reads the live
+kernel state of the workspace's processes and is **not** part of any stream. It
+shares its process registry with `GET /v1/workspaces/{id}/processes`, so the two
+can never disagree, and it is orthogonal to **tunnels** (which publish a port to
+the public internet).
+
+### ADR 96 — port discovery is an engine endpoint because the tenant cannot see its own sockets
+
+**Decision.** The engine answers a workspace's listening ports through an
+**on-demand** `GET /v1/workspaces/{id}/ports`, by reading
+`/proc/<pid>/net/{tcp,tcp6,udp,udp6,unix}` for a pid that is already inside the
+workspace's own network namespace, and attributing each socket to its owning
+process by matching the socket inode against the workspace's process registry.
+Per endpoint it reports the port, protocol, bind address, a derived **scope**,
+the state, and — when resolvable — the owning **pid / kind / label**; an entry
+whose owner cannot be resolved is reported with an explicit **`attributed:
+false`**, never dropped and never guessed. Unix sockets are reported in a
+**separate `unix` section**, never mixed into the port list.
+
+**Why the endpoint MUST exist (MEASURED — do not re-litigate).** Inside a
+workspace the tenant cannot answer this itself. `/proc/net` **does not exist**
+(`ls /proc/net` → `No such file or directory`), because the curated `/proc`
+(ADR 86) ships only the chosen files; and **`ss` and `netstat` are absent** from
+the profile (`/bin/ss`, `/usr/bin/ss`, `/usr/sbin/ss`, `/bin/netstat` all
+missing). A user's app can **bind** a port and the user has **no way to see it**
+from inside. The engine is therefore the only thing that can tell them — which
+is the whole justification for the feature.
+
+**Why `/proc/<pid>/net/*` and not `ip netns exec <ns> ss` (MEASURED — do not
+build on it).** The workspace's network namespace is created by **slirp**
+(`sbxdws-<hex>` plus `sbxdrelay`), and the run's process reports
+`net:[4026554106]`; `ip netns exec net:[4026554106] ss` fails with
+`Cannot open network namespace: No such file or directory`. Reading
+`/proc/<pid>/net/*` needs **no namespace handling at all**, because the pid is
+**already inside** the namespace. (`ss` is not installed anyway.)
+
+**Cost, and therefore ON-DEMAND, NOT on the metrics tick (MEASURED).** A direct
+open of `/proc/<pid>/net/tcp` from a root process measured **4.6 ms** (15 ms
+through `sudo` — which is why the read is a direct file read and never shells
+out). That is fine for one on-demand request and **far too expensive** for the
+3-second metrics stream: 4.6 ms × 1000 workspaces = **4.6 s per tick**. The
+read is therefore kept **out of `internal/metrics`**, and a monotonic
+`ports.reads_total` counter (advertised in `/v1/meta`) lets a gate prove it:
+the counter does **not** move across metrics ticks, and **does** move on a
+`/ports` request (so the assertion is not vacuous).
+
+**Attribution rule and its ambiguity.** `/proc/net/*` gives a **socket inode**;
+the owner is the process whose `/proc/<pid>/fd/*` contains
+`socket:[<inode>]`. The scan runs **only over the pids the workspace's process
+registry already reports** (never a blind `/proc` scan, and `/proc/<pid>/environ`
+is never read). Bounds are explicit (`ports.max_pids`, default 64;
+`ports.max_fds_per_pid`, default 512). Handling: a pid that **disappears
+mid-scan** is skipped; a socket held by **several** pids reports **all** of them
+(`owners`, sorted by pid) and names the **lowest pid** as primary,
+deterministically; a socket whose inode **no live pid holds** is reported
+`attributed:false`. **A bound hit sets `complete:false`** with a `notes` entry —
+the same honesty rule the disk figure uses — so a partial list is never shown as
+total.
+
+**Scope, and why it matters for publishing.** A bind address is classified
+**`loopback`** (`127.0.0.0/8`, `::1`), **`wildcard`** (`0.0.0.0`, `::`) or
+**`specific`**. This is exactly what a user who wants to publish a port needs to
+know: a `loopback`-only listener is **not** reachable from outside the workspace
+even once a port is published, while a `wildcard` binding is. The API docs say
+plainly that **a reported port is listening inside the workspace's private
+namespace and does NOT mean it is reachable from outside** — publishing requires
+a **tunnel** (`limits.allow_tunnels` **and** `tunnels.enabled`, both required,
+else 422), so a client must never tell a user their app is public merely because
+it appears in this list. Every response carries that reachability note.
+
+**UDP has no listen state.** TCP listening sockets are reported `state:
+"LISTEN"` (kernel state `0A`). UDP has **no** listen state, so a bound UDP
+socket is reported with an **empty** `state` — the engine says so rather than
+inventing "LISTEN". A UDP socket is reportable when it is **bound** (remote
+unspecified, local port non-zero); a connected client flow (a DNS query in
+flight) is not a service and is not reported.
+
+**Unix sockets: a separate section.** They are readable from
+`/proc/<pid>/net/unix` and are how many dev servers expose a socket instead of a
+port, but they are **not ports**. They are reported in a **separate `unix`
+array** (`ports.include_unix`, default on) and **never** mixed into the port
+list, so the shape cannot pretend a unix socket is a reachable port. A unix
+socket is attributed by the same inode→process rule.
+
+**Default is ON, deliberately.** `ports.enabled` defaults to **true**. This is a
+considered choice, not an inherited "new is off" default: the feature is
+**read-only introspection of the tenant's OWN workspace** — it reveals nothing
+about the host, another workspace or the operator — and with it off the user has
+**no way at all** to see their own services (they cannot see `/proc/net`, and
+`ss`/`netstat` are absent). Disabling it would leave the user blind to their own
+work. An operator who nonetheless wants the surface absent sets
+`ports.enabled: false`, and the route then reads as **404 `ports_disabled`**
+(the surface is simply gone), and `/v1/meta` reports it off.
+
+**Isolation is the load-bearing property.** The read is scoped **by construction**
+to the workspace's own pids, so a **host** listener (or another tenant's) can
+never appear. `scripts/ports-check.sh` asserts this directly — it starts a real
+listener on the **host** and proves it **never** appears in a workspace's list —
+and asserts that two workspaces binding the **same** port number each see only
+themselves. This is why the read is host-side and scoped, rather than anything
+the tenant could reach.
+
+**We do not weaken the curated `/proc`.** The masking work (ADR 86) hides the
+host on purpose. Whether the tenant should also see its own `/proc/net/tcp` from
+**inside** is a **separate** decision with its own gate; it is **not** done here,
+and nothing in this feature adds `/proc/net` back to the workspace view.
+
+**Files.** `internal/ports` (the pure `/proc/net` parser, scope derivation,
+deterministic sort, and the attribution/report types), `internal/executor/ports.go`
+(the bounded host read and the inode→pid attribution), `internal/service/ports.go`
+(the registry-scoped `ListPorts`), `internal/config` (`ports:` block, default
+on), the API route and its capability in `/v1/meta`, and the gate
+`scripts/ports-check.sh` (real nsjail; asserts the scope/protocol/state, the
+exact-owner attribution, the host-isolation assertion, the cross-tenant
+assertion, the empty-200, liveness, determinism, the not-in-metrics assertion,
+the meta advertisement, and the no-leak check).
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.
@@ -2510,7 +2631,7 @@ documented window; a rate above `disk_mb` is refused; and nothing is leaked.
   `unknown_profile`, `session_needs_interpreter`, `subscription_expired`, `subscription_invalid`,
   `max_duration_exceeded`, `subscription_would_shorten`, `validation`,
   `unprocessable`, `not_directory`, `payload_too_large`, `timeout`, `tunnel_url_unavailable`,
-  `unavailable`, `internal`, `write_rate_exceeded`. _Rationale_: fixed vocabulary mapped 1:1 from HTTP status.
+  `unavailable`, `internal`, `write_rate_exceeded`, `ports_disabled`. _Rationale_: fixed vocabulary mapped 1:1 from HTTP status.
 - **CWD default**: `/` normalizes to the workspace root `/workspace` inside the sandbox.
   _Rationale_: the workspace is the only mounted path users should see.
 - **Log offset semantics**: byte offsets into the log file; `next` is the offset to pass on the

@@ -5,6 +5,12 @@ import (
 	"sandboxd/internal/ports"
 )
 
+// PortsMarker is an opaque build marker embedded in the binary and logged at
+// startup. An acceptance harness greps the built binary for it as a positive
+// control, proving the tested artifact is a fresh build of the intended commit.
+// It names no engine.
+const PortsMarker = "zcp-ports-native-v0.0.20"
+
 // PortsEnabled reports whether native port discovery is configured on. It is ON
 // by default (see config.PortsConfig): read-only introspection of the tenant's
 // OWN workspace, which the tenant otherwise cannot see from inside, because the

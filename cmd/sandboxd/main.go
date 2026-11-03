@@ -165,6 +165,11 @@ func main() {
 	// so metrics-check can prove the tested binary is a fresh build. The sampler
 	// is lazy: this line configures it, it starts only on the first subscriber.
 	service.MetricsStartupLog(logger, cfg)
+	// Native port/service discovery embeds its own build marker so ports-check
+	// can prove the tested binary is a fresh build. The read is on-demand; this
+	// line only records the configuration.
+	logger.Info("native port discovery configured", "build_marker", service.PortsMarker,
+		"enabled", cfg.Ports.Enabled, "max_pids", cfg.Ports.MaxPids, "max_fds_per_pid", cfg.Ports.MaxFDsPerPID)
 	authn := auth.New(cfg.Keys)
 	server := api.NewServer(svc, authn, logger)
 

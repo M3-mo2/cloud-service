@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: sandboxd API
-  version: 0.0.19
+  version: 0.0.20
   description: |
     Secure per-principal code execution backend. All `/v1` endpoints require a
     static bearer API key. All timestamps are RFC3339 UTC.
@@ -18,6 +18,7 @@ tags:
   - name: Processes
   - name: Tunnels
   - name: Metrics
+  - name: Ports
 
 security:
   - bearerAuth: []
@@ -334,6 +335,41 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ProcessStop" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/workspaces/{workspaceId}/ports:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getv1_workspaces_workspaceId_ports
+      tags: [Ports]
+      summary: List the ports the workspace is listening on
+      description: >
+        The ports the workspace's processes are listening on, and which process
+        serves each one. The engine reads /proc/<pid>/net/{tcp,tcp6,udp,udp6,unix}
+        for a pid already inside the workspace's own network namespace and
+        attributes each socket to its owner by matching the socket inode against
+        the workspace's process registry (the same registry GET .../processes
+        serves, so the two cannot disagree). The read is bounded and live on
+        every call (nothing is cached). A port whose owner cannot be resolved is
+        reported with `attributed: false`, never dropped and never guessed.
+
+        IMPORTANT: a reported port is listening INSIDE the workspace's private
+        network namespace. It does NOT mean it is reachable from outside.
+        Publishing a port to the public internet is a separate feature (tunnels,
+        which require `limits.allow_tunnels` AND `tunnels.enabled`), so a client
+        must never tell a user their app is public merely because it appears
+        here. An empty workspace is an honest empty list (`count: 0`) with a 200,
+        never an error. This endpoint is on-demand only and is NOT part of the
+        metrics stream. A foreign principal gets 403; when port discovery is
+        switched off it reads as 404 `ports_disabled`.
+      responses:
+        "200":
+          description: The workspace's listening endpoints and unix sockets
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PortList" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1534,7 +1570,7 @@ components:
       type: object
       required: [version, api_version, runtimes, limits_defaults]
       properties:
-        version: { type: string, examples: ["0.0.19"] }
+        version: { type: string, examples: ["0.0.20"] }
         api_version: { type: string, examples: [v1] }
         runtimes:
           type: array
@@ -1733,6 +1769,32 @@ components:
             routes:
               type: array
               items: { type: string }
+        ports:
+          type: object
+          description: >-
+            Native port/service discovery capability, reported truthfully.
+            `enabled` is the server switch (ports.enabled, DEFAULT TRUE: it is
+            read-only introspection of the tenant's own workspace, which the
+            tenant cannot see from inside); `max_pids`/`max_fds_per_pid` are the
+            bounded-scan caps; `include_unix` is whether unix sockets are
+            reported (in the separate `unix` section); `mechanism` states the
+            on-demand /proc/<pid>/net read and the inode->process attribution;
+            `reachability` is the plain statement that a reported port is inside
+            the workspace and not thereby public; `reads_total` is a monotonic
+            diagnostic proving the read is on-demand only (it does not move on a
+            metrics tick).
+          properties:
+            enabled: { type: boolean }
+            max_pids: { type: integer }
+            max_fds_per_pid: { type: integer }
+            include_unix: { type: boolean }
+            mechanism: { type: string }
+            routes:
+              type: array
+              items: { type: string }
+            reachability: { type: string }
+            default_note: { type: string }
+            reads_total: { type: integer }
     ArchiveEntry:
       type: object
       description: One archive member as reported by an extraction or dry run.
@@ -2070,6 +2132,86 @@ components:
           description: "`stopped` when a live tree was signalled; `gone` when the process had already exited (idempotent)."
         stopped: { type: boolean }
         stopped_at: { type: string, format: date-time }
+    Port:
+      type: object
+      required: [port, protocol, address, scope, state, attributed]
+      properties:
+        port: { type: integer, description: "The listening port number." }
+        protocol:
+          type: string
+          enum: [tcp, tcp6, udp, udp6]
+          description: "The network table this endpoint was read from."
+        address: { type: string, description: "Bind address, decoded from the kernel's hex form (e.g. 127.0.0.1, 0.0.0.0, ::1)." }
+        scope:
+          type: string
+          enum: [loopback, wildcard, specific]
+          description: >
+            `loopback` (127.0.0.0/8, ::1), `wildcard` (0.0.0.0, ::) or
+            `specific`. It decides whether the port is reachable from outside
+            the workspace at all: a loopback-only listener is not, even once a
+            port is published.
+        state:
+          type: string
+          description: >
+            `LISTEN` for a TCP listener. A UDP socket has NO listen state, so
+            its value is the empty string -- the engine says so rather than
+            inventing one.
+        attributed:
+          type: boolean
+          description: "true when the owning process was resolved; false means the entry is still reported but its owner is unknown (never dropped, never guessed)."
+        pid: { type: integer, description: "Host pid of the owning process (present when attributed)." }
+        kind:
+          type: string
+          enum: [run, session, detached]
+          description: "The owning process's kind (present when attributed)."
+        label: { type: string, description: "Short human label (argv[0] basename + args, truncated)." }
+        argv:
+          type: array
+          items: { type: string }
+          description: "The owning process's command line (present when attributed)."
+        owners:
+          type: array
+          items: { type: integer }
+          description: "Every candidate pid holding the socket, sorted by pid; the primary `pid` is the lowest."
+        inode: { type: integer, description: "Kernel socket inode, for correlation with a client's own diagnostics." }
+        ipv6: { type: boolean, description: "true for the tcp6/udp6 variants." }
+    UnixSocket:
+      type: object
+      properties:
+        path: { type: string, description: "Filesystem path of the unix socket; empty for an abstract/unnamed socket." }
+        type: { type: string, enum: [stream, dgram, seqpacket, unknown] }
+        state: { type: string, enum: [unconnected, connecting, connected, disconnecting, unknown] }
+        attributed: { type: boolean }
+        pid: { type: integer }
+        kind: { type: string, enum: [run, session, detached] }
+        label: { type: string }
+        inode: { type: integer }
+    PortList:
+      type: object
+      required: [workspace_id, ports, count, unix, unix_count, complete, notes, reachability]
+      properties:
+        workspace_id: { type: string }
+        ports:
+          type: array
+          items: { $ref: "#/components/schemas/Port" }
+        count: { type: integer, description: "Number of listening endpoints (0 is an honest empty list)." }
+        unix:
+          type: array
+          items: { $ref: "#/components/schemas/UnixSocket" }
+          description: "Unix-domain sockets, in a SEPARATE section: a unix socket is not a reachable port, so it is never mixed into `ports`."
+        unix_count: { type: integer }
+        complete:
+          type: boolean
+          description: "false (with a `notes` entry) when the bounded scan hit a cap, so the list is a partial view and not a total one."
+        notes:
+          type: array
+          items: { type: string }
+          description: "Why the result is incomplete (which bound was hit)."
+        pids_scanned: { type: integer, description: "Processes examined for attribution." }
+        fds_scanned: { type: integer, description: "File descriptors examined for attribution." }
+        reachability:
+          type: string
+          description: "The plain statement that these ports are listening inside the workspace's private namespace and are NOT thereby reachable from outside; publishing requires a tunnel (limits.allow_tunnels AND tunnels.enabled)."
     CreateTunnelRequest:
       type: object
       required: [port]

@@ -79,7 +79,7 @@ additional code the router emits:
 |------|------|---------|--------------|
 | `unauthorized` | 401 | Missing or invalid credentials | No/invalid `Authorization` header on a `/v1` route. |
 | `forbidden` | 403 | Resource belongs to another principal | Valid key, `owner_id` mismatch. |
-| `not_found` | 404 | Resource missing | Unknown workspace/run/file, unknown route. |
+| `not_found` | 404 | Resource missing | Unknown workspace/run/file, unknown route. Also `ports_disabled` when port discovery is switched off (`ports.enabled: false`), so the surface reads as absent. |
 | `conflict` | 409 | Operation conflicts with current state | Purging run history (or deleting one run) while a run is still queued/running. |
 | `tunnels_disabled` | 422 | Quick tunnels forbidden | `POST .../tunnels` when `tunnels.enabled` is false (`details.config:"tunnels.enabled"`), the workspace has not opted in (`limits.allow_tunnels`), or the workspace has no egress (`limits.allow_net`), which cloudflared needs. |
 | `too_many_tunnels` | 422 | Per-workspace tunnel cap reached | `POST .../tunnels` when `tunnels.max_per_workspace` active tunnels already exist. |
@@ -219,7 +219,7 @@ default per-workspace limits.
 
   ```json
   {
-    "version": "0.0.19",
+    "version": "0.0.20",
     "api_version": "v1",
     "runtimes": ["python3"],
     "subscriptions": {
@@ -246,6 +246,17 @@ default per-workspace limits.
                         "archive_too_large", "archive_too_many_entries",
                         "archive_ratio_exceeded", "archive_unsafe_entry", "archive_entry_exists"],
       "semantics": "extraction validates every entry before writing (a refused archive leaves no partial tree); an entry that escapes the destination, is a symlink/hardlink, or sets a privileged bit is refused, and the bytes written are bounded by a streaming budget so a lying header cannot overshoot; overwrite:false (the default) refuses to clobber an existing file with 409 archive_entry_exists"
+    },
+    "ports": {
+      "enabled": true,
+      "max_pids": 64,
+      "max_fds_per_pid": 512,
+      "include_unix": true,
+      "mechanism": "on-demand read of /proc/<pid>/net/{tcp,tcp6,udp,udp6,unix} for a pid inside the workspace's own namespace, with socket-inode -> owning-process attribution over the workspace's process registry; never cached and never on the metrics tick",
+      "routes": ["GET /v1/workspaces/{id}/ports"],
+      "reachability": "a reported port is listening inside the workspace's private network namespace; it is NOT reachable from outside unless a tunnel publishes it (limits.allow_tunnels AND tunnels.enabled)",
+      "default_note": "enabled by default: read-only introspection of the tenant's own workspace, which the tenant cannot see from inside (no /proc/net, no ss/netstat)",
+      "reads_total": 0
     },
     "interpreters": ["bash", "node", "perl", "python3"],
     "runnable_extensions": [".bash", ".cjs", ".js", ".mjs", ".pl", ".pm", ".py", ".sh"],
@@ -753,6 +764,75 @@ PID=$(curl -s -H "Authorization: Bearer $KEY" \
   python3 -c 'import json,sys;print(json.load(sys.stdin)["processes"][0]["id"])')
 curl -s -X POST -H "Authorization: Bearer $KEY" \
   localhost:8080/v1/workspaces/$WS/processes/$PID/stop
+```
+
+### GET /v1/workspaces/{workspaceID}/ports
+
+List the **ports the workspace's processes are listening on**, and which process
+serves each one. This is what lets a client tell a user "your app is live on port
+8080".
+
+- **Path parameter:** `workspaceID`.
+- **Response 200:**
+
+  ```json
+  {"workspace_id":"ws_01J...",
+   "ports":[
+     {"port":8080,"protocol":"tcp","address":"127.0.0.1","scope":"loopback",
+      "state":"LISTEN","attributed":true,"pid":179173,"kind":"run",
+      "label":"python3 -m http.server 8080","argv":["python3","-m","http.server","8080"],
+      "owners":[179173],"inode":2704413670},
+     {"port":5353,"protocol":"udp","address":"0.0.0.0","scope":"wildcard",
+      "state":"","attributed":false}],
+   "count":2,
+   "unix":[{"path":"/run/app.sock","type":"stream","state":"connected",
+            "attributed":true,"pid":179173,"kind":"run"}],
+   "unix_count":1,
+   "complete":true,"notes":[],"pids_scanned":1,"fds_scanned":12,
+   "reachability":"ports are listening inside the workspace's private network namespace; this does not mean they are reachable from outside. Publishing a port requires a tunnel (limits.allow_tunnels and tunnels.enabled)."}
+  ```
+
+  | Field | Meaning |
+  |-------|---------|
+  | `port` | The listening port number. |
+  | `protocol` | `tcp`, `tcp6`, `udp` or `udp6`. |
+  | `address` | The bind address, decoded from the kernel's hex form (e.g. `127.0.0.1`, `0.0.0.0`, `::1`). |
+  | `scope` | `loopback` (`127.0.0.0/8`, `::1`), `wildcard` (`0.0.0.0`, `::`), or `specific`. Decides whether the port is reachable from outside at all. |
+  | `state` | `LISTEN` for a TCP listener. A **UDP** socket has **no** listen state, so its `state` is the **empty string** — the engine says so rather than inventing "LISTEN". |
+  | `attributed` | `true` when the owning process was resolved. When `false`, the entry is still reported, never dropped and never guessed. |
+  | `pid`, `kind`, `label`, `argv`, `owners` | The owning process: its host pid, its `run`/`session`/`detached` kind, a short human label (`argv[0]` basename + args, truncated), its argv, and every candidate pid holding the socket (when more than one). |
+  | `inode` | The kernel socket inode, for correlation with a client's own diagnostics. |
+  | `unix` | A **separate** array of unix-domain sockets. They are **never** mixed into `ports`, because a unix socket is not a reachable port. |
+  | `complete` | `false` (with a `notes` entry) when the bounded scan hit a cap; the list is then a **partial** view, not a total one. |
+  | `pids_scanned`, `fds_scanned` | The bounded work actually performed. |
+  | `reachability` | The plain statement, always present, that these ports are **inside** the workspace and are **not** thereby reachable from outside. |
+
+- **Errors:** 401 `unauthorized`, 403 `forbidden`, 404 `not_found`, 404
+  `ports_disabled` (the feature is switched off with `ports.enabled: false`).
+- **Semantics (how it is measured):** the engine reads
+  `/proc/<pid>/net/{tcp,tcp6,udp,udp6,unix}` for a pid that is **already inside
+  the workspace's own network namespace**, and attributes each socket to its
+  owner by matching the socket inode against the workspace's process registry
+  (the same registry `GET .../processes` serves, so the two cannot disagree).
+  The read is **bounded** (`ports.max_pids`, `ports.max_fds_per_pid`) and
+  **live** on every call — nothing is cached, so a port that appears after the
+  first call is reported on the next, and one whose process exited disappears.
+  The list is sorted deterministically by `(port, protocol)`.
+- **Not reachability.** A port here is listening inside the workspace's private
+  network namespace. It does **not** mean it is reachable from the internet:
+  publishing a port is a separate feature (**tunnels**), which requires
+  `limits.allow_tunnels` **and** `tunnels.enabled`. A client must never tell a
+  user their app is public merely because it appears here.
+- **Isolation:** the scan runs **only** over the workspace's own processes, so a
+  port on the **host**, or another tenant's port, can never appear. A foreign
+  principal gets **403**. An empty workspace is an honest
+  `{"ports":[],"count":0,"complete":true}` with a 200, never an error.
+- **Cost:** the read is **on-demand only** and is deliberately **not** part of
+  the metrics stream (one table read is measured at ~4.6 ms).
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" \
+  localhost:8080/v1/workspaces/$WS/ports
 ```
 
 ### GET /v1/workspaces/{workspaceID}/usage

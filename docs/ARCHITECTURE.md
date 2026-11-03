@@ -5,7 +5,7 @@
 > sandbox. Diagrams are [Mermaid](https://mermaid.js.org/); they render on
 > GitHub/GitLab and in most Markdown viewers.
 
-- Version: **0.0.19** (pre-alpha)
+- Version: **0.0.20** (pre-alpha)
 - Language: Go 1.23+
 - Isolation: [`nsjail`](https://github.com/google/nsjail) (Linux namespaces,
   cgroups v2, seccomp, rlimits)
@@ -71,7 +71,7 @@ services** that call it on a user's behalf — not the users themselves.
 
 See [DECISIONS.md](DECISIONS.md) #54 for the decision and its consequences.
 
-### What it deliberately is *not* (v0.0.19)
+### What it deliberately is *not* (v0.0.20)
 
 Pre-alpha scope. It is a single-node, static-key service. Not yet: a hardened
 public-internet multi-tenant platform, a distributed scheduler, or a
@@ -152,9 +152,11 @@ flowchart TD
     SVC --> SUB["internal/subscription (pure: parser, decision, derivations)"]
     SVC --> ARC["internal/archive (pure: detection, plan, budgeted extract, export)"]
     SVC --> MET["internal/metrics (one lazy sampler: statfs + summed cgroups)"]
+    SVC --> PORTS["internal/ports (pure /proc/net parser, scope, attribution types)"]
 
     RUN --> CFGS["configs (embedded template)"]
     RUN --> MODEL
+    RUN --> PORTS
     STORE --> MODEL
     WS --> MODEL
     CFG --> MODEL
@@ -178,9 +180,10 @@ flowchart TD
 | `internal/metrics` | `metrics.go`, `sampler.go`, `reader.go` | The per-workspace resource stream: the snapshot/frame types and percentages, the ONE lazily-started service-wide sampler with its subscriber registry and coalescing, and the production `statfs`+cgroup reader. Pure entry points, injected `Provider`/`Reader` for tests |
 | `internal/workspace` | `fs.go`, `path.go`, `diskfs.go` | Safe rooted filesystem, traversal/symlink defense, disk quota accounting, and the per-workspace fuse2fs ext4 image manager |
 | `internal/storage` | `store.go` | Atomic JSON metadata + run-log/session-output files on disk |
-| `internal/executor` | `executor.go`, `nsjail.go`, `live.go`, `identity.go`, `fake.go`, `pty_relay.py` | nsjail config rendering, UID/GID mapping, one-shot and interactive process lifecycles, capped capture, PTY relay helper |
+| `internal/executor` | `executor.go`, `nsjail.go`, `live.go`, `identity.go`, `ports.go`, `fake.go`, `pty_relay.py` | nsjail config rendering, UID/GID mapping, one-shot and interactive process lifecycles, capped capture, PTY relay helper, and the bounded `/proc/<pid>/net/*` + `/proc/<pid>/fd` port read |
+| `internal/ports` | `parse.go`, `discover.go` | The PURE port/service discovery parts: the `/proc/net/{tcp,tcp6,udp,udp6,unix}` line parser (hex address incl. IPv6, hex port, LISTEN state), scope derivation and deterministic sort, and the socket-inode -> process attribution/report types. No I/O |
 | `configs` | `nsjail_python.cfg.tmpl`, `embed.go` | nsjail TextProto template (also compiled into the binary) |
-| `scripts` | `acceptance.sh`, `session-nsjail-check.sh`, `subscription-check.sh`, `archive-check.sh`, `nsjail-stub.py` | End-to-end acceptance transcript; privileged real-nsjail terminal-session + subscription + archive acceptance; test stub |
+| `scripts` | `acceptance.sh`, `session-nsjail-check.sh`, `subscription-check.sh`, `archive-check.sh`, `ports-check.sh`, `nsjail-stub.py` | End-to-end acceptance transcript; privileged real-nsjail terminal-session + subscription + archive + port-discovery acceptance; test stub |
 
 Total ≈ 6.4k lines of Go across 8 packages, plus one embedded template and an
 OpenAPI 3.1 spec (`api/openapi.yaml`).
@@ -612,6 +615,55 @@ flowchart TD
     RATE -->|no| RESET
     RATE -->|yes| KILL["stop the run(s): status rate_limited<br/>AND flag the engine's own write path<br/>(429 write_rate_exceeded)"]
 ```
+
+### 4.8b Native port/service discovery (on-demand, never on the tick)
+
+`GET /v1/workspaces/{id}/ports` answers what a workspace is listening on and
+which process serves each one, so a client can say "your app is live on port
+8080". It exists because the tenant **cannot** answer it itself: the curated
+`/proc` carries no `/proc/net` (ADR 86) and neither `ss` nor `netstat` is
+installed. The read is **on demand**, one request at a time, and is deliberately
+**not** part of the resource stream: a single `/proc/<pid>/net/tcp` open is
+measured at **~4.6 ms**, and 4.6 ms × 1000 workspaces would add **4.6 s** to
+every 3-second tick (ADR 96).
+
+```mermaid
+flowchart TD
+    REQ["GET .../ports"] --> REG["process registry (same as .../processes)<br/>candidate pids for the workspace"]
+    REG --> READ["read /proc/&lt;pid&gt;/net/{tcp,tcp6,udp,udp6,unix}<br/>for a pid already INSIDE the workspace ns"]
+    READ --> PARSE["pure parser: hex addr/port, state, inode<br/>scope = loopback | wildcard | specific"]
+    REG --> FD["scan /proc/&lt;pid&gt;/fd for socket:[inode]<br/>(bounded: max_pids, max_fds_per_pid)"]
+    FD --> ATTR{"inode held by a workspace pid?"}
+    PARSE --> ATTR
+    ATTR -->|yes| OWN["pid + kind + label (argv-driven)"]
+    ATTR -->|no| UNAT["attributed:false (reported, never dropped)"]
+    OWN --> SORT["sort by (port, protocol); unix in a SEPARATE section"]
+    UNAT --> SORT
+    SORT --> DONE["complete flag; notes when a cap was hit"]
+```
+
+The load-bearing properties are:
+
+- **The tenant cannot see this itself**, which is why the endpoint is the only
+  answer: no `/proc/net`, no `ss`, no `netstat` inside.
+- **`/proc/<pid>/net/*`, not `ip netns exec ... ss`.** The pid is already inside
+  the workspace's slirp-created namespace; `ip netns exec net:[...]` fails on
+  this host (measured). Reading `/proc/<pid>/net/*` needs no namespace handling.
+- **Scoped to the workspace's own pids**, so a host port or another tenant's port
+  can never appear — the isolation property `scripts/ports-check.sh` proves.
+- **On-demand, never on the tick.** A monotonic `reads_total` counter (in
+  `/v1/meta`) does not move across a metrics tick and does move on a `/ports`
+  request, so the gate proves the cost decision without being vacuous.
+- **Honest**: a port whose owner cannot be resolved is reported `attributed:
+  false`; a bound hit sets `complete:false` rather than a partial list that looks
+  total; UDP has no `LISTEN` state and is not given one.
+- **Not reachability.** A port here is inside the workspace; publishing needs a
+  **tunnel** (`limits.allow_tunnels` **and** `tunnels.enabled`), so every
+  response carries a plain reachability note.
+
+The route and frame shape are in [docs/API.md](API.md#get-v1workspacesworkspaceidports);
+the decision is ADR 96; and `scripts/ports-check.sh` asserts the whole contract
+against real nsjail.
 
 ---
 
@@ -1177,6 +1229,9 @@ flowchart LR
 | `POST .../sessions/{id}/resize` | `TIOCSWINSZ` | 204 | 409 ended, 422 |
 | `GET .../sessions/{id}/output` | poll PTY output by offset | 200 | 409 ended |
 | `DELETE .../sessions/{id}` | graceful close (idempotent) | 200 | 404 |
+| `GET .../processes` | every live process in the workspace (inventory) | 200 | 403, 404 |
+| `POST .../processes/{processID}/stop` | stop one process tree (cgroup-scoped) | 200 | 403, 404 |
+| `GET .../ports` | ports the workspace is listening on + their owner (on-demand) | 200 | 403, 404, 404 `ports_disabled` |
 
 All errors share one envelope:
 
@@ -1258,6 +1313,11 @@ metrics:                     # per-workspace RAM+disk stream (all defaulted)
   include_cpu: false         # opt-in cpu.stat + pids.current (the costly files)
   idle_reconcile_interval: "15s" # inventory refresh (live cgroups are per-tick)
   max_subscribers: 1024      # concurrent streams cap
+ports:                       # native port/service discovery (ON by default)
+  enabled: true              # false = the route reads 404 ports_disabled
+  max_pids: 64               # bounded-scan cap: processes examined
+  max_fds_per_pid: 512       # bounded-scan cap: fds examined per process
+  include_unix: true         # report unix sockets (in the SEPARATE unix section)
 keys:                        # service bearer keys → principal_id (1:N allowed);
                              # held by the frontend, never by end users
   - { key: "dev-key-please-rotate", principal_id: "user_dev" }
@@ -1351,11 +1411,11 @@ set `NSJAIL=/usr/local/bin/nsjail` and it will verify the binary is real.
 
 Deferred to v0.1 (documented, not bugs):
 
-- **SSE log streaming** — v0.0.19 polls logs with `offset`/`limit`.
+- **SSE log streaming** — v0.0.20 polls logs with `offset`/`limit`.
 - **Multi-node storage / sharding** — storage is a local filesystem.
 - **Dynamic/DB authentication** — keys are static in config (bearer auth itself
   is exercised by `TestAuth*`).
-- **Per-UID-per-workspace isolation** — v0.0.19 uses a shared `sandbox` UID/GID
+- **Per-UID-per-workspace isolation** — v0.0.20 uses a shared `sandbox` UID/GID
   with per-run user namespaces + cgroups.
 - **Kernel-enforced per-run disk quota** — disk is accounted on the file API
   path and rechecked with `du`; the sandbox process is bounded by `rlimit_fsize`

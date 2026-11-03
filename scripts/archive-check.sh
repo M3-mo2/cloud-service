@@ -98,7 +98,7 @@ KEY=dev-key-please-rotate
 A="Authorization: Bearer $KEY"
 J="Content-Type: application/json"
 BASE="http://127.0.0.1:$PORT"
-MARKER=zcp-archive-native-v0.0.19
+MARKER=zcp-archive-native-v0.0.20
 # The committed fixture root. Every archive the gate exercises is read from here.
 FIX="$ROOT/internal/archive/testdata"
 PASS=0

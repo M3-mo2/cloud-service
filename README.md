@@ -7,9 +7,9 @@ product's job; this service authenticates only static per-principal API keys.
 `sandboxd` lets clients create isolated workspaces, upload files, and run code inside
 [nsjail](https://github.com/google/nsjail) with CPU/memory/disk limits and no network by default.
 
-> Status: **v0.0.19** (pre-alpha). The service version string (`model.Version`)
+> Status: **v0.0.20** (pre-alpha). The service version string (`model.Version`)
 > tracks the highest feature group resolved in [docs/DECISIONS.md](docs/DECISIONS.md),
-> which now runs to v0.0.19; it is independent of the `/v1` API contract version.
+> which now runs to v0.0.20; it is independent of the `/v1` API contract version.
 > SSE log streaming and multi-node storage are deferred to v0.1.
 
 ## Features
