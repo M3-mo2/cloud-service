@@ -2100,6 +2100,135 @@ edited so that it has an expiry but no `GraceEndsAt` still decides correctly:
 `Decide` derives the grace end from `ExpiresAt + grace` when the stored value is
 zero.
 
+### ADR 93 — the per-workspace resource stream: one lazy service-wide sampler, statfs disk, summed cgroups
+
+**Decision.** A workspace's RAM and disk are pushed every 3s (configurable) over
+SSE, served by a single service-wide sampler in `internal/metrics`. The design is
+chosen **from measurement**, not intuition, because the operator's hard
+requirement is that it be so cheap that thousands of workspaces cause no
+pressure: an implementation that samples per connection, or walks a directory
+tree, is refused even though it would "work". Four routes are shipped —
+`GET /v1/metrics`, `GET /v1/metrics/stream`,
+`GET /v1/workspaces/{id}/metrics`, `GET /v1/workspaces/{id}/metrics/stream` —
+gated on `metrics.enabled` and advertised in `GET /v1/meta`.
+
+**The disk figure is `statfs`, never a tree walk (measured).** `statfs` is
+O(1) and costs **1.7–1.9 µs**; the directory walk `Service.Usage()` performs
+costs **153 µs per file** (82× worse per file) and is O(files) — a 17908-file
+tree took **2742 ms**. At a 3s cadence the disk figure therefore **must** come
+from a single `statfs` (`workspace.MountedDiskUsed`). `Service.Usage()`'s walk is
+never called from the sampling path; a `tree_walk_reads` counter is exposed and
+is always 0 as a contract guard against a future regression.
+
+**A workspace's RAM is the SUM over its cgroups — runs AND sessions (measured).**
+The cgroup is **per run and per session, not per workspace**. Two runs in one
+workspace (limit `memory_mb: 160`) produced two `NSJAIL.<pid>` cgroups, each with
+`memory.max = 167772160` (160 MB), so `sum(current) = 113 MB` and
+`sum(max) = 320 MB` against a 160 MB workspace limit. Nothing in the tree gives a
+workspace's RAM as one number, so **summing is the only correct answer**; reading
+one cgroup and calling it "the workspace's RAM" is a wrong number, not an
+approximation. Sessions likewise get their own cgroup (measured: creating a
+session added `NSJAIL.<pid>`), so the sum covers run cgroups and session cgroups.
+
+**`memory.max` is a per-RUN ceiling — a documented property, not a fix.** Because
+there is one cgroup per run, a workspace with N runs can consume **N ×
+`memory_mb`** (with the default `max_runs: 20`, that is 20× the advertised
+figure). This is a pre-existing property of the engine's enforcement model and is
+**deliberately not changed here**: the stream reports the summed truth (the
+`ram_cgroup_limit_bytes` field is the sum of the live cgroups' `memory.max`),
+and this ADR records the per-run behaviour honestly. Changing the enforcement
+model is a separate decision the operator has not made.
+
+**The disk-reporting bug this task fixed (measured).** `MountedDiskUsed`
+computed `used = total − f_bavail`. `f_bavail` is the space available to a
+**non-root** writer, which on ext4 excludes the filesystem's **reserved-block
+margin** (mkfs.ext4's `-m 5` default), so the figure did not match the tenant's
+own `df`: an **empty** 64 MB workspace was reported as **7639040 bytes
+(11.9 % full)** while `df -B1` inside it said **90112**. `total − f_bfree`
+matches `df` exactly (90112 empty, 10579968 after 10 MB). `MountedDiskUsed` now
+uses `f_bfree`, still one `statfs` call. The operator's rule is that **the number
+reported must equal the number the tenant sees**, so the gate asserts the
+reported disk equals `df -B1 --output=used /workspace` run **inside** the
+workspace within one block, for an **empty** workspace as well as a written one.
+`df` shows `size=64M` but only ~`57M` *available* because ext4 reserves ~5 % for
+root; the engine reports **used** (`total − f_bfree`), so the reservation is a
+deliberate filesystem property the reporting does not blur.
+
+**One lazy service-wide sampler (the architecture).** A single goroutine owns the
+ticker in `internal/metrics.Sampler`. It is **not** started at boot: it starts
+when the first subscriber registers and stops when the last one leaves, so a
+service nobody watches costs **exactly zero**. `Ticks` and `Running` are exposed,
+so the gate proves the lazy start (frozen with zero subscribers) and clean stop.
+One ticker, one cadence, for every subscriber.
+
+**Sample once, fan out.** Per tick the sampler builds **one** snapshot covering
+every candidate workspace, encodes one frame per scope, and delivers it to every
+subscriber. Sampling cost is therefore O(workspaces with something live),
+**independent of the subscriber count**: the gate opens three subscribers and
+asserts the per-tick cgroup reads are exactly 2 (one live cgroup × two files),
+not 2 × 3.
+
+**Idle elision.** A workspace with **no live cgroup** reports RAM 0 and costs
+**zero file reads**; only its disk is read, and that is one `statfs`. Measured
+against the sampler's own counters. The candidate set comes from the executor's
+**existing** run→cgroup tracking (`RunCgroupDirs`, joined to the service run
+table) and the service's live sessions — **never** a `/sys/fs/cgroup` scan per
+tick. Only the workspace inventory (owner, limits) is refreshed, on a **slower
+reconcile cadence** (`idle_reconcile_interval`, default 15s); create/patch/delete
+also update it immediately so a new workspace is visible on the next tick. A run
+whose cgroup was not resolved at launch (the bounded fork-race window can expire
+on a loaded host) is re-resolved lazily from the nsjail pid the runner already
+tracks — the same registry and resolver, not a second one — so a live run is
+never reported as RAM 0.
+
+**Read the minimum.** By default only `memory.current` + `memory.max` are read
+per live cgroup. `cpu.stat` (31 µs) and `pids.current` (25.4 µs) are the most
+expensive files and are **opt-in** behind `metrics.include_cpu`; tripling the
+reads for fields nobody asked for is exactly the cost this task exists to avoid.
+cgroup files need root (the service is root); **no `sudo` on the sampling path**
+— measured, `sudo -n cat` is ~9 ms versus ~23 µs direct, a 400× penalty that
+alone would break the cheap requirement. Nothing on the sampling path reads
+`/proc/<pid>/environ` (~9 ms per call) or shells out.
+
+**The honest cost model (measured).**
+
+```
+per live cgroup, per tick (2 files)      ≈ 46 µs
+per workspace, per tick (1 statfs)       ≈  1.7 µs
+1000 workspaces x 1 live run:  1000 statfs + 1000 cgroups x 46µs  ≈  48 ms/tick  ≈ 1.6% of one core
+10000 workspaces x 1 live run:                                    ≈ 480 ms/tick ≈ 16%  of one core
+```
+
+The stream stays cheap because idle workspaces are nearly free. A deployment
+with 10k simultaneously-busy workspaces is a CPU question about cadence, which is
+why the cadence is configurable and **clamped**.
+
+**Coalescing, never a queue.** Each stream holds **at most one pending frame**. A
+subscriber is a single-slot channel; if the client has not read the previous
+frame the sampler **drops** the new one (it does not buffer), so a slow client
+can never grow unbounded engine memory. Drops are counted per subscriber and
+globally and exposed (`dropped_frames`); the gate stalls a reader with a tiny
+socket buffer and asserts the counter moves. A subscriber is removed on **every**
+exit path (a `defer`, so a panic path is covered), which is what stops the
+sampler when the last one leaves — the failure that would otherwise turn "costs
+nothing when idle" into "costs something forever".
+
+**The interval floor is enforced.** Default `3s`; `min_interval` (default `1s`)
+is a hard **floor**: a client requesting a faster cadence is **refused with 422**
+(never silently raised — silently ignoring a requested cadence is worse than
+refusing it), and a value above `max_interval` (default `300s`) is clamped down.
+A per-request `?interval=` override adjusts the one service-wide cadence and is
+clamped to the floor; the default is restored when the last subscriber leaves.
+
+**Proof.** Pure unit tests in `internal/metrics` (interval clamp, percentage
+arithmetic including a zero limit, cgroup parsing, the sum across cgroups, idle
+elision, fan-out, coalescing, lazy start/stop, scope isolation) plus unit tests
+for the `f_bfree` fix; and `scripts/metrics-check.sh` drives the REAL service,
+real nsjail and a real FUSE disk and asserts the whole cheap-stream contract —
+including the `df`-inside-the-workspace assertion that caught the `f_bavail`
+bug, the SUM assertion (two runs exceed one cgroup), idle elision, fan-out, no
+tree walk, the floor, coalescing, clean disconnect, and a full leak check.
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.

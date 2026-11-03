@@ -3,7 +3,7 @@ PKG := ./...
 GO ?= go
 CC ?= cc
 
-.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check identity-check egress-decoy-check subscription-check archive-check docs-check
+.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check identity-check egress-decoy-check subscription-check archive-check metrics-check docs-check
 
 all: fmt vet shim build test
 
@@ -135,6 +135,22 @@ subscription-check:
 # it cannot pass without them.
 archive-check:
 	sudo -E bash scripts/archive-check.sh
+
+# Per-workspace resource-stream acceptance against REAL nsjail and a REAL FUSE
+# disk on the host (needs root, no container). It asserts the whole cheap-stream
+# contract: both SSE routes return text/event-stream and deliver a frame
+# promptly, frames arrive on the configured cadence with monotonic timestamps,
+# the RAM figure tracks a real allocation and is the SUM over the workspace's
+# per-run and per-session cgroups (not one cgroup), an idle workspace costs zero
+# cgroup reads, the per-tick reads do not grow with the subscriber count, there
+# is no tree walk (disk is one statfs), the interval floor is enforced, a stalled
+# subscriber is coalesced (drop counter moves), disconnects are clean with a
+# lazy start/stop, and the reported disk equals `df -B1 --output=used /workspace`
+# run INSIDE the workspace. Every wait is bounded and at most two workspaces run
+# concurrently (this check is about resource cost, so it must not itself hammer
+# the host).
+metrics-check:
+	sudo -E bash scripts/metrics-check.sh
 
 # Documentation-consistency gate. It derives its assertions from the code
 # (router, error constants, test count) rather than the prose, so it fails when

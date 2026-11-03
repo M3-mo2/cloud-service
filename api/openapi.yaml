@@ -17,6 +17,7 @@ tags:
   - name: Packages
   - name: Processes
   - name: Tunnels
+  - name: Metrics
 
 security:
   - bearerAuth: []
@@ -75,6 +76,38 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Meta" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/metrics:
+    get:
+      operationId: getv1_metrics
+      tags: [Metrics]
+      summary: One-shot RAM + disk snapshot for every owned workspace
+      responses:
+        "200":
+          description: Snapshot
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MetricsSnapshot" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/metrics/stream:
+    get:
+      operationId: getv1_metrics_stream
+      tags: [Metrics]
+      summary: Server-Sent Events stream of RAM + disk frames for every owned workspace
+      parameters:
+        - $ref: "#/components/parameters/MetricsInterval"
+      responses:
+        "200":
+          description: SSE stream (text/event-stream); one JSON frame per tick
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
 
   /v1/workspaces:
     post:
@@ -320,6 +353,44 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/workspaces/{workspaceId}/metrics:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getv1_workspaces_workspaceId_metrics
+      tags: [Metrics]
+      summary: One-shot RAM + disk snapshot for one workspace
+      responses:
+        "200":
+          description: Snapshot
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MetricsSnapshot" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/workspaces/{workspaceId}/metrics/stream:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    get:
+      operationId: getv1_workspaces_workspaceId_metrics_stream
+      tags: [Metrics]
+      summary: Server-Sent Events stream of RAM + disk frames for one workspace
+      parameters:
+        - $ref: "#/components/parameters/MetricsInterval"
+      responses:
+        "200":
+          description: SSE stream (text/event-stream); one JSON frame per tick
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Validation" }
 
   /v1/workspaces/{workspaceId}/packages:
     parameters:
@@ -1276,6 +1347,12 @@ components:
       required: true
       description: "A tunnel id (`tun_<ULID>`)."
       schema: { type: string, pattern: "^tun_[0-9A-HJKMNP-TV-Z]{26}$" }
+    MetricsInterval:
+      name: interval
+      in: query
+      required: false
+      description: "Cadence override (a Go duration, e.g. `3s`). Clamped to the configured floor and ceiling; a value below the floor is refused with 422."
+      schema: { type: string, example: "3s" }
   responses:
     Unauthorized:
       description: Missing or invalid credentials
@@ -1611,6 +1688,28 @@ components:
               type: array
               items: { type: string }
             semantics: { type: string }
+        metrics:
+          type: object
+          description: >-
+            Per-workspace resource-stream capability, reported truthfully.
+            `enabled` is the server switch (metrics.enabled, default true);
+            `interval_seconds`, `min_interval_sec` and `max_interval_sec` are
+            the effective (clamped) cadence and the enforced floor/ceiling;
+            `include_cpu` is whether the costly cpu/pids extras are read;
+            `mechanism`/`limits` state the lazy one-sample-fan-out design, the
+            statfs disk, the summed RAM, the coalescing policy and the floor.
+          properties:
+            enabled: { type: boolean }
+            interval_seconds: { type: number, format: float }
+            min_interval_sec: { type: number, format: float }
+            max_interval_sec: { type: number, format: float }
+            include_cpu: { type: boolean }
+            max_subscribers: { type: integer }
+            mechanism: { type: string }
+            limits: { type: string }
+            routes:
+              type: array
+              items: { type: string }
     ArchiveEntry:
       type: object
       description: One archive member as reported by an extraction or dry run.
@@ -1813,6 +1912,84 @@ components:
         active_runs: { type: integer }
         max_runs: { type: integer }
         limits: { $ref: "#/components/schemas/Limits" }
+    MetricsSnapshot:
+      type: object
+      required: [timestamp, interval_seconds, workspaces, sampler]
+      description: >
+        One tick's frame (or a one-shot response). Disk comes from a single
+        statfs (O(1)); RAM is the SUM over the workspace's live per-run AND
+        per-session cgroups. An idle workspace (no live cgroup) reports RAM 0 and
+        costs zero cgroup reads.
+      properties:
+        timestamp: { type: string, format: date-time }
+        interval_seconds: { type: number, format: float }
+        workspaces:
+          type: array
+          items: { $ref: "#/components/schemas/WorkspaceMetrics" }
+        sampler: { $ref: "#/components/schemas/MetricsCounters" }
+    WorkspaceMetrics:
+      type: object
+      required: [workspace_id, ram_used_bytes, ram_limit_bytes, ram_cgroup_limit_bytes, ram_percent, ram_complete, disk_used_bytes, disk_limit_bytes, disk_percent, disk_complete, live_runs, live_cgroups]
+      properties:
+        workspace_id: { type: string }
+        ram_used_bytes:
+          type: integer
+          format: int64
+          description: "SUM of memory.current over the live run AND session cgroups."
+        ram_limit_bytes:
+          type: integer
+          format: int64
+          description: "The workspace's configured allowance (memory_mb), stable whether or not a cgroup is live."
+        ram_cgroup_limit_bytes:
+          type: integer
+          format: int64
+          description: "SUM of the live cgroups' memory.max (the ceiling actually enforced). It can exceed ram_limit_bytes because the cgroup is per run."
+        ram_percent: { type: number, format: float }
+        ram_complete:
+          type: boolean
+          description: "false when a cgroup read failed, making ram_used_bytes a lower bound."
+        disk_used_bytes:
+          type: integer
+          format: int64
+          description: "Filesystem used bytes (total - f_bfree), equal to what `df` reports inside the workspace."
+        disk_limit_bytes: { type: integer, format: int64 }
+        disk_percent: { type: number, format: float }
+        disk_complete:
+          type: boolean
+          description: "false when the workspace root is not a live mount."
+        live_runs: { type: integer }
+        live_cgroups: { type: integer }
+        cpu_usage_usec:
+          type: integer
+          format: int64
+          description: "Present only when metrics.include_cpu is true."
+        pids_current:
+          type: integer
+          description: "Present only when metrics.include_cpu is true."
+    MetricsCounters:
+      type: object
+      required: [ticks, cgroup_reads, statfs_reads, tree_walk_reads, subscribers, running, dropped_frames, candidates]
+      properties:
+        ticks:
+          type: integer
+          format: int64
+          description: "Sample passes; frozen while no subscriber is connected (lazy start)."
+        cgroup_reads: { type: integer, format: int64 }
+        statfs_reads: { type: integer, format: int64 }
+        tree_walk_reads:
+          type: integer
+          format: int64
+          description: "Contract guard: always 0 (disk is one statfs, never a tree walk)."
+        subscribers: { type: integer, format: int64 }
+        running:
+          type: integer
+          format: int64
+          description: "1 while the sampler goroutine is alive (at least one subscriber), else 0."
+        dropped_frames:
+          type: integer
+          format: int64
+          description: "Frames coalesced away because a subscriber had not read the previous one."
+        candidates: { type: integer }
     Process:
       type: object
       required: [id, pid, ppid, argv, kind, source_id, started_at]

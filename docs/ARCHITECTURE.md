@@ -151,6 +151,7 @@ flowchart TD
     SVC --> WS
     SVC --> SUB["internal/subscription (pure: parser, decision, derivations)"]
     SVC --> ARC["internal/archive (pure: detection, plan, budgeted extract, export)"]
+    SVC --> MET["internal/metrics (one lazy sampler: statfs + summed cgroups)"]
 
     RUN --> CFGS["configs (embedded template)"]
     RUN --> MODEL
@@ -174,6 +175,7 @@ flowchart TD
 | `internal/service` | `service.go`, `files.go`, `exec.go`, `runs.go`, `control.go`, `packages.go`, `sessions.go`, `subscription.go` | Orchestration, ownership checks, limits, retention, run and session registries, and the subscription lifecycle + reaper loop |
 | `internal/subscription` | `subscription.go` | The PURE subscription parts: the duration-grammar parser, the reaper decision function `Decide(now, sub, grace)`, and the derived summary numbers. No I/O, no daemon |
 | `internal/archive` | `format.go`, `plan.go`, `extract.go`, `export.go`, `engine.go`, `errors.go` | The PURE native-archive engine: content-based format detection, the validated extraction plan, the streaming budget, extraction, and directory export. No shell tool, no direct filesystem access (writes go through a `Sink`) |
+| `internal/metrics` | `metrics.go`, `sampler.go`, `reader.go` | The per-workspace resource stream: the snapshot/frame types and percentages, the ONE lazily-started service-wide sampler with its subscriber registry and coalescing, and the production `statfs`+cgroup reader. Pure entry points, injected `Provider`/`Reader` for tests |
 | `internal/workspace` | `fs.go`, `path.go`, `diskfs.go` | Safe rooted filesystem, traversal/symlink defense, disk quota accounting, and the per-workspace fuse2fs ext4 image manager |
 | `internal/storage` | `store.go` | Atomic JSON metadata + run-log/session-output files on disk |
 | `internal/executor` | `executor.go`, `nsjail.go`, `live.go`, `identity.go`, `fake.go`, `pty_relay.py` | nsjail config rendering, UID/GID mapping, one-shot and interactive process lifecycles, capped capture, PTY relay helper |
@@ -540,6 +542,49 @@ The three routes (`POST /files/archive`, `POST /files/extract`,
 decisions are recorded in [DECISIONS.md](DECISIONS.md) ADR 92, and
 `scripts/archive-check.sh` asserts the whole boundary against real nsjail and a
 real FUSE disk.
+
+### 4.8 The per-workspace resource stream (one lazy sampler over statfs + cgroups)
+
+The resource stream pushes a workspace's RAM and disk every 3s, cheaply enough
+that thousands of workspaces cause no pressure. It is one package,
+`internal/metrics`, whose cost model is fixed by **measurement** (ADR 93):
+
+```mermaid
+flowchart TD
+    SUB["subscriber registers (SSE)"] --> LAZY{"first subscriber?"}
+    LAZY -->|yes| START["start ONE sampler goroutine"]
+    LAZY -->|no| FAN
+    START --> TICK["tick: build ONE snapshot"]
+    TICK --> CAND["candidates from executor run→cgroup map<br/>+ live sessions + reconciled inventory<br/>(NEVER a /sys/fs/cgroup scan)"]
+    CAND --> DISK["per workspace: 1 statfs (O(1))"]
+    CAND --> CG{"live cgroup?"}
+    CG -->|no| ZERO["RAM 0, ZERO cgroup reads"]
+    CG -->|yes| READ["memory.current + memory.max<br/>(+ cpu.stat + pids.current if include_cpu)"]
+    READ --> SUM["RAM = SUM over run AND session cgroups"]
+    DISK --> FAN
+    SUM --> FAN["fan ONE sample out to every subscriber"]
+    FAN --> SLOT["per subscriber: single slot<br/>(coalesce or DROP, never queue)"]
+    SLOT --> DROP["last subscriber leaves?"]
+    DROP -->|yes| STOP["stop the sampler"]
+```
+
+The load-bearing properties are:
+
+- **`statfs`, never a tree walk.** Disk is one O(1) call (~1.7 µs); the walk
+  `Service.Usage()` does is 153 µs/file (82×). A `tree_walk_reads` counter stays
+  0 as a contract guard.
+- **RAM is the SUM over cgroups.** The cgroup is per run/session, not per
+  workspace; `memory.max` is a per-`_run` ceiling (documented, not changed).
+- **One sampler, lazily started.** Starts on the first subscriber, stops on the
+  last, so an unwatched service costs exactly zero.
+- **Sample once, fan out.** Cost is independent of subscriber count.
+- **Idle elision.** No live cgroup → RAM 0, zero file reads, one statfs.
+- **Coalesce, never queue.** One pending frame per stream; drops are counted.
+
+The four routes and the frame shape are in
+[docs/API.md](API.md#get-v1metrics); the SPEC surface is §2.2; the decisions are
+ADR 93; and `scripts/metrics-check.sh` asserts the whole contract against real
+nsjail and a real FUSE disk.
 
 ---
 
@@ -1171,6 +1216,14 @@ archives:                    # native archive handling (in-engine; all defaulted
   overwrite: false           # default collision policy → 409 archive_entry_exists
   skip_junk: true            # skip __MACOSX/, .DS_Store, ._*, Thumbs.db, desktop.ini
   formats: ["zip", "rar"]    # content-detected allowlist (RAR is read-only)
+metrics:                     # per-workspace RAM+disk stream (all defaulted)
+  enabled: true              # false refuses every metrics route (404)
+  interval: "3s"             # stream cadence (clamped to [min,max])
+  min_interval: "1s"         # enforced floor; a lower request is 422
+  max_interval: "300s"       # enforced ceiling
+  include_cpu: false         # opt-in cpu.stat + pids.current (the costly files)
+  idle_reconcile_interval: "15s" # inventory refresh (live cgroups are per-tick)
+  max_subscribers: 1024      # concurrent streams cap
 keys:                        # service bearer keys → principal_id (1:N allowed);
                              # held by the frontend, never by end users
   - { key: "dev-key-please-rotate", principal_id: "user_dev" }

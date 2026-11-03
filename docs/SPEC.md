@@ -249,6 +249,35 @@ hard (SIGKILL) daemon death, so an orphan does not keep running for the life of
 its `time_limit` (or forever when unbounded). A graceful `SIGTERM` shutdown
 already leaves nothing.
 
+**Resource stream (RAM + disk).** A workspace's RAM and disk are pushed every
+`metrics.interval` (default **3s**), cheaply enough that thousands of workspaces
+cause no pressure. Four routes:
+
+- `GET /v1/metrics` and `GET /v1/workspaces/{id}/metrics` — one-shot snapshots
+  (every workspace the principal owns, or one workspace).
+- `GET /v1/metrics/stream` and `GET /v1/workspaces/{id}/metrics/stream` — SSE
+  (`text/event-stream`), one JSON frame per tick, flushed after every frame.
+
+Each frame reports, per workspace: `ram_used_bytes`, `ram_limit_bytes`,
+`ram_cgroup_limit_bytes`, `ram_percent`, `ram_complete`, `disk_used_bytes`,
+`disk_limit_bytes`, `disk_percent`, `disk_complete`, `live_runs`,
+`live_cgroups` (and `cpu_usage_usec`/`pids_current` when `include_cpu` is on).
+Together with a `timestamp`, `interval_seconds`, and the `sampler` counters
+(`ticks`, `cgroup_reads`, `statfs_reads`, `tree_walk_reads`, `subscribers`,
+`running`, `dropped_frames`, `candidates`).
+
+The design is fixed by measurement (see [docs/DECISIONS.md](DECISIONS.md)
+ADR 93): disk comes from a single **`statfs`** (O(1), ~1.7 µs), never a tree
+walk (153 µs/file); RAM is the **SUM** over the workspace's per-run **and**
+per-session cgroups (the cgroup is per run, not per workspace); **one**
+service-wide sampler starts on the first subscriber and stops on the last;
+sampling happens **once per tick** and is fanned out, so cost is independent of
+the subscriber count; an idle workspace (no live cgroup) costs **zero** cgroup
+reads and reports RAM 0; each stream holds at most **one pending frame**
+(coalesce, never queue; drops are counted); and `?interval=` is clamped to a
+configured **floor** (below it → `422`). The whole feature is gated on
+`metrics.enabled` and advertised in `GET /v1/meta`.
+
 ### 2.3 Files (per workspace)
 
 All paths relative to workspace root; leading `/` allowed and normalized. All

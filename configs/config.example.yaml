@@ -392,6 +392,49 @@ archives:
   # format not in the list is refused with 415 unsupported_archive.
   formats: ["zip", "rar"]
 
+# Per-workspace resource stream: push a workspace's RAM and disk usage on a
+# configurable cadence, cheaply enough that thousands of workspaces cause no
+# pressure. Every key is defaulted so nothing changes unless an operator uses it,
+# and the routes are gated on enabled.
+#
+# DESIGN (fixed by measurement; see docs/DECISIONS.md ADR 93):
+#   * disk comes from ONE statfs (O(1), ~1.7us), NEVER a directory tree walk
+#     (153us PER FILE, 82x worse); the existing Service.Usage() walk is never on
+#     the sampling path;
+#   * a workspace's RAM is the SUM over its per-run AND per-session cgroups (the
+#     cgroup is per run, not per workspace); memory.max is a PER-RUN ceiling, so
+#     the advertised memory_mb does not cap a workspace with several runs;
+#   * ONE service-wide sampler goroutine starts on the first subscriber and stops
+#     on the last, so a service nobody watches costs exactly zero;
+#   * it samples ONCE per tick and fans out, so cost is independent of the number
+#     of subscribers; an idle workspace (no live cgroup) costs ZERO cgroup reads;
+#   * each stream holds at most ONE pending frame (coalesce, never queue), and
+#     drops are counted;
+#   * no sudo and no /proc/<pid>/environ on the sampling path.
+metrics:
+  # Server-level switch. false refuses every metrics route with 404. Default true.
+  enabled: true
+  # Default stream cadence. Clamped into [min_interval, max_interval]. Default 3s
+  # exactly as asked.
+  interval: "3s"
+  # Enforced FLOOR: no client may request a faster cadence; a lower request is
+  # refused with 422 (never silently raised). Default 1s.
+  min_interval: "1s"
+  # Enforced ceiling on the server's own cadence. Default 300s.
+  max_interval: "300s"
+  # Add the cpu.stat (usage_usec) and pids.current fields. They are the most
+  # expensive files (31us and 25us) and are OFF by default: with include_cpu
+  # false only memory.current and memory.max are read per live cgroup.
+  include_cpu: false
+  # How often the candidate workspace inventory (owner, limits) is refreshed.
+  # Deliberately slower than the sample cadence: the live-cgroup set comes from
+  # the executor's existing in-memory tracking every tick, so only the inventory
+  # needs reconciling. Default 15s.
+  idle_reconcile_interval: "15s"
+  # Cap on concurrently connected streams; past it a subscribe is refused rather
+  # than allowing unbounded goroutines.
+  max_subscribers: 1024
+
 # Static API keys. Each entry maps a key to a principal_id.
 # Multiple keys may share a principal_id.
 keys:

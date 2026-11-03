@@ -787,6 +787,97 @@ Report the workspace's actual disk use, run counters and effective limits.
 curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/workspaces/$WS/usage
 ```
 
+### GET /v1/metrics
+
+One-shot (non-streaming) snapshot of every workspace the principal owns. The
+frame shape is identical to one SSE frame from `GET /v1/metrics/stream`, so a
+polling client and a streaming client parse the same JSON. It is O(1) per
+workspace: disk is a single `statfs`, RAM is one `memory.current` + one
+`memory.max` per **live** cgroup (a workspace with no live cgroup costs zero
+cgroup reads and reports RAM 0).
+
+- **Response 200:**
+
+  ```json
+  {"timestamp":"2026-01-02T15:04:05.123456789Z","interval_seconds":3,
+   "workspaces":[
+     {"workspace_id":"ws_...",
+      "ram_used_bytes":113246208,"ram_limit_bytes":167772160,
+      "ram_cgroup_limit_bytes":335544320,"ram_percent":67.5,
+      "ram_complete":true,
+      "disk_used_bytes":90112,"disk_limit_bytes":67108864,
+      "disk_percent":0.13,"disk_complete":true,
+      "live_runs":2,"live_cgroups":2}],
+   "sampler":{"ticks":42,"cgroup_reads":84,"statfs_reads":42,
+              "tree_walk_reads":0,"subscribers":0,"running":0,
+              "dropped_frames":0,"candidates":1}}
+  ```
+
+- **Errors:** 401. 404 when `metrics.enabled` is false.
+- **Semantics:** `ram_used_bytes` is the **SUM** of `memory.current` over the
+  workspace's live run **and** session cgroups — reading one cgroup would be a
+  wrong number, not an approximation. `ram_limit_bytes` is the workspace's
+  configured `memory_mb`; `ram_cgroup_limit_bytes` is the sum of the live
+  cgroups' `memory.max` (the ceiling actually enforced), which can exceed
+  `ram_limit_bytes` because the cgroup is **per run** (see
+  [docs/DECISIONS.md](DECISIONS.md) ADR 93). `disk_used_bytes` is the
+  filesystem's used bytes (`total − f_bfree`), which equals what `df` reports
+  **inside** the workspace. `*_complete` is false when a figure is a lower
+  bound (`ram_complete` on a failed cgroup read, `disk_complete` when the root
+  is not a live mount). Percentages are 0 when the limit is not positive — a
+  derived percentage the numbers cannot support is never published.
+
+```sh
+curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/metrics
+```
+
+### GET /v1/metrics/stream
+
+Server-Sent Events stream of the same frames, one per tick. Scoped to every
+workspace the principal owns.
+
+- **Response 200:** `Content-Type: text/event-stream`, `Cache-Control: no-cache`.
+  An initial `: connected` comment line is written and flushed so the client's
+  parser sees bytes immediately; then one `data: <json>` frame per tick.
+- **Query:** `interval` (optional) — a cadence override. It is **clamped to the
+  configured floor and ceiling**; a value **below the floor is refused with
+  `422`** (never silently raised). Accepts a Go duration (`1s`, `500ms`).
+- **Errors:** 401, 422 (interval below the floor). 404 when disabled.
+- **Semantics:** the stream is a thin consumer of the **one service-wide
+  sampler**: the sampler starts on the first subscriber, stops on the last
+  (a service nobody watches costs zero), and samples **once per tick** regardless
+  of how many subscribers are connected. Each stream holds **at most one pending
+  frame** — a subscriber that lags is **dropped**, never buffered — so a slow
+  client cannot grow the engine's memory. See
+  [docs/DECISIONS.md](DECISIONS.md) ADR 93.
+
+```sh
+curl -sN -H "Authorization: Bearer $KEY" "localhost:8080/v1/metrics/stream?interval=3s"
+```
+
+### GET /v1/workspaces/{workspaceID}/metrics
+
+One-shot snapshot of a single workspace. Same frame shape as
+`GET /v1/metrics`, scoped to one workspace the principal owns.
+
+- **Path parameter:** `workspaceID`.
+- **Response 200:** the same `{timestamp, interval_seconds, workspaces, sampler}`
+  object with exactly one entry in `workspaces`.
+- **Errors:** 401, 403, 404.
+
+### GET /v1/workspaces/{workspaceID}/metrics/stream
+
+SSE stream for a single workspace. Identical framing and rules to
+`GET /v1/metrics/stream`, scoped to the one workspace.
+
+- **Path parameter:** `workspaceID`.
+- **Response 200:** `Content-Type: text/event-stream`.
+- **Errors:** 401, 403, 404, 422.
+
+```sh
+curl -sN -H "Authorization: Bearer $KEY" "localhost:8080/v1/workspaces/$WS/metrics/stream"
+```
+
 ### GET /v1/workspaces/{workspaceID}/packages
 
 List what is installed in the workspace's **private** package tier, and report

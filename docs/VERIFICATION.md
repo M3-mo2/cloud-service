@@ -105,7 +105,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **442** (438 unit + 4 `integration`-tagged), including regression
+Test functions: **458** (454 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -175,7 +175,7 @@ file (the same measure `scripts/docs-consistency.sh` asserts against):
 
 ```
 $ find . -name '*_test.go' -exec grep -hE '^func Test' {} + | wc -l
-442
+458
 ```
 
 ## 2. Probes
@@ -2028,7 +2028,7 @@ What each group proves:
 instant: exactly at expiry, exactly at grace end; the backwards-clock rule) and
 the derivations (unlimited, active, expiring-soon, locked, clamped-at-0); the
 service adds the whole lifecycle with an injected clock; the API adds the
-request/response contract. Suite total `442` test functions (see §1).
+request/response contract. Suite total `458` test functions (see §1).
 
 ## 9m. Native archives (this revision)
 
@@ -2082,6 +2082,115 @@ multivolume, evil-symlink, hardlink) plus a ZIP round-trip that never emits a
 symlink. `internal/api/archive_test.go` covers the three endpoints, the disabled
 switch, `dry_run`, traversal and overwrite, and `/v1/meta` advertising the
 capability.
+
+## 9n. Per-workspace resource stream (RAM + disk) (this revision)
+
+A workspace's RAM and disk are pushed every `metrics.interval` (default **3s**)
+over SSE, cheaply enough that thousands of workspaces cause no pressure. The
+requirement is hard: an implementation that samples per connection, or walks a
+directory tree, fails it even though it "works". The design is fixed by
+measurement (see [DECISIONS.md](DECISIONS.md) ADR 93): one lazily-started
+service-wide sampler, one sample per tick fanned out to every subscriber, idle
+elision (a workspace with no live cgroup reads zero cgroup files), disk from a
+single `statfs`, and RAM as the **SUM** over the workspace's per-run and
+per-session cgroups. Four routes are shipped (`GET /v1/metrics`,
+`GET /v1/metrics/stream`, `GET /v1/workspaces/{id}/metrics`,
+`GET /v1/workspaces/{id}/metrics/stream`), gated on `metrics.enabled`.
+
+### 9n.1 The measured cost model
+
+| source | cost | note |
+|---|---|---|
+| disk: `statfs` | **1.7–1.9 µs**, O(1) | `workspace.MountedDiskUsed`; no tree walk |
+| disk: tree walk + lstat | **153 µs PER FILE**, O(files) | what `Service.Usage()` does; never on the sampling path |
+| RAM: `memory.current` | **23.6 µs/read** | per live cgroup |
+| RAM: `memory.max` | **22.0 µs/read** | equals the workspace's `memory_mb` |
+| `cpu.stat` | 31.0 µs/read | opt-in (`include_cpu`) |
+| `pids.current` | 25.4 µs/read | opt-in (`include_cpu`) |
+
+Measured directly: 1000 statfs calls = 1.9 ms; a walk of 17908 files = 2742 ms
+(82× worse per file). The stream's disk figure is therefore `statfs`, and the
+gate asserts the sampler's `tree_walk_reads` counter stays **0**.
+
+```
+per live cgroup, per tick (2 files)      ≈ 46 µs
+per workspace, per tick (1 statfs)       ≈  1.7 µs
+1000 workspaces x 1 live run:  1000 statfs + 1000 cgroups x 46µs  ≈  48 ms/tick  ≈ 1.6% of one core
+10000 workspaces x 1 live run:                                    ≈ 480 ms/tick ≈ 16%  of one core
+```
+
+A `sudo` on the sampling path would cost ~9 ms/call versus ~23 µs direct (a 400×
+penalty), so there is none; the service runs as root and reads the cgroup files
+directly.
+
+### 9n.2 The disk-reporting bug this revision fixed (measured)
+
+`MountedDiskUsed` computed `used = total − f_bavail`. `f_bavail` excludes ext4's
+reserved-block margin (mkfs's `-m 5` default), so the published figure did not
+match the tenant's own `df`:
+
+```
+                          empty                    after writing 10 MB
+df -B1 inside workspace   used = 90112             used = 10579968     <- what the TENANT sees
+MountedDiskUsed (before)  used = 7639040  (11.9%)  used = 18128896     <- what the API published
+total - f_bfree (now)     used = 90112             used = 10579968     <- matches df exactly
+```
+
+`MountedDiskUsed` now uses `f_bfree` (one `statfs` call); an empty 64 MB
+workspace reports `90112` bytes, not `7639040`. The operator's rule is that the
+number reported must equal the number the tenant sees. `df` shows `size=64M` but
+only ~`57M` *available* because ext4 reserves ~5 % for root; the engine reports
+**used** (`total − f_bfree`), so the reservation is a deliberate property the
+reporting does not blur.
+
+### 9n.3 The real-nsjail acceptance
+
+`scripts/metrics-check.sh` drives the REAL service, real nsjail and a real FUSE
+disk. Every wait is bounded and at most two workspaces run concurrently (this
+check is about resource cost, so it must not itself hammer the host). Measured
+`51 passed / 0 failed` across four consecutive runs:
+
+- the build marker is present (`zcp-metrics-stream-v0.0.19`) and the daemon's
+  `/proc/<pid>/exe` hash equals the built image;
+- both stream routes return `text/event-stream` and deliver an initial frame
+  promptly (bounded wait, no bare sleep); a stream of 3 frames is parseable JSON
+  with monotonically increasing timestamps and ~1s cadence;
+- a run holding a 60 MiB allocation drives `ram_used_bytes` above a 40 MB floor,
+  and it falls back to 0 once the run ends;
+- with **two** runs the reported RAM exceeds the single-run reading by a margin a
+  single cgroup cannot produce (measured `135245824 >= 100819840`), proving the
+  figure is the **sum**;
+- with no live run RAM is 0 and the cgroup-read counter does not advance across
+  ticks (idle elision);
+- with three subscribers open, one sample pass reads exactly **2** cgroup files
+  per tick (independent of the count) — fan-out, not per-subscriber sampling;
+- the `tree_walk_reads` counter is 0, and a snapshot of a 3000-file workspace
+  returns in well under 0.2s (a walk would cost ~0.46s at the measured 153 µs
+  per file);
+- `?interval=1ms` is refused with **422** (floor enforced); `?interval=10ms` at
+  the floor is accepted;
+- a subscriber stalled on a tiny socket buffer advances the `dropped_frames`
+  counter (coalescing, never buffering) and the subscriber count stays bounded;
+- after five open/close cycles the subscriber count is 0, the sampler reports
+  `running:0`, and the tick counter is frozen with zero subscribers and while
+  one is connected (lazy start/stop is real);
+- an **empty** workspace reports ~0 disk used and matches `df -B1
+  --output=used /workspace` run **inside** it within one block; after a 10 MiB
+  write the stream, the `/v1/workspaces/{id}` summary and `df` all agree, and
+  `GET /usage` (a different path: a byte-sum walk) agrees within tolerance;
+- `GET /v1/meta` advertises the capability; and no fuse2fs, mount or cgroup is
+  left behind.
+
+### 9n.4 The pure parts and the API surface
+
+`internal/metrics` carries unit tests for the interval clamp, the percentage
+arithmetic (including a **zero limit** — never divide by zero), cgroup-file
+parsing, the sum across cgroups (including no cgroups), idle elision, fan-out,
+coalescing drops, lazy start/stop, repeated open/close with no leak, scope
+isolation across principals, and JSON frame shape with monotonic timestamps.
+`internal/workspace` carries a unit test locking the `f_bfree` fix (against the
+measured numbers). The four routes and the frame shape are documented in
+[docs/API.md](API.md) and `api/openapi.yaml`, and advertised in `GET /v1/meta`.
 
 ## 10. Decisions
 
@@ -2278,7 +2387,7 @@ identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/
       disk.df_bare_workspace_1k 262144
       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
 docs-consistency.sh             222 passed / 0 failed
- go test ./...                  442 test functions (from 353)
+ go test ./...                  458 test functions (from 353)
 ```
 
 The full gate set re-run for this revision, one gate at a time (concurrent runs
@@ -2293,7 +2402,7 @@ scripts/identity-check.sh       131 passed / 0 failed / 2 skipped   (run 3x: 131
 scripts/egress-decoy-check.sh    58 passed / 0 failed / 0 skipped
 scripts/subscription-check.sh    61 passed / 0 failed             (compressed clock; see §9l)
 scripts/archive-check.sh        101 passed / 0 failed             (native archives; see §9m)
-go test ./...                    442 test functions; go vet ./... clean
+go test ./...                    458 test functions; go vet ./... clean
 ```
 
 `scripts/archive-check.sh` is the new gate for this revision: it extracts the

@@ -107,6 +107,10 @@ NEW_PATHS=(
   "/v1/workspaces/{id}/processes/{processID}/stop"
   "/v1/workspaces/{id}/tunnels"
   "/v1/workspaces/{id}/tunnels/{tunnelID}"
+  "/v1/metrics"
+  "/v1/metrics/stream"
+  "/v1/workspaces/{id}/metrics"
+  "/v1/workspaces/{id}/metrics/stream"
 )
 for p in "${NEW_PATHS[@]}"; do
   # SPEC.md uses the {id} spelling; accept the {workspaceID} spelling too.
@@ -452,6 +456,93 @@ if grep -qF 'archive.BuildMarker' cmd/sandboxd/main.go && grep -qF 'BuildMarker'
   ok "archive.build-marker"
 else
   fail "archive.build-marker" "the archive build marker is not logged at startup / defined"
+fi
+
+# --- 4d-sexies. the per-workspace metrics harness exists and is documented -----
+# metrics-check.sh is the only check that drives the REAL cheap-stream contract
+# against real nsjail and a real FUSE disk (RAM as the SUM over per-run/per-
+# session cgroups, idle elision, fan-out, no tree walk, the interval floor,
+# coalescing, clean disconnect), so it must exist, be executable, be named in
+# VERIFICATION.md and be wired into the Makefile -- it cannot silently rot.
+
+if [ -f scripts/metrics-check.sh ]; then
+  ok "metrics-harness.exists"
+else
+  fail "metrics-harness.exists" "scripts/metrics-check.sh is missing"
+fi
+if [ -x scripts/metrics-check.sh ]; then
+  ok "metrics-harness.executable"
+else
+  fail "metrics-harness.executable" "scripts/metrics-check.sh is not executable"
+fi
+if grep -qF 'metrics-check.sh' docs/VERIFICATION.md; then
+  ok "metrics-harness.documented"
+else
+  fail "metrics-harness.documented" "docs/VERIFICATION.md does not mention scripts/metrics-check.sh"
+fi
+if grep -qE '^metrics-check:' Makefile; then
+  ok "makefile.target.metrics-check"
+else
+  fail "makefile.target.metrics-check" "Makefile has no 'metrics-check:' target"
+fi
+if grep -qE 'bash scripts/metrics-check.sh' Makefile; then
+  ok "makefile.sudo.metrics-check"
+else
+  fail "makefile.sudo.metrics-check" "Makefile's 'metrics-check' target does not run scripts/metrics-check.sh"
+fi
+if grep -qE '^\.PHONY:.*\bmetrics-check\b' Makefile; then
+  ok "makefile.phony.metrics-check"
+else
+  fail "makefile.phony.metrics-check" "'metrics-check' is not in .PHONY"
+fi
+
+# The metrics feature (this iteration): the config section, the ADR, the service-
+# wide lazy sampler, the SSE surface and the disk-reporting fix must all be
+# documented and wired, so they cannot silently regress.
+if grep -qF 'metrics:' configs/config.example.yaml && grep -qF 'MetricsConfig struct' internal/config/config.go; then
+  ok "metrics.config"
+else
+  fail "metrics.config" "the metrics section is missing from configs/config.example.yaml or internal/config/config.go"
+fi
+if grep -qF 'ADR 93' docs/DECISIONS.md; then
+  ok "metrics.adr"
+else
+  fail "metrics.adr" "docs/DECISIONS.md is missing ADR 93 (per-workspace resource stream)"
+fi
+if grep -qiF 'statfs' docs/DECISIONS.md && grep -qiE '82|tree walk' docs/DECISIONS.md; then
+  ok "metrics.adr-statfs-not-walk"
+else
+  fail "metrics.adr-statfs-not-walk" "ADR 93 must record statfs (O(1)) vs the tree walk (82x, per-file cost)"
+fi
+if grep -qiF 'SUM' docs/DECISIONS.md && grep -qiF 'per-run' docs/DECISIONS.md; then
+  ok "metrics.adr-sum-cgroups"
+else
+  fail "metrics.adr-sum-cgroups" "ADR 93 must record that RAM is the SUM over per-run/per-session cgroups"
+fi
+if grep -qiF 'f_bfree' internal/workspace/statfs_linux.go && grep -qiF 'f_bfree' docs/DECISIONS.md; then
+  ok "metrics.disk-bfree-fix"
+else
+  fail "metrics.disk-bfree-fix" "MountedDiskUsed must use f_bfree and ADR 93 must record the fix"
+fi
+if grep -qF 'internal/metrics' internal/service/metrics.go && grep -qF 'text/event-stream' internal/api/metrics_stream.go; then
+  ok "metrics.service-and-sse"
+else
+  fail "metrics.service-and-sse" "the metrics package/service wiring or the SSE content type is missing"
+fi
+if grep -qF 'GET /v1/metrics/stream' docs/API.md && grep -qF 'GET /v1/workspaces/{workspaceID}/metrics/stream' docs/API.md; then
+  ok "metrics.routes-documented"
+else
+  fail "metrics.routes-documented" "the metrics stream routes are not documented in docs/API.md"
+fi
+if grep -qF '/v1/metrics' api/openapi.yaml && grep -qF '/v1/workspaces/{workspaceId}/metrics/stream' api/openapi.yaml; then
+  ok "metrics.openapi"
+else
+  fail "metrics.openapi" "the metrics routes are missing from api/openapi.yaml"
+fi
+if grep -qF 'metrics' internal/api/router.go && grep -qF 'metricsCap' internal/api/router.go; then
+  ok "metrics.meta-advertised"
+else
+  fail "metrics.meta-advertised" "GET /v1/meta does not advertise the metrics capability"
 fi
 
 # The masking shim source and the embedded artifact must both be present, so a
