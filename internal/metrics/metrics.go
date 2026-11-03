@@ -5,7 +5,12 @@
 //   - disk comes from statfs (O(1), ~1.7 µs), never a tree walk (153 µs/file,
 //     82x worse per file and O(files));
 //   - a workspace's RAM is the SUM over its per-run and per-session cgroups,
-//     because the cgroup is per-run/per-session, not per-workspace;
+//     because a run owns a leaf cgroup; the leaves all live inside ONE
+//     per-workspace parent cgroup whose memory.max is the ENFORCED ceiling, so
+//     the summed usage can never exceed the advertised limit;
+//   - the reported ram_limit is that parent's memory.max (read from the kernel
+//     while live), so the number the tenant sees is the number the kernel
+//     enforces;
 //   - ONE service-wide sampler goroutine starts lazily on the first subscriber
 //     and stops on the last, so a service nobody watches costs exactly zero;
 //   - it samples ONCE per tick and fans out, so cost is independent of the
@@ -40,8 +45,13 @@ type WorkspaceInfo struct {
 	DiskRoot         string
 	DiskLimitBytes   int64
 	MemoryLimitBytes int64
-	RunCgroups       []string
-	SessionCgroups   []string
+	// ParentCgroup is the workspace's parent cgroup directory, whose memory.max
+	// is the ENFORCED ceiling. It is read for the reported ram_limit only while
+	// a run or session is live, so an idle workspace still costs zero cgroup
+	// reads. Empty when the executor has not provisioned the parent.
+	ParentCgroup   string
+	RunCgroups     []string
+	SessionCgroups []string
 }
 
 // Provider supplies the sampler with the candidate set each tick. It is
@@ -79,17 +89,19 @@ type WorkspaceSnapshot struct {
 	ownerID string
 	// RAMUsedBytes is the SUM of memory.current over the live run AND session
 	// cgroups. Reading one cgroup would be a wrong number, not an
-	// approximation.
+	// approximation. The kernel enforces the SUM at the workspace's parent
+	// cgroup, so this figure can never exceed RAMLimitBytes.
 	RAMUsedBytes int64 `json:"ram_used_bytes"`
-	// RAMLimitBytes is the workspace's configured allowance (memory_mb). It is
-	// what the tenant is advertised, and it is stable whether or not a cgroup
-	// is live.
+	// RAMLimitBytes is the workspace's ENFORCED ceiling: the parent cgroup's
+	// memory.max, read from the kernel (memory_mb bytes). It is what the tenant
+	// is advertised AND what the kernel enforces, so ram_used <= ram_limit
+	// always holds. When the workspace has no live cgroup it falls back to the
+	// configured memory_mb, which is the same number written to the parent.
 	RAMLimitBytes int64 `json:"ram_limit_bytes"`
-	// RAMCgroupLimitBytes is the SUM of the live cgroups' memory.max (the
-	// ceiling actually enforced). It can exceed RAMLimitBytes because the
-	// cgroup is per-run: a workspace with N runs may consume N x memory_mb.
-	RAMCgroupLimitBytes int64   `json:"ram_cgroup_limit_bytes"`
-	RAMPercent          float64 `json:"ram_percent"`
+	// RAMPercent is RAMUsedBytes/RAMLimitBytes*100. Because the ceiling is
+	// enforced it never exceeds 100 (the historical per-run model reported
+	// >100%, which read as a broken contract).
+	RAMPercent float64 `json:"ram_percent"`
 	// RAMComplete is false when a cgroup read did not succeed, so the figure is
 	// a lower bound.
 	RAMComplete bool `json:"ram_complete"`
@@ -232,23 +244,24 @@ func parseStatUsec(b []byte) (int64, error) {
 
 // BuildWorkspaceSnapshot assembles one workspace's frame from already-read
 // facts. It is pure: the caller supplies the per-cgroup readings so the sum and
-// the percentage arithmetic are unit-testable in isolation.
-func BuildWorkspaceSnapshot(info WorkspaceInfo, diskUsed, diskLimit int64, diskOK bool, ramUsed, ramCgroupMax int64, ramOK bool, liveRuns, liveCgroups int, cpuUsec, pids int64) WorkspaceSnapshot {
+// the percentage arithmetic are unit-testable in isolation. ramLimit is the
+// workspace's ENFORCED ceiling (the parent cgroup's memory.max value, which the
+// engine wrote from memory_mb); it is the denominator for RAMPercent.
+func BuildWorkspaceSnapshot(info WorkspaceInfo, diskUsed, diskLimit int64, diskOK bool, ramUsed, ramLimit int64, ramOK bool, liveRuns, liveCgroups int, cpuUsec, pids int64) WorkspaceSnapshot {
 	return WorkspaceSnapshot{
-		WorkspaceID:         info.ID,
-		ownerID:             info.OwnerID,
-		RAMUsedBytes:        ramUsed,
-		RAMLimitBytes:       info.MemoryLimitBytes,
-		RAMCgroupLimitBytes: ramCgroupMax,
-		RAMPercent:          Percent(ramUsed, info.MemoryLimitBytes),
-		RAMComplete:         ramOK,
-		DiskUsedBytes:       diskUsed,
-		DiskLimitBytes:      diskLimit,
-		DiskPercent:         Percent(diskUsed, diskLimit),
-		DiskComplete:        diskOK,
-		LiveRuns:            liveRuns,
-		LiveCgroups:         liveCgroups,
-		CPUUsageUsec:        cpuUsec,
-		PidsCurrent:         pids,
+		WorkspaceID:    info.ID,
+		ownerID:        info.OwnerID,
+		RAMUsedBytes:   ramUsed,
+		RAMLimitBytes:  ramLimit,
+		RAMPercent:     Percent(ramUsed, ramLimit),
+		RAMComplete:    ramOK,
+		DiskUsedBytes:  diskUsed,
+		DiskLimitBytes: diskLimit,
+		DiskPercent:    Percent(diskUsed, diskLimit),
+		DiskComplete:   diskOK,
+		LiveRuns:       liveRuns,
+		LiveCgroups:    liveCgroups,
+		CPUUsageUsec:   cpuUsec,
+		PidsCurrent:    pids,
 	}
 }

@@ -169,7 +169,15 @@ wait_teardown() {
   echo "no(procs=$procs mount=$mnt)"
 }
 
-cg_before=$(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null | wc -l | tr -d ' ')
+# nsjail_leaves prints the number of LIVE nsjail leaf cgroups, both at the root
+# (legacy) and nested under a workspace parent (ws-*/NSJAIL.*).
+nsjail_leaves() {
+  { ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null
+    ls -d /sys/fs/cgroup/ws-*/NSJAIL.* 2>/dev/null
+  } | wc -l | tr -d ' '
+}
+
+cg_before=$(nsjail_leaves)
 FUSE_BASE=$(fuse_count)
 
 cleanup() {
@@ -183,7 +191,14 @@ cleanup() {
     fusermount3 -u -z "$m" 2>/dev/null || true
   done
   sleep 0.5
-  # Remove only empty NSJAIL cgroups (a foreign jail's non-empty cgroup is left).
+  # Remove only empty cgroups (a foreign jail's non-empty cgroup is left):
+  # nested leaves first, then empty workspace parents, then any root-level leaf.
+  for d in $(ls -d /sys/fs/cgroup/ws-*/NSJAIL.* 2>/dev/null); do
+    if [ ! -s "$d/cgroup.procs" ]; then rmdir "$d" 2>/dev/null; fi
+  done
+  for d in $(ls -d /sys/fs/cgroup/ws-* 2>/dev/null); do
+    if [ ! -s "$d/cgroup.procs" ]; then rmdir "$d" 2>/dev/null; fi
+  done
   for d in $(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null); do
     if [ ! -s "$d/cgroup.procs" ]; then rmdir "$d" 2>/dev/null; fi
   done
@@ -424,8 +439,10 @@ for id in "$W2" "$W5" "$W6"; do
   [ -n "$id" ] && api DELETE "/v1/workspaces/$id" >/dev/null 2>&1 || true
 done
 sleep 2
-cg_after=$(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null | wc -l | tr -d ' ')
+cg_after=$(nsjail_leaves)
 chkbool "cgroups did not grow past baseline" "yes" "$([ "${cg_after:-0}" -le "${cg_before:-0}" ] && echo yes || echo no)"
+PARENTS_LEFT=$(ls -d /sys/fs/cgroup/ws-* 2>/dev/null | wc -l | tr -d ' ')
+chk "no workspace parent cgroup left after delete" "0" "$PARENTS_LEFT"
 LEFT_MOUNTS=$(findmnt -rno TARGET 2>/dev/null | grep -F "$DATA" | wc -l | tr -d ' ')
 chk "no mount left under the data dir" "0" "$LEFT_MOUNTS"
 FUSE_END=$(fuse_count)

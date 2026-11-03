@@ -306,7 +306,16 @@ wait_cgroups() {
   echo "no($n)"
 }
 
-cg_before=$(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null | wc -l | tr -d ' ')
+# nsjail_leaves prints the number of LIVE nsjail leaf cgroups, both at the root
+# (legacy) and nested under a workspace parent (ws-*/NSJAIL.*, the current
+# per-workspace layout).
+nsjail_leaves() {
+  { ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null
+    ls -d /sys/fs/cgroup/ws-*/NSJAIL.* 2>/dev/null
+  } | wc -l | tr -d ' '
+}
+
+cg_before=$(nsjail_leaves)
 FUSE_BASE=$(fuse_count)
 
 cleanup() {
@@ -318,6 +327,12 @@ cleanup() {
     fusermount3 -u -z "$m" 2>/dev/null || true
   done
   sleep 0.5
+  for d in $(ls -d /sys/fs/cgroup/ws-*/NSJAIL.* 2>/dev/null); do
+    if [ ! -s "$d/cgroup.procs" ]; then rmdir "$d" 2>/dev/null; fi
+  done
+  for d in $(ls -d /sys/fs/cgroup/ws-* 2>/dev/null); do
+    if [ ! -s "$d/cgroup.procs" ]; then rmdir "$d" 2>/dev/null; fi
+  done
   for d in $(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null); do
     if [ ! -s "$d/cgroup.procs" ]; then rmdir "$d" 2>/dev/null; fi
   done
@@ -496,6 +511,23 @@ chkbool "sampler reports two live cgroups" "yes" "$CG2"
 # cannot produce. Wait for the SUM to appear (a single cgroup cannot reach it).
 R2=$(wait_ram "$WA" above "$((R1 + 30000000))" 25)
 chkge "two-run RAM exceeds the single-run reading by a margin" "$R2" "$((R1 + 30000000))"
+
+echo "=== 4b) the reported ceiling is the ENFORCED parent ceiling (ram_used <= ram_limit) ==="
+# The workspace's memory_mb is 512 MiB (the config default). The reported
+# ram_limit must be that number, the kernel's parent cgroup must enforce exactly
+# it, and the summed usage must never exceed it -- because the kernel enforces
+# the SUM at the parent, which is the contract that used to be broken (a tenant
+# saw ram_used > ram_limit). Asserted while BOTH runs are still live.
+LIM=$(snap_ws_field "$WA" ram_limit_bytes)
+chk "reported ram_limit is the workspace memory_mb" "536870912" "$LIM"
+USED=$(snap_ws_field "$WA" ram_used_bytes)
+PCT=$(snap_ws_field "$WA" ram_percent)
+chkbool "ram_used <= ram_limit under load" "yes" \
+  "$(awk "BEGIN{exit !($USED <= $LIM)}" && echo yes || echo "no(used=$USED lim=$LIM)")"
+chkbool "ram_percent <= 100 under load" "yes" \
+  "$(awk "BEGIN{exit !($PCT <= 100)}" && echo yes || echo "no(pct=$PCT)")"
+PARENTMAX=$(cat "/sys/fs/cgroup/ws-$WA/memory.max" 2>/dev/null || echo "")
+chk "parent memory.max equals the advertised ceiling" "536870912" "$PARENTMAX"
 wait_run_done "$WA" 40 >/dev/null
 
 echo "=== 5) idle elision: no live run -> RAM 0, cgroup reads frozen ==="
@@ -685,8 +717,10 @@ for id in "$WA" "$WB" $FAN_EXTRA; do
   [ -n "$id" ] && api DELETE "/v1/workspaces/$id" >/dev/null 2>&1 || true
 done
 sleep 2
-cg_after=$(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null | wc -l | tr -d ' ')
+cg_after=$(nsjail_leaves)
 chkbool "cgroups did not grow past baseline" "yes" "$([ "${cg_after:-0}" -le "${cg_before:-0}" ] && echo yes || echo no)"
+PARENTS_LEFT=$(ls -d /sys/fs/cgroup/ws-* 2>/dev/null | wc -l | tr -d ' ')
+chk "no workspace parent cgroup left after delete" "0" "$PARENTS_LEFT"
 LEFT_MOUNTS=$(findmnt -rno TARGET 2>/dev/null | grep -F "$DATA" | wc -l | tr -d ' ')
 chk "no mount left under the data dir" "0" "$LEFT_MOUNTS"
 FUSE_END=$(fuse_count)

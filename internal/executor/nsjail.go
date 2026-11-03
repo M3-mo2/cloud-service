@@ -157,15 +157,23 @@ func (r *NsjailRunner) Identity() Identity { return r.identity }
 // CgroupMount is the location nsjail uses for the cgroup v2 hierarchy.
 const CgroupMount = "/sys/fs/cgroup"
 
-// The physical memory ceiling of a workspace is cgroup_mem_max = memory_mb
-// (bytes): a process that COMMITS past it is OOM-killed there. rlimit_as is a
-// separate, coarser virtual-address-space backstop and is deliberately NOT set
-// to memory_mb, because a modern managed runtime reserves a large VIRTUAL
-// address space at startup that it never commits, and RLIMIT_AS counts every
-// reservation including PROT_NONE ones. Measured: the pinned node/V8 build
-// (v24.22.2) mmaps a 512 MiB PROT_NONE CodeRange plus heap reservations --
-// ~1.1 GiB of address space -- before it runs a single line, so rlimit_as =
-// memory_mb aborts it with "Fatal process out of memory:
+// The physical memory ceiling of a workspace is the parent cgroup's memory.max
+// = memory_mb (bytes): a process that COMMITS past it is OOM-killed there. The
+// per-run `cgroup_mem_max` is kept EQUAL to the workspace's ceiling rather than
+// set to unlimited, because nsjail creates its leaf cgroup only when at least
+// one cgroup limit is set: with cgroup_mem_max=0 AND cgroup_pids_max=0 AND
+// cgroup_cpu_ms_per_sec=0, measured, nsjail creates NO leaf cgroup at all, which
+// would cost the cgroup-scoped kill/inventory handle. The parent still enforces
+// the SUM across concurrent runs, so one run may use up to memory_mb and N runs
+// share the same memory_mb (they no longer each get their own).
+//
+// rlimit_as is a separate, coarser virtual-address-space backstop and is
+// deliberately NOT set to memory_mb, because a modern managed runtime reserves a
+// large VIRTUAL address space at startup that it never commits, and RLIMIT_AS
+// counts every reservation including PROT_NONE ones. Measured: the pinned
+// node/V8 build (v24.22.2) mmaps a 512 MiB PROT_NONE CodeRange plus heap
+// reservations -- ~1.1 GiB of address space -- before it runs a single line, so
+// rlimit_as = memory_mb aborts it with "Fatal process out of memory:
 // SegmentedTable::InitializeTable (subspace allocation)" / "Failed to reserve
 // virtual memory for CodeRange". This is a property of rlimit_as vs V8, NOT of
 // the host-identity shim: `node -e 'console.log(42)'` fails identically with
@@ -397,7 +405,23 @@ func (r *NsjailRunner) Run(req Request) (Result, error) {
 		cmd.Stdin = strings.NewReader("")
 	}
 
+	// Read the workspace parent cgroup's cumulative oom_kill counter before the
+	// run so an OOM at the ceiling can be told apart from a clean exit. The
+	// parent persists for the workspace's lifetime, so it is readable after too.
+	oomBefore := readOOMKill(req.WorkspaceCgroup)
+
 	res, err := r.runCapture(ctx, cmd, req)
+	// An OOM at the ceiling is not a clean exit. The kernel's OOM killer sends
+	// SIGKILL to the run's process group (memory.oom.group is set on the parent),
+	// which nsjail reports as exit 137 -- the same code an ordinary SIGKILL
+	// produces. The parent's oom_kill counter is the authoritative signal that it
+	// was the CEILING, so the outcome is observable rather than a silent
+	// disappearance.
+	if err == nil && res.ExitCode == 137 && oomBefore >= 0 {
+		if after := readOOMKill(req.WorkspaceCgroup); after > oomBefore {
+			res.OOM = true
+		}
+	}
 	return res, err
 }
 
@@ -657,6 +681,26 @@ func (r *NsjailRunner) ListProcesses() []ProcessInfo { return ListJailProcesses(
 // ReapOrphans kills and removes every orphaned sandbox cgroup on the host.
 func (r *NsjailRunner) ReapOrphans() int { return ReapOrphans() }
 
+// EnsureWorkspaceCgroup creates (idempotently) the workspace's parent cgroup and
+// writes its enforced limits. It is a no-op when cgroup v2 is not usable (an
+// unprivileged process, or a host where the hierarchy is not writable): nsjail
+// cannot enforce a cgroup ceiling there either, and readiness reports it.
+func (r *NsjailRunner) EnsureWorkspaceCgroup(ws *model.Workspace) error {
+	if !r.CgroupsUsable() {
+		return nil
+	}
+	return EnsureWorkspaceCgroup(ws)
+}
+
+// RemoveWorkspaceCgroup kills any remaining member of the workspace's parent
+// cgroup and removes it. It is a no-op when cgroup v2 is not usable.
+func (r *NsjailRunner) RemoveWorkspaceCgroup(wsID string) {
+	if !r.CgroupsUsable() {
+		return
+	}
+	RemoveWorkspaceCgroup(wsID)
+}
+
 // trackCgroup records the NSJAIL cgroup directory for a run so a later stop can
 // kill the whole cgroup (not just the process group) and the completion path can
 // remove it.
@@ -853,9 +897,18 @@ type tmplData struct {
 	CPUCores     float64
 	CPUMilli     int
 	MemoryMB     int
-	MemoryBytes  int64
-	PidsMax      int
-	FsizeMB      int
+	// MemoryBytes is the per-run cgroup_mem_max. It is kept EQUAL to the
+	// workspace's ceiling so nsjail still creates its leaf cgroup (a leaf is
+	// created only when a cgroup limit is set); the workspace PARENT enforces
+	// the SUM. See the block above CgroupMount for the measurement.
+	MemoryBytes int64
+	PidsMax     int
+	FsizeMB     int
+	// Cgroupv2Mount, when non-empty, is the workspace's parent cgroup. nsjail is
+	// pointed at it via cgroupv2_mount so every run's leaf cgroup is created
+	// inside it and the parent's memory.max is the enforced ceiling. Empty
+	// omits the field (nsjail then uses the root, the legacy per-run layout).
+	Cgroupv2Mount string
 	// AsMB is the rlimit_as backstop in MB: the workspace's memory_mb plus a
 	// runtime address-space headroom (see addressSpaceMB), never memory_mb
 	// alone -- a managed runtime reserves more VIRTUAL space than it commits.
@@ -1102,6 +1155,7 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 		CPUMilli:      int(lim.CPUCores * 1000),
 		MemoryMB:      lim.MemoryMB,
 		MemoryBytes:   int64(lim.MemoryMB) * 1024 * 1024,
+		Cgroupv2Mount: req.WorkspaceCgroup,
 		PidsMax:       lim.MaxRuns * 64,
 		FsizeMB:       lim.DiskMB,
 		AsMB:          addressSpaceMB(lim.MemoryMB),

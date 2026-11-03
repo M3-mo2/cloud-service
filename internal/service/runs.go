@@ -215,6 +215,15 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		return nil, model.New(503, model.CodeUnavailable, "workspace disk unavailable: "+err.Error())
 	}
 
+	// Create (idempotently) the workspace's parent cgroup and write its enforced
+	// limits before the run is recorded. Every run's leaf cgroup is created
+	// inside this parent, so the SUM across concurrent runs is bounded by the
+	// advertised memory_mb. A provisioning failure refuses the run rather than
+	// run without the ceiling the workspace was promised.
+	if err := s.ensureWorkspaceCgroup(w); err != nil {
+		return nil, model.New(503, model.CodeUnavailable, "workspace cgroup unavailable: "+err.Error())
+	}
+
 	// Resolve the two package tiers before the run starts. A failure to
 	// prepare the private tier is fatal; a missing shared tier is not.
 	sharedHost, privateHost, err := s.packageDirs(w)
@@ -267,6 +276,11 @@ func (s *Service) StartRun(w *model.Workspace, spec StartRunSpec) (*model.Run, e
 		// (including a descendant that left the process group) to this run.
 		ProcessKind:   executor.KindRun,
 		ProcessSource: run.ID,
+
+		// The workspace's parent cgroup: nsjail creates this run's leaf inside
+		// it, and the executor reads its oom_kill counter to tell an OOM at the
+		// ceiling apart from a clean exit.
+		WorkspaceCgroup: workspaceCgroupPath(w.ID),
 
 		SharedPackagesDir:  sharedHost,
 		PrivatePackagesDir: privateHost,
@@ -328,6 +342,12 @@ func (s *Service) executeRun(ctx context.Context, w *model.Workspace, run *model
 		s.logger.Error("run failed", "run_id", run.ID, "error", err)
 	} else if res.TimedOut {
 		run.Status = model.RunTimeout
+		run.SetExitCode(res.ExitCode)
+	} else if res.OOM {
+		// Killed by the kernel at the workspace's memory ceiling. This is NOT a
+		// clean exit: it reads as `oom`, an explicit terminal state, so a client
+		// can tell "the workspace ran out of memory" from "the program finished".
+		run.Status = model.RunOOM
 		run.SetExitCode(res.ExitCode)
 	} else if res.Killed {
 		run.Status = model.RunKilled

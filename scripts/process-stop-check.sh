@@ -129,7 +129,22 @@ print((m[0]['id']+' '+str(m[0]['pid'])) if m else '')
 "
 }
 
-cg_before=$(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null | wc -l | tr -d ' ')
+# nsjail_leaves prints the number of LIVE nsjail leaf cgroups on the host, both
+# at the root (a legacy layout) and nested under a workspace parent
+# (/sys/fs/cgroup/ws-*/NSJAIL.*, the current per-workspace layout). It is the
+# honest count of run/session cgroups in either layout.
+nsjail_leaves() {
+  { ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null
+    ls -d /sys/fs/cgroup/ws-*/NSJAIL.* 2>/dev/null
+  } | wc -l | tr -d ' '
+}
+
+# ws_parents prints the number of workspace parent cgroups (ws-*) on the host.
+ws_parents() {
+  ls -d /sys/fs/cgroup/ws-* 2>/dev/null | wc -l | tr -d ' '
+}
+
+cg_before=$(nsjail_leaves)
 
 cleanup() {
   if [ -n "$SRV" ]; then
@@ -142,7 +157,14 @@ cleanup() {
   for p in $(pgrep -f "[s]andboxdpsc-" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
   sleep 0.5
   # Remove only cgroups that are now empty; a non-empty cgroup (a foreign jail
-  # still running) is left alone.
+  # still running) is left alone. Nested leaves go first, then empty workspace
+  # parents, then any root-level leaf.
+  for d in $(ls -d /sys/fs/cgroup/ws-*/NSJAIL.* 2>/dev/null); do
+    if [ ! -s "$d/cgroup.procs" ]; then rmdir "$d" 2>/dev/null; fi
+  done
+  for d in $(ls -d /sys/fs/cgroup/ws-* 2>/dev/null); do
+    if [ ! -s "$d/cgroup.procs" ]; then rmdir "$d" 2>/dev/null; fi
+  done
   for d in $(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null); do
     if [ ! -s "$d/cgroup.procs" ]; then rmdir "$d" 2>/dev/null; fi
   done
@@ -312,11 +334,38 @@ chk "workspace B inventory empty" "0" "$BW"
 curl -s -o /dev/null -m 40 -X POST "$BASE/v1/workspaces/$WSA/stop" -H "$A"
 sleep 2
 
-echo "=== 6) NSJAIL cgroup count returns to its pre-run value ==="
+echo "=== 6) nsjail leaf cgroups return to their pre-run value; the new layout holds ==="
 sleep 1
-cg_after=$(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null | wc -l | tr -d ' ')
-chk "cgroups did not grow past baseline" "no" "$([ "$cg_after" -gt "$cg_before" ] && echo yes || echo no)"
-chk "cgroups back to pre-run value" "$cg_before" "$cg_after"
+cg_after=$(nsjail_leaves)
+chk "nsjail leaves did not grow past baseline" "no" "$([ "$cg_after" -gt "$cg_before" ] && echo yes || echo no)"
+chk "nsjail leaves back to pre-run value" "$cg_before" "$cg_after"
+
+echo "=== 6b) the per-workspace ceiling layout: leaves are NESTED, never at the root ==="
+# With a live run the leaf cgroup must live INSIDE the workspace parent
+# (/sys/fs/cgroup/ws-*/NSJAIL.*) and ZERO NSJAIL.* may exist directly under
+# /sys/fs/cgroup. This is the assertion that proves the per-workspace layout is
+# actually in force (the kill path depends on resolving the nested leaf).
+WSL=$(curl -s -m 15 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"layout"}' | jsonf "['workspace']['id']")
+TOKL="$NS-layout"
+curl -s -o /dev/null -m 20 -X POST "$BASE/v1/workspaces/$WSL/runs" -H "$A" -H "$J" \
+  -d "{\"kind\":\"command\",\"argv\":[\"python3\",\"-c\",\"$PY\",\"$TOKL\"],\"no_timeout\":true}"
+# Wait for the workspace parent to exist and the run leaf to appear inside it.
+LAID="no"
+for _ in $(seq 1 40); do
+  if [ -d "/sys/fs/cgroup/ws-$WSL" ] && ls -d "/sys/fs/cgroup/ws-$WSL"/NSJAIL.* >/dev/null 2>&1; then
+    LAID="yes"; break
+  fi
+  sleep 0.5
+done
+chk "run leaf nested under the workspace parent" "yes" "$LAID"
+ROOTLEAF=$(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null | wc -l | tr -d ' ')
+chk "zero NSJAIL.* directly under the root while live" "0" "$ROOTLEAF"
+PMEM=$(cat "/sys/fs/cgroup/ws-$WSL/memory.max" 2>/dev/null || echo "")
+chk "parent enforces the advertised memory_mb" "536870912" "$PMEM"
+ROOTCONT=$(cat "/sys/fs/cgroup/ws-$WSL/cgroup.subtree_control" 2>/dev/null | tr -s ' ' | sed 's/^ //')
+chk "parent delegates the controllers" "cpu memory pids" "$ROOTCONT"
+curl -s -o /dev/null -m 40 -X POST "$BASE/v1/workspaces/$WSL/stop" -H "$A"
+sleep 2
 
 echo "=== 7) a forced daemon death + restart reaps the orphan ==="
 WS7=$(curl -s -m 15 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"orphan"}' | jsonf "['workspace']['id']")
@@ -343,8 +392,13 @@ NSLEFT=$(pgrep -xc nsjail 2>/dev/null || true)
 chk "nsjail reaped on restart" "0" "$([ -z "$NSLEFT" ] && echo 0 || echo "$NSLEFT")"
 ORPH2=$(pgrep -fc "[s]andboxdpsc-" 2>/dev/null || true)
 chk "orphan workload reaped on restart" "0" "$([ -z "$ORPH2" ] && echo 0 || echo "$ORPH2")"
-cg_final=$(ls -d /sys/fs/cgroup/NSJAIL.* 2>/dev/null | wc -l | tr -d ' ')
-chk "orphan cgroup removed on restart" "$cg_before" "$cg_final"
+cg_final=$(nsjail_leaves)
+chk "orphan leaf cgroup removed on restart" "0" "$cg_final"
+# The orphan workspace's PARENT cgroup must also be gone: a leftover parent makes
+# every later run inherit it. Only our own ws-* parents are asserted; a foreign
+# workspace's parent is left alone.
+OPAR=$(ls -d /sys/fs/cgroup/ws-* 2>/dev/null | wc -l | tr -d ' ')
+chk "orphan workspace parent reaped on restart" "0" "$OPAR"
 
 echo
 echo "================ process-stop acceptance: $PASS passed / $FAIL failed ================"

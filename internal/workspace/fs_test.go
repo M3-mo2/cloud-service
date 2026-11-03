@@ -204,6 +204,57 @@ func TestQuotaRecheck(t *testing.T) {
 	}
 }
 
+// TestQuotaBoundaryExactlyAtLimit pins the budget arithmetic at the boundary:
+// a write that lands EXACTLY on the limit succeeds, and a single byte over is
+// refused. The workspace's own allowance is the budget (never the filesystem's
+// reserved margin), so the boundary is exact.
+func TestQuotaBoundaryExactlyAtLimit(t *testing.T) {
+	fs := newFs(t)
+	fs.SetDiskLimit(100)
+	if err := fs.Write("/at", []byte(strings.Repeat("x", 100)), false, WriteOptions{}); err != nil {
+		t.Fatalf("a write that lands exactly on the limit must succeed: %v", err)
+	}
+	if fs.Used() != 100 {
+		t.Fatalf("used = %d, want 100", fs.Used())
+	}
+	// One block over is refused with a QuotaError.
+	err := fs.Write("/over", []byte("y"), false, WriteOptions{})
+	var qe *QuotaError
+	if !asQuota(err, &qe) {
+		t.Fatalf("one byte over the limit must be a QuotaError, got %v", err)
+	}
+	if qe.Used != 100 || qe.Limit != 100 {
+		t.Fatalf("quota error used/limit = %d/%d, want 100/100", qe.Used, qe.Limit)
+	}
+	// The refused write left the workspace unchanged.
+	if fs.Used() != 100 {
+		t.Fatalf("a refused write must not change used (got %d)", fs.Used())
+	}
+}
+
+// TestQuotaOneBlockOver is the append case: the workspace's own budget is the
+// boundary, so appending past it is refused rather than spending a reserved
+// margin.
+func TestQuotaOneBlockOver(t *testing.T) {
+	fs := newFs(t)
+	fs.SetDiskLimit(64)
+	if err := fs.Write("/a", []byte(strings.Repeat("x", 60)), false, WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// 60 + 5 = 65 > 64: refused.
+	var qe *QuotaError
+	if err := fs.Write("/a", []byte("bbbbb"), true, WriteOptions{}); !asQuota(err, &qe) {
+		t.Fatalf("append past the limit must be a QuotaError, got %v", err)
+	}
+	// 60 + 4 = 64: exactly at the limit, allowed.
+	if err := fs.Write("/a", []byte("dddd"), true, WriteOptions{}); err != nil {
+		t.Fatalf("append landing exactly on the limit must succeed: %v", err)
+	}
+	if fs.Used() != 64 {
+		t.Fatalf("used = %d, want 64", fs.Used())
+	}
+}
+
 func TestOversizeWriteQuotaOrder(t *testing.T) {
 	fs := newFs(t)
 	fs.SetDiskLimit(10)

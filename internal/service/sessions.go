@@ -125,6 +125,12 @@ func (s *Service) StartSession(w *model.Workspace, spec StartSessionSpec) (*mode
 	if err := s.ensureWorkspaceDisk(w); err != nil {
 		return nil, model.New(503, model.CodeUnavailable, "workspace disk unavailable: "+err.Error())
 	}
+	// Provision the workspace's parent cgroup before the session starts, so the
+	// session's leaf cgroup is created inside it and the workspace ceiling bounds
+	// the SUM with any concurrent runs.
+	if err := s.ensureWorkspaceCgroup(w); err != nil {
+		return nil, model.New(503, model.CodeUnavailable, "workspace cgroup unavailable: "+err.Error())
+	}
 
 	now := time.Now().UTC()
 	sess := &model.Session{
@@ -162,6 +168,10 @@ func (s *Service) StartSession(w *model.Workspace, spec StartSessionSpec) (*mode
 		// session in the process inventory.
 		ProcessKind:   executor.KindSession,
 		ProcessSource: sess.ID,
+
+		// The workspace's parent cgroup: the session's leaf cgroup is created
+		// inside it.
+		WorkspaceCgroup: workspaceCgroupPath(w.ID),
 	}
 	// Sessions run in the workspace's own isolated network too.
 	req, err = s.ApplyNetwork(w, req)

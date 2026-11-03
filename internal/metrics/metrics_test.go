@@ -119,23 +119,30 @@ func TestParseHelpers(t *testing.T) {
 }
 
 // TestBuildSnapshotSumsCgroups proves the RAM figure is the SUM over the
-// workspace's per-run and per-session cgroups, with the per-run memory.max sum
-// exposed separately. This is the assertion that catches "read one cgroup and
-// call it the workspace".
+// workspace's per-run and per-session cgroups, and that the reported ceiling is
+// the workspace's ENFORCED parent limit (passed in), not a per-run sum. This is
+// the assertion that catches "read one cgroup and call it the workspace" and
+// "publish a per-run ceiling that can exceed the workspace's allowance".
 func TestBuildSnapshotSumsCgroups(t *testing.T) {
-	info := WorkspaceInfo{ID: "ws_1", MemoryLimitBytes: 160 * 1024 * 1024, DiskLimitBytes: 64 * 1024 * 1024}
+	// The workspace's enforced ceiling (the parent memory.max): 160 MB.
+	var limit int64 = 160 * 1024 * 1024
+	info := WorkspaceInfo{ID: "ws_1", MemoryLimitBytes: limit, DiskLimitBytes: 64 * 1024 * 1024}
 	// Two runs: 61 MB and 56 MB (the measured two-run case).
 	var used int64 = 61546496 + 56934400
-	var max int64 = 167772160 + 167772160
-	snap := BuildWorkspaceSnapshot(info, 90112, info.DiskLimitBytes, true, used, max, true, 2, 2, 0, 0)
+	snap := BuildWorkspaceSnapshot(info, 90112, info.DiskLimitBytes, true, used, limit, true, 2, 2, 0, 0)
 	if snap.RAMUsedBytes != used {
 		t.Fatalf("RAMUsedBytes = %d, want sum %d", snap.RAMUsedBytes, used)
 	}
-	if snap.RAMCgroupLimitBytes != max {
-		t.Fatalf("RAMCgroupLimitBytes = %d, want %d", snap.RAMCgroupLimitBytes, max)
+	if snap.RAMLimitBytes != limit {
+		t.Fatalf("RAMLimitBytes = %d, want the enforced ceiling %d", snap.RAMLimitBytes, limit)
 	}
-	if snap.RAMCgroupLimitBytes <= info.MemoryLimitBytes {
-		t.Fatalf("per-run ceiling sum (%d) should exceed the workspace allowance (%d)", snap.RAMCgroupLimitBytes, info.MemoryLimitBytes)
+	// The contract the tenant sees: usage never exceeds the advertised ceiling,
+	// because the kernel enforces the SUM at the parent.
+	if snap.RAMUsedBytes > snap.RAMLimitBytes {
+		t.Fatalf("ram_used (%d) must never exceed ram_limit (%d)", snap.RAMUsedBytes, snap.RAMLimitBytes)
+	}
+	if snap.RAMPercent > 100 {
+		t.Fatalf("ram_percent = %v, must never exceed 100", snap.RAMPercent)
 	}
 	if snap.LiveRuns != 2 || snap.LiveCgroups != 2 {
 		t.Fatalf("live runs/cgroups = %d/%d", snap.LiveRuns, snap.LiveCgroups)
@@ -175,19 +182,21 @@ func TestIdleWorkspaceZeroCgroupReads(t *testing.T) {
 	}
 }
 
-// TestLiveCgroupReadsOnlyMemoryFiles proves a live cgroup reads exactly two
-// files by default (memory.current + memory.max), not the expensive extras.
+// TestLiveCgroupReadsOnlyMemoryFiles proves a live workspace reads only the
+// cheap memory files by default: one memory.current per leaf cgroup, plus one
+// read of the workspace parent cgroup's memory.max for the ENFORCED ceiling. The
+// expensive extras (cpu.stat, pids.current) are NOT read.
 func TestLiveCgroupReadsOnlyMemoryFiles(t *testing.T) {
 	r := newFakeReader()
 	r.current["/cg/a"] = 100
-	r.max["/cg/a"] = 1000
 	r.current["/cg/b"] = 200
-	r.max["/cg/b"] = 1000
+	r.max["/ws/parent"] = 3000
 	p := &fakeProvider{}
 	p.set([]WorkspaceInfo{{
 		ID: "ws_live", OwnerID: "u1", DiskRoot: "/none",
-		DiskLimitBytes: 64 << 20, MemoryLimitBytes: 1000,
-		RunCgroups: []string{"/cg/a"}, SessionCgroups: []string{"/cg/b"},
+		DiskLimitBytes: 64 << 20, MemoryLimitBytes: 3000,
+		ParentCgroup: "/ws/parent",
+		RunCgroups:   []string{"/cg/a"}, SessionCgroups: []string{"/cg/b"},
 	}})
 	r.diskOK["/none"] = true
 	s := New(DefaultConfig(), p, r)
@@ -196,11 +205,11 @@ func TestLiveCgroupReadsOnlyMemoryFiles(t *testing.T) {
 	if w.RAMUsedBytes != 300 {
 		t.Fatalf("summed RAM = %d, want 300", w.RAMUsedBytes)
 	}
-	if w.RAMCgroupLimitBytes != 2000 {
-		t.Fatalf("cgroup max sum = %d, want 2000", w.RAMCgroupLimitBytes)
+	if w.RAMLimitBytes != 3000 {
+		t.Fatalf("RAMLimitBytes = %d, want the parent memory.max 3000", w.RAMLimitBytes)
 	}
-	if snap.Sampler.CgroupReads != 4 { // 2 cgroups x 2 files
-		t.Fatalf("cgroup reads = %d, want 4", snap.Sampler.CgroupReads)
+	if snap.Sampler.CgroupReads != 3 { // 2 leaf memory.current + 1 parent memory.max
+		t.Fatalf("cgroup reads = %d, want 3", snap.Sampler.CgroupReads)
 	}
 	if r.cpuReads != 0 {
 		t.Fatalf("cpu.stat read with include_cpu off (%d)", r.cpuReads)
@@ -278,11 +287,12 @@ func TestLazyStartAndStop(t *testing.T) {
 func TestFanOutReadsIndependentOfSubscribers(t *testing.T) {
 	r := newFakeReader()
 	r.current["/cg/a"] = 100
-	r.max["/cg/a"] = 1000
+	r.max["/ws/parent"] = 1000
 	p := &fakeProvider{}
 	p.set([]WorkspaceInfo{{
 		ID: "ws", OwnerID: "u1", DiskRoot: "/none",
-		DiskLimitBytes: 1, MemoryLimitBytes: 1000, RunCgroups: []string{"/cg/a"},
+		DiskLimitBytes: 1, MemoryLimitBytes: 1000,
+		ParentCgroup: "/ws/parent", RunCgroups: []string{"/cg/a"},
 	}})
 	r.diskOK["/none"] = true
 	cfg := DefaultConfig()
@@ -317,7 +327,8 @@ func TestFanOutReadsIndependentOfSubscribers(t *testing.T) {
 	}
 	before := s.Counters().CgroupReads
 	// ONE publish fans out to all 8 subscribers and performs exactly one sample
-	// pass (2 cgroup reads here), so cost is independent of subscriber count.
+	// pass (2 cgroup reads here: one leaf memory.current + the parent
+	// memory.max), so cost is independent of subscriber count.
 	s.publish()
 	after := s.Counters().CgroupReads
 	if after-before != 2 {

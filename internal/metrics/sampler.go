@@ -405,8 +405,9 @@ func (s *Sampler) sampleAll() Snapshot {
 }
 
 // sampleWorkspace reads the minimum for one workspace: one statfs for disk, and
-// two files per live cgroup for RAM. A workspace with no live cgroup does ZERO
-// cgroup reads and reports RAM 0.
+// one memory.current per live cgroup PLUS (when a run or session is live) one
+// read of the workspace parent cgroup's memory.max for the enforced ceiling. A
+// workspace with no live cgroup does ZERO cgroup reads and reports RAM 0.
 func (s *Sampler) sampleWorkspace(info WorkspaceInfo) WorkspaceSnapshot {
 	used, ok := s.reader.DiskUsed(info.DiskRoot)
 	s.c.statfsReads.Add(1)
@@ -415,7 +416,7 @@ func (s *Sampler) sampleWorkspace(info WorkspaceInfo) WorkspaceSnapshot {
 	cgroups = append(cgroups, info.RunCgroups...)
 	cgroups = append(cgroups, info.SessionCgroups...)
 
-	var ramUsed, ramMax, cpuUsec, pids int64
+	var ramUsed, cpuUsec, pids int64
 	ramOK := true
 	live := 0
 	for _, dir := range cgroups {
@@ -425,13 +426,7 @@ func (s *Sampler) sampleWorkspace(info WorkspaceInfo) WorkspaceSnapshot {
 			ramOK = false
 			continue
 		}
-		max, err := s.reader.MemoryMax(dir)
-		s.c.cgroupReads.Add(1)
-		if err != nil {
-			ramOK = false
-		}
 		ramUsed += cur
-		ramMax += max
 		live++
 		if s.cfg.IncludeCPU {
 			if u, err := s.reader.CPUUsageUsec(dir); err == nil {
@@ -444,8 +439,20 @@ func (s *Sampler) sampleWorkspace(info WorkspaceInfo) WorkspaceSnapshot {
 			s.c.cgroupReads.Add(1)
 		}
 	}
+	// The enforced ceiling is the workspace parent cgroup's memory.max. It is
+	// read only while a run or session is live (an idle workspace must cost zero
+	// cgroup reads); when there is no live cgroup, or no parent is known, the
+	// configured memory_mb is reported -- the exact number the engine writes to
+	// the parent, so the advertised and enforced figures are the same value.
+	ramLimit := info.MemoryLimitBytes
+	if live > 0 && info.ParentCgroup != "" {
+		if m, err := s.reader.MemoryMax(info.ParentCgroup); err == nil && m > 0 {
+			ramLimit = m
+		}
+		s.c.cgroupReads.Add(1)
+	}
 	return BuildWorkspaceSnapshot(info, used, info.DiskLimitBytes, ok,
-		ramUsed, ramMax, ramOK, len(info.RunCgroups), live, cpuUsec, pids)
+		ramUsed, ramLimit, ramOK, len(info.RunCgroups), live, cpuUsec, pids)
 }
 
 // sseDataFrame encodes one SSE event carrying a JSON payload.

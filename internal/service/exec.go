@@ -51,6 +51,12 @@ func (s *Service) Exec(w *model.Workspace, spec ExecSpec) (ExecOutcome, error) {
 	if err := s.ensureWorkspaceDisk(w); err != nil {
 		return ExecOutcome{}, model.New(503, model.CodeUnavailable, "workspace disk unavailable: "+err.Error())
 	}
+	// Provision the workspace's parent cgroup before the sandbox starts, so the
+	// exec's leaf cgroup is created inside it and the workspace ceiling bounds
+	// the SUM with any concurrent runs.
+	if err := s.ensureWorkspaceCgroup(w); err != nil {
+		return ExecOutcome{}, model.New(503, model.CodeUnavailable, "workspace cgroup unavailable: "+err.Error())
+	}
 	req := executor.Request{
 		Workspace:     w,
 		WorkspaceRoot: s.store.WorkspaceRoot(w.ID),
@@ -66,6 +72,8 @@ func (s *Service) Exec(w *model.Workspace, spec ExecSpec) (ExecOutcome, error) {
 		// detached child) is still attributed to this workspace. Exec has no
 		// run/session id, so such a process is reported as "detached".
 		ProcessKind: executor.KindExec,
+
+		WorkspaceCgroup: workspaceCgroupPath(w.ID),
 
 		SharedPackagesDir:  sharedHost,
 		PrivatePackagesDir: privateHost,

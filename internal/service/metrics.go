@@ -153,8 +153,12 @@ func (p *metricsProvider) Candidates() []metrics.WorkspaceInfo {
 			DiskRoot:         p.svc.store.WorkspaceRoot(id),
 			DiskLimitBytes:   c.diskLimit,
 			MemoryLimitBytes: c.memoryLimit,
-			RunCgroups:       runCgroups[id],
-			SessionCgroups:   sessionCgroups[id],
+			// The parent cgroup's memory.max is the ENFORCED ceiling. The
+			// sampler reads it only while a run/session is live, so an idle
+			// workspace still costs zero cgroup reads.
+			ParentCgroup:   workspaceCgroupPath(id),
+			RunCgroups:     runCgroups[id],
+			SessionCgroups: sessionCgroups[id],
 		})
 	}
 	return out

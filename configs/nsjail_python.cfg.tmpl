@@ -26,6 +26,16 @@ clone_newuts: true
 # Use cgroup v2 (unified hierarchy). Required on modern hosts.
 use_cgroupv2: true
 
+# The workspace's PARENT cgroup. Every run's leaf cgroup is created INSIDE it,
+# and the parent's memory.max is the workspace's ENFORCED ceiling -- so the SUM
+# across concurrent runs is bounded by the advertised memory_mb, not N x
+# memory_mb. Moving an existing cgroup under a parent is EPERM, so nsjail must
+# be pointed here at launch. Empty (a host without engine-managed cgroups, or a
+# legacy record) omits the field and nsjail uses its default root layout.
+{{- if .Cgroupv2Mount }}
+cgroupv2_mount: {{ .Cgroupv2Mount }}
+{{- end }}
+
 # Do not mount /proc: it leaks host process information.
 mount_proc: false
 
@@ -425,7 +435,13 @@ rlimit_nofile: 256
 rlimit_nproc: {{ .PidsMax }}
 rlimit_core: 0
 
-# cgroup v2 limits (memory in bytes, cpu in microseconds per second).
+# Per-run cgroup v2 limits (memory in bytes, cpu in microseconds per second).
+# These are the workspace's values, NOT a second, larger budget: the leaf cgroup
+# is created INSIDE the workspace's parent (cgroupv2_mount above), whose
+# memory.max/pids.max/cpu.max enforce the SUM across every concurrent run. A leaf
+# limit is set (rather than 0/unlimited) because nsjail only creates the leaf
+# when at least one cgroup limit is set; with all three 0 it creates NO leaf,
+# which would cost the engine its cgroup-scoped kill/inventory handle (measured).
 cgroup_mem_max: {{ .MemoryBytes }}
 cgroup_pids_max: {{ .PidsMax }}
 cgroup_cpu_ms_per_sec: {{ .CPUMilli }}

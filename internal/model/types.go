@@ -189,6 +189,11 @@ const (
 	RunTimeout     RunStatus = "timeout"
 	RunFailed      RunStatus = "failed"
 	RunInterrupted RunStatus = "interrupted"
+	// RunOOM is a run the kernel's OOM killer ended because it reached the
+	// workspace's memory ceiling. It is DISTINCT from exited: a run killed at
+	// the ceiling must never read as a clean exit. It is distinct from killed,
+	// which is an explicit stop and does not charge the ceiling.
+	RunOOM RunStatus = "oom"
 )
 
 // Log streams.

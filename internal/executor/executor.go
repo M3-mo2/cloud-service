@@ -131,6 +131,14 @@ type Request struct {
 	// SessionOutputCap bounds the persisted PTY output log. It overrides the
 	// default run-log cap for a session.
 	SessionOutputCap int64
+
+	// WorkspaceCgroup, when set, is the workspace's parent cgroup directory. It
+	// is where the workspace's enforced ceiling lives (memory.max), so a run
+	// that is OOM-killed at the ceiling can be told apart from a clean exit: the
+	// executor reads the parent's cumulative oom_kill counter before and after
+	// the run. Empty disables OOM attribution (the run is still contained by
+	// nsjail, only the exit classification is coarser).
+	WorkspaceCgroup string
 }
 
 // Result is the outcome of an execution.
@@ -141,6 +149,10 @@ type Result struct {
 	Truncated bool
 	TimedOut  bool
 	Killed    bool
+	// OOM is set when the kernel's OOM killer ended the run because it reached
+	// the workspace's memory ceiling. A run killed by the ceiling is NOT a
+	// clean exit and is NOT an explicit stop; it is classified distinctly.
+	OOM bool
 	// Streamed reports that output was written to disk rather than returned.
 	Streamed bool
 }
@@ -189,6 +201,14 @@ type Runner interface {
 	// ReapOrphans kills and removes every orphaned sandbox cgroup left by a hard
 	// (SIGKILL) daemon death, and reports how many it reaped.
 	ReapOrphans() int
+	// EnsureWorkspaceCgroup creates (idempotently) the workspace's parent cgroup
+	// and writes its enforced limits (memory/pids/cpu). Every run's leaf cgroup
+	// is created inside it, so the SUM across concurrent runs is bounded by the
+	// advertised limits. It is a no-op where cgroups are not usable.
+	EnsureWorkspaceCgroup(ws *model.Workspace) error
+	// RemoveWorkspaceCgroup kills any remaining member of the workspace's parent
+	// cgroup and removes it. It is idempotent.
+	RemoveWorkspaceCgroup(wsID string)
 	// RunCgroupDirs returns a snapshot of the run ID -> NSJAIL cgroup directory
 	// map the runner already tracks for every live run. It is READ-ONLY and
 	// O(live runs): the metrics sampler joins it against the service's run table

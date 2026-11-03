@@ -235,6 +235,11 @@ func (s *Service) deleteWorkspaceFully(w *model.Workspace) error {
 	s.StopWorkspaceSessions(w.ID, model.SessionReasonWorkspaceDeleted)
 	s.StopDetachedProcesses(w)
 	s.ReleaseWorkspaceTunnels(w)
+	// Remove the workspace's parent cgroup AFTER every run/session/process has
+	// been stopped: a cgroup that still has processes is never rmdir'd, so the
+	// members must be killed first (this also catches a detached process that
+	// outlived the stop).
+	s.removeWorkspaceCgroup(w.ID)
 	// Unmount first, then delete the image, then the tree; the network last.
 	s.removeWorkspaceDisk(w.ID)
 	if err := s.store.DeleteWorkspace(w.ID); err != nil {

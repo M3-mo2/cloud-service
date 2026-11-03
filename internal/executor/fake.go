@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"sandboxd/configs"
+	"sandboxd/internal/model"
 	"sandboxd/internal/profile"
 )
 
@@ -61,6 +62,10 @@ type FakeRunner struct {
 	// RunCgroups, when set, is returned by RunCgroupDirs so the metrics sampler
 	// can be tested without a real cgroup hierarchy.
 	RunCgroups map[string]string
+
+	// cgroupEnsured records the workspace ids EnsureWorkspaceCgroup was called
+	// for, so a service test can assert the provisioning path ran.
+	cgroupEnsured map[string]bool
 }
 
 // fakeLive is an in-memory LiveProcess for tests.
@@ -295,6 +300,35 @@ func (f *FakeRunner) ReapOrphans() int {
 	n := f.reaped
 	f.reaped = 0
 	return n
+}
+
+// EnsureWorkspaceCgroup is a no-op in the fake: there is no real cgroup
+// hierarchy to provision and no nsjail to point at it. It records the calls so
+// a service test can assert the provisioning path ran.
+func (f *FakeRunner) EnsureWorkspaceCgroup(ws *model.Workspace) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.cgroupEnsured == nil {
+		f.cgroupEnsured = map[string]bool{}
+	}
+	if ws != nil {
+		f.cgroupEnsured[ws.ID] = true
+	}
+	return nil
+}
+
+// RemoveWorkspaceCgroup is a no-op in the fake.
+func (f *FakeRunner) RemoveWorkspaceCgroup(wsID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.cgroupEnsured, wsID)
+}
+
+// CgroupEnsured reports whether EnsureWorkspaceCgroup was called for wsID.
+func (f *FakeRunner) CgroupEnsured(wsID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cgroupEnsured[wsID]
 }
 
 // RunCgroupDirs returns the fake's configured run -> cgroup map (a copy).

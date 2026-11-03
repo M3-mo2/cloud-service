@@ -90,25 +90,45 @@ func nsjailCgroupLeader(nsjailPID int) int {
 // belongs to, or "" when the pid is not in an nsjail cgroup (or /proc is not
 // readable). The pid's own cgroup membership is authoritative and survives
 // setsid()/setpgid(), unlike its process group.
+//
+// The path is taken from the pid's /proc cgroup membership in FULL, so it is
+// correct for BOTH layouts: the current per-workspace parent layout, where the
+// leaf is nested at
+// /sys/fs/cgroup/ws-<id>/NSJAIL.<leader>, and a legacy root-level
+// /sys/fs/cgroup/NSJAIL.<leader> if one is ever seen. The leaf name is what
+// identifies it as a jail cgroup.
 func CgroupDirOfPID(pid int) string {
 	b, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cgroup"))
 	if err != nil {
 		return ""
 	}
 	for _, line := range strings.Split(string(b), "\n") {
-		// Format: "0::/NSJAIL.<n>" on a unified (v2) host.
-		rest, ok := strings.CutPrefix(line, "0::")
-		if !ok {
-			continue
+		if dir := parseCgroupLine(line); dir != "" {
+			return dir
 		}
-		rest = strings.TrimSpace(rest)
-		base := filepath.Base(rest)
-		if !strings.HasPrefix(base, NsjailCgroupPrefix) {
-			return ""
-		}
-		return filepath.Join(CgroupMount, base)
 	}
 	return ""
+}
+
+// parseCgroupLine parses one /proc/<pid>/cgroup line and returns the absolute
+// leaf cgroup path when it names a jail cgroup (its final component has the
+// NSJAIL. prefix), or "" otherwise. It is the testable core of CgroupDirOfPID
+// and understands both the current nested layout (ws-<id>/NSJAIL.<pid>) and the
+// legacy root-level one (NSJAIL.<pid>).
+func parseCgroupLine(line string) string {
+	rest, ok := strings.CutPrefix(line, "0::")
+	if !ok {
+		return ""
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" || !strings.HasPrefix(filepath.Base(rest), NsjailCgroupPrefix) {
+		return ""
+	}
+	joined := filepath.Join(CgroupMount, rest)
+	if !strings.HasPrefix(joined, CgroupMount+string(filepath.Separator)) {
+		return ""
+	}
+	return joined
 }
 
 // CgroupForNsjailPID resolves the NSJAIL cgroup directory nsjail creates for a
@@ -117,6 +137,12 @@ func CgroupDirOfPID(pid int) string {
 // brief bounded wait is needed before the directory is visible. It returns ""
 // when no cgroup appears within the window (the jail already exited, /proc is
 // restricted, or the direct child is not nsjail at all as in a test stub).
+//
+// The leader's own /proc cgroup membership is authoritative and yields the full
+// path, which under the current per-workspace parent layout is nested
+// (ws-<id>/NSJAIL.<leader>). The filesystem fallback below only runs when that
+// read is unavailable, and it searches both the root (legacy) and every
+// workspace parent so a nested leaf is still found.
 func CgroupForNsjailPID(nsjailPID int) string {
 	// Fast path: if the direct child is not nsjail (a test stub that exec'd the
 	// target, or a reaped jail), there is no NSJAIL cgroup to find and waiting
@@ -130,8 +156,8 @@ func CgroupForNsjailPID(nsjailPID int) string {
 			if dir := CgroupDirOfPID(leader); dir != "" {
 				return dir
 			}
-			if _, err := os.Stat(filepath.Join(CgroupMount, NsjailCgroupPrefix+strconv.Itoa(leader))); err == nil {
-				return filepath.Join(CgroupMount, NsjailCgroupPrefix+strconv.Itoa(leader))
+			if dir := findByLeafName(NsjailCgroupPrefix + strconv.Itoa(leader)); dir != "" {
+				return dir
 			}
 		}
 		if time.Now().After(deadline) {
@@ -139,6 +165,23 @@ func CgroupForNsjailPID(nsjailPID int) string {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// findByLeafName returns the absolute path of a cgroup directory named leaf,
+// searching the root (legacy NSJAIL.<pid>) and every workspace parent
+// (ws-<id>/NSJAIL.<pid>). It is the /proc-independent fallback for resolving a
+// jail's cgroup. It returns "" when no such directory exists.
+func findByLeafName(leaf string) string {
+	if _, err := os.Stat(filepath.Join(CgroupMount, leaf)); err == nil {
+		return filepath.Join(CgroupMount, leaf)
+	}
+	for _, parent := range listWorkspaceCgroups() {
+		p := filepath.Join(parent, leaf)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
 }
 
 // directChildIsNsjail reports whether a pid names the nsjail supervisor, i.e.
@@ -238,7 +281,11 @@ func waitCgroupGone(dir string, timeout time.Duration) bool {
 	}
 }
 
-// listNsjailCgroups returns every nsjail cgroup directory under the mount.
+// listNsjailCgroups returns every nsjail leaf cgroup on the host. Under the
+// current per-workspace parent layout a leaf lives at
+// /sys/fs/cgroup/ws-<id>/NSJAIL.<pid>; a legacy root-level
+// /sys/fs/cgroup/NSJAIL.<pid> (from before the parent existed, or a stray) is
+// included too so the inventory and orphan reaper stay correct either way.
 func listNsjailCgroups() []string {
 	entries, err := os.ReadDir(CgroupMount)
 	if err != nil {
@@ -246,8 +293,25 @@ func listNsjailCgroups() []string {
 	}
 	var out []string
 	for _, e := range entries {
-		if e.IsDir() && strings.HasPrefix(e.Name(), NsjailCgroupPrefix) {
-			out = append(out, filepath.Join(CgroupMount, e.Name()))
+		if !e.IsDir() {
+			continue
+		}
+		full := filepath.Join(CgroupMount, e.Name())
+		if strings.HasPrefix(e.Name(), NsjailCgroupPrefix) {
+			out = append(out, full)
+			continue
+		}
+		// A workspace parent: collect its NSJAIL.* leaves.
+		if strings.HasPrefix(e.Name(), WorkspaceCgroupPrefix) {
+			subs, serr := os.ReadDir(full)
+			if serr != nil {
+				continue
+			}
+			for _, s := range subs {
+				if s.IsDir() && strings.HasPrefix(s.Name(), NsjailCgroupPrefix) {
+					out = append(out, filepath.Join(full, s.Name()))
+				}
+			}
 		}
 	}
 	sort.Strings(out)
@@ -314,13 +378,20 @@ func ReapCgroup(dir string) { KillCgroupTree(dir) }
 // ReapOrphans kills and removes every nsjail cgroup currently on the host. A
 // run or session never survives a service restart, so anything still present at
 // startup is an orphan from a hard (SIGKILL) daemon death; a graceful shutdown
-// already leaves nothing. It returns the number of cgroups reaped.
+// already leaves nothing. It reaps workspace parent cgroups first (a parent
+// removal also removes the nested leaves), then any stray root-level leaf. It
+// returns the number of cgroups reaped.
 func ReapOrphans() int {
-	dirs := listNsjailCgroups()
-	for _, dir := range dirs {
-		KillCgroupTree(dir)
+	n := 0
+	for _, dir := range listWorkspaceCgroups() {
+		KillCgroupTreeNested(dir)
+		n++
 	}
-	return len(dirs)
+	for _, dir := range listNsjailCgroups() {
+		KillCgroupTree(dir)
+		n++
+	}
+	return n
 }
 
 // sampleProcess reads the details of a host pid needed for the inventory: argv,
