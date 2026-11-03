@@ -2599,22 +2599,22 @@ identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/
       curated.free_bytes_agree 268435456
       curated.mountinfo_ok yes ; curated.mountinfo_workspace_present 1
       curated.mountinfo_no_zfs 0 ; curated.mtab_present yes ; curated.mtab_agrees 1
-  §1c disk.statvfs_total_workspace 268435456 ; disk.statf_agree 65536
-      disk.df_agree 268435456 ; disk.no_host_fstype no
-      disk.dfh_bare_ok ok ; disk.dfh_bare_workspace_size 256M
-      disk.dfh_workspace_rc 0 ; disk.dfh_workspace_size 256M
-      disk.dfh_root_ok ok ; disk.dfh_root_has_row yes
-      disk.df_bare_workspace_1k 262144
-      disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
-docs-consistency.sh             272 passed / 0 failed
- go test ./...                  489 test functions (from 353)
+   §1c disk.statvfs_total_workspace 268435456 ; disk.statf_agree 65536
+       disk.df_agree 268435456 ; disk.no_host_fstype no
+       disk.dfh_bare_ok ok ; disk.dfh_bare_workspace_size 256M
+       disk.dfh_workspace_rc 0 ; disk.dfh_workspace_size 256M
+       disk.dfh_root_ok ok ; disk.dfh_root_has_row yes
+       disk.df_bare_workspace_1k 262144
+       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
+ docs-consistency.sh             294 passed / 0 failed
+ go test ./...                   521 test functions
 ```
 
 The full gate set re-run for this revision, one gate at a time (concurrent runs
 corrupt the `docs-consistency` tally), all green:
 
 ```
-scripts/docs-consistency.sh     272 passed / 0 failed   (258 before the write-rate additions)
+scripts/docs-consistency.sh     294 passed / 0 failed   (272 before the ports additions)
 scripts/acceptance.sh           113 passed / 0 failed
 scripts/process-stop-check.sh    30 passed / 0 failed
 scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped   (real quick tunnel)
@@ -2624,9 +2624,17 @@ scripts/subscription-check.sh    62 passed / 0 failed
 scripts/archive-check.sh        102 passed / 0 failed
 scripts/metrics-check.sh         56 passed / 0 failed
 scripts/spread-check.sh          32 passed / 0 failed
-scripts/write-rate-check.sh      29 passed / 0 failed             (write-rate ceiling; see §9p)
-go test ./...                    489 test functions; go vet ./... clean
+scripts/write-rate-check.sh      29 passed / 0 failed             (write-rate ceiling; see §9p; 1 transient 28/1 on a loaded host, then 29/0 on re-runs)
+scripts/ports-check.sh           49 passed / 0 failed             (native port discovery; see §9q)
+go test ./...                    521 test functions; go vet ./... clean
 ```
+
+`scripts/ports-check.sh` is the new gate for this revision: it drives the real
+service against the host's real nsjail and asserts the whole port-discovery
+contract — the scope/protocol/state, the exact-owner attribution, the
+host-isolation assertion, the cross-tenant assertion, the empty-200, liveness,
+determinism, the not-in-metrics assertion, the meta advertisement, and the
+no-leak check. See §9q.
 
 `scripts/metrics-check.sh` is the new gate for this revision: it drives the real
 service, real nsjail and a real FUSE disk and asserts the whole cheap-stream
