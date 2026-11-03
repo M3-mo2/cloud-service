@@ -265,6 +265,16 @@ func PatternList() []string {
 	return out
 }
 
+// wellKnownDoHIPList returns the covered resolver addresses in a stable order.
+func wellKnownDoHIPList() []string {
+	out := make([]string, 0, len(wellKnownDoHIPs))
+	for ip := range wellKnownDoHIPs {
+		out = append(out, ip)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Derive returns the decoy profile for a workspace. It is deterministic in the
 // workspace id, so a workspace always gets the same identity across restarts
 // and across channels, while two workspaces get different addresses (so tenants

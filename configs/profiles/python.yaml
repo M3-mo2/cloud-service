@@ -109,6 +109,12 @@ commands:
   - openssl
   - ssh
   - scp
+  # DNS inspection tools: a developer workspace legitimately resolves and
+  # diagnoses names. (The egress-decoy layer, when the operator turns it on,
+  # answers these with the decoy identity regardless.)
+  - dig
+  - host
+  - nslookup
   # screen/tmux are included because the operator asked for them; see `notes`
   # for where a PTY-based tool does and does not work.
   - screen

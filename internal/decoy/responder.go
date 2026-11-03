@@ -1,12 +1,12 @@
 package decoy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/url"
 	"strconv"
@@ -62,7 +62,10 @@ func (r *Responder) serveBound(ctx context.Context, httpLn, tlsLn net.Listener) 
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			host := strings.TrimSuffix(hello.ServerName, ".")
 			if host == "" {
-				host = r.Profile.IP.String()
+				// No SNI: a client addressed a bare resolver IP. Present a
+				// certificate carrying every covered resolver IP as a SAN so
+				// verification succeeds (never a warning) whichever one it used.
+				return r.CA.LeafForIPs(wellKnownDoHIPList())
 			}
 			return r.CA.Leaf(host)
 		},
@@ -174,6 +177,9 @@ type httpReq struct {
 	Query  string
 }
 
+// readRequest reads an HTTP request head. A client keeps the connection open
+// (it is waiting for the response), so the reader must stop at the end of the
+// header block — reading to EOF would block until the deadline.
 func readRequest(c net.Conn) (httpReq, error) {
 	return readRequestWithLead(c, 0)
 }
@@ -181,15 +187,32 @@ func readRequest(c net.Conn) (httpReq, error) {
 // readRequestWithLead reads a request whose first byte has already been consumed
 // (lead != 0), so the DNS/HTTP discriminator does not lose it.
 func readRequestWithLead(c net.Conn, lead byte) (httpReq, error) {
-	buf, err := io.ReadAll(io.LimitReader(c, 1<<16))
-	if err != nil {
-		return httpReq{}, err
-	}
+	var buf []byte
 	if lead != 0 {
-		buf = append([]byte{lead}, buf...)
+		buf = append(buf, lead)
 	}
-	text := string(buf)
-	lines := strings.Split(text, "\r\n")
+	tmp := make([]byte, 4096)
+	for {
+		if i := bytes.Index(buf, []byte("\r\n\r\n")); i >= 0 {
+			buf = buf[:i]
+			break
+		}
+		if len(buf) > (1 << 16) {
+			break
+		}
+		n, err := c.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			continue
+		}
+		if err != nil {
+			if len(buf) == 0 {
+				return httpReq{}, err
+			}
+			break
+		}
+	}
+	lines := strings.Split(string(buf), "\r\n")
 	if len(lines) == 0 {
 		return httpReq{}, fmt.Errorf("empty request")
 	}

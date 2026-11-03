@@ -235,7 +235,7 @@ func (r *Resolver) txtResponse(hdr dnsmessage.Header, q dnsmessage.Question, pro
 	_ = b.StartQuestions()
 	_ = b.Question(q)
 	_ = b.StartAnswers()
-	_ = b.TXTResource(dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET, TTL: 30}, dnsmessage.TXTResource{TXT: []string{prof.IP.String()}})
+	_ = b.TXTResource(dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeTXT, Class: q.Class, TTL: 30}, dnsmessage.TXTResource{TXT: []string{prof.IP.String()}})
 	out, _ := b.Finish()
 	return out
 }

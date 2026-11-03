@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -117,8 +118,24 @@ func parseAddrMaybe(s string) net.IP {
 // Every intercepted hostname gets a certificate whose SAN is exactly that name,
 // so the interception is seamless for curl, wget and python.
 func (ca *CA) Leaf(host string) (*tls.Certificate, error) {
+	return ca.leafFor(host, nil)
+}
+
+// LeafForIPs returns a certificate with the given IP addresses as SANs, used
+// when a client addresses a bare resolver IP (no SNI): the certificate must
+// carry that IP so verification succeeds rather than warning. The set is fixed
+// and small (the covered DoH/DoT resolvers), so the extra SANs are harmless.
+func (ca *CA) LeafForIPs(ips []string) (*tls.Certificate, error) {
+	return ca.leafFor("", ips)
+}
+
+func (ca *CA) leafFor(host string, ips []string) (*tls.Certificate, error) {
+	cacheKey := host
+	if host == "" {
+		cacheKey = "ips:" + strings.Join(ips, ",")
+	}
 	ca.mu.Lock()
-	if c, ok := ca.leafs[host]; ok {
+	if c, ok := ca.leafs[cacheKey]; ok {
 		ca.mu.Unlock()
 		return c, nil
 	}
@@ -133,10 +150,14 @@ func (ca *CA) Leaf(host string) (*tls.Certificate, error) {
 		return nil, err
 	}
 	now := time.Now()
+	cn := host
+	if cn == "" {
+		cn = "resolver"
+	}
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
-			CommonName:   host,
+			CommonName:   cn,
 			Organization: ca.cert.Subject.Organization,
 		},
 		NotBefore:             now.Add(-time.Hour),
@@ -147,9 +168,14 @@ func (ca *CA) Leaf(host string) (*tls.Certificate, error) {
 	}
 	// A DNS name goes in DNSNames; a bare IP goes in IPAddresses.
 	if ip := parseAddrMaybe(host); ip != nil {
-		tmpl.IPAddresses = []net.IP{ip}
-	} else {
+		tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+	} else if host != "" {
 		tmpl.DNSNames = []string{host}
+	}
+	for _, s := range ips {
+		if ip := parseAddrMaybe(s); ip != nil {
+			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+		}
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)
 	if err != nil {
@@ -157,7 +183,7 @@ func (ca *CA) Leaf(host string) (*tls.Certificate, error) {
 	}
 	leaf := &tls.Certificate{Certificate: [][]byte{der, ca.cert.Raw}, PrivateKey: key}
 	ca.mu.Lock()
-	ca.leafs[host] = leaf
+	ca.leafs[cacheKey] = leaf
 	ca.mu.Unlock()
 	return leaf, nil
 }

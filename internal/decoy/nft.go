@@ -35,16 +35,6 @@ type RulesSpec struct {
 // DefaultRulesSpec builds the rules for a config and workspace.
 func DefaultRulesSpec(cfg Config, workspaceID string) RulesSpec {
 	p := cfg.Derive(workspaceID)
-	var doh []string
-	for ip := range wellKnownDoHIPs {
-		doh = append(doh, ip)
-	}
-	// Stable order for deterministic rules.
-	for i := 1; i < len(doh); i++ {
-		for j := i; j > 0 && doh[j-1] > doh[j]; j-- {
-			doh[j-1], doh[j] = doh[j], doh[j-1]
-		}
-	}
 	return RulesSpec{
 		Table:     "sbxd_decoy",
 		ProfileIP: p.IP.String(),
@@ -52,7 +42,7 @@ func DefaultRulesSpec(cfg Config, workspaceID string) RulesSpec {
 		HTTPPort:  cfg.HTTPPort,
 		HTTPSPort: cfg.HTTPSPort,
 		Mark:      MarkValue,
-		DoHIPs:    doh,
+		DoHIPs:    wellKnownDoHIPList(),
 	}
 }
 
