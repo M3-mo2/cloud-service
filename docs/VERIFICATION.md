@@ -1956,12 +1956,13 @@ Measured, from inside two real workspaces with different limits (w1
 os.statvfs total    268435456               536870912
 stat -f -c %b       65536                   131072        (S=4096, Type: fuseblk)
 df -B1 size         268435456               536870912
-df fstype           -                       -
+df fstype           fuse.ext4               fuse.ext4
 ```
 
-`df` in the curated profile is the busybox-style `df` whose `fstype` column is
-`-` (it does not name a host filesystem), and `stat -f %T` reports `fuseblk` —
-never the host's `zfs`. The three size channels agree with the allowance exactly.
+`df --output=fstype` reports the curated mount's own type `fuse.ext4` (the same
+type `/proc/mounts` and `/proc/self/mountinfo` carry), never the host's `zfs`,
+and `stat -f %T` reports `fuseblk` (the kernel's `statfs` super-magic label for a
+FUSE mount). The three size channels agree with the allowance exactly.
 
 The limit is enforced AT the boundary, with no overshoot. Raw probe against a
 256 MiB allowance (write in 4 MiB chunks until the kernel refuses):
