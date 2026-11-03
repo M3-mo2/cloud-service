@@ -1,4 +1,4 @@
-# sandboxd specification (v0.0.18)
+# sandboxd specification (v0.0.19)
 
 This document is the canonical specification for the sandboxd service. It is a
 faithful copy of the project brief, retained in-repo so implementation and
@@ -15,9 +15,9 @@ belong to the separate frontend product, §2.6.)
 
 - Language: Go 1.22 (the brief targeted 1.22; `go.mod` requires Go 1.23 because
   the mandated koanf YAML parser declares a `go 1.23` floor — see
-  [DECISIONS.md](DECISIONS.md)). The service version string is `0.0.18`
+  [DECISIONS.md](DECISIONS.md)). The service version string is `0.0.19`
   (`model.Version`): it is the highest feature group resolved in DECISIONS.md
-  (which runs to v0.0.18), not the `/v1` API contract version. The two move
+  (which runs to v0.0.19), not the `/v1` API contract version. The two move
   independently — the API prefix changes only on a breaking contract change.
 - OS: Ubuntu Noble (24.04), x86_64.
 - Router: `github.com/go-chi/chi/v5`.
@@ -30,12 +30,12 @@ belong to the separate frontend product, §2.6.)
 - Lint: `golangci-lint` if available; otherwise `go vet ./...` must pass.
 - Sandbox: `nsjail` (may or may not be installed on the host — the service must
   detect and report via `/readyz`, never crash).
-- No external DB. Storage is filesystem JSON under `./data/` in v0.0.18.
+- No external DB. Storage is filesystem JSON under `./data/` in v0.0.19.
 - The service version string (`model.Version`) tracks the highest feature group
-  resolved in [DECISIONS.md](DECISIONS.md) (currently v0.0.18), **not** the `/v1`
+  resolved in [DECISIONS.md](DECISIONS.md) (currently v0.0.19), **not** the `/v1`
   API contract version: the API prefix changes only on a breaking contract
   change, so the two are deliberately decoupled. The decision log's own
-  per-group labels (v0.0.6 … v0.0.18) are the version history this number
+  per-group labels (v0.0.6 … v0.0.19) are the version history this number
   follows.
 - Everything must build with `go build ./...` and pass `go test ./...`.
 - Generate OpenAPI 3.1 spec at `api/openapi.yaml` — it is the source of truth
@@ -54,7 +54,7 @@ request/response bodies are JSON unless stated. All timestamps RFC3339 UTC.
 
 - `GET /healthz` → 200 `{"status":"ok"}`
 - `GET /readyz` → 200 or 503 `{"status":"ready"|"not_ready","nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str},"workspace_limits":{"enabled":bool,"mechanism":str,"proc":bool,"proc_files":[str],"reason":str},"egress_decoy":{"enabled":bool,"ready":bool,"reason":str}}`
-- `GET /v1/meta` → `{"version":"0.0.18","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"workspace_limits":{"enabled":bool,"mechanism":str,"reporting":str,"enforcement":str,"limits":str},"egress_decoy":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
+- `GET /v1/meta` → `{"version":"0.0.19","api_version":"v1","runtimes":["python3"],"limits_defaults":{...},"limits_maxima":{...},"network":{...},"tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"provider_tools_hidden":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str},"workspace_limits":{"enabled":bool,"mechanism":str,"reporting":str,"enforcement":str,"limits":str},"egress_decoy":{"enabled":bool,"ready":bool,"mechanism":str,"limits":str}}`
 - `GET /metrics` → Prometheus text
 
 #### What a workspace can and cannot observe
@@ -118,7 +118,7 @@ is asserted as a known result by `scripts/identity-check.sh`.
 Workspace JSON:
 
 ```json
-{"id":"ws_...","owner_id":"user_...","name":"...","created_at":"...","status":"active","limits":{},"last_activity_at":"..."}
+{"id":"ws_...","owner_id":"user_...","name":"...","created_at":"...","status":"active","limits":{},"last_activity_at":"...","subscription":{},"summary":{}}
 ```
 
 `limits` is `{cpu_cores, memory_mb, disk_mb, max_wall_time_sec, max_runs,
@@ -128,9 +128,56 @@ allow_net, allow_unlimited_runs, allow_tunnels}`; `allow_unlimited_runs` and
 `tunnels.enabled` respectively) before a workspace may request `no_timeout:true`
 runs or quick tunnels.
 
-`status` is `active` or `suspended` (`deleted` exists in the type vocabulary but
-is never persisted: a deleted workspace is removed outright). The status is
-persisted and survives a restart.
+`status` is `active`, `suspended` or `locked` (`deleted` exists in the type
+vocabulary but is never persisted: a deleted workspace is removed outright). The
+status is persisted and survives a restart. `locked` is the **derived** status of
+a lapsed subscription term (see below): it is the automatic consequence of the
+term ending, distinct from `suspended` (a manual operator action), and the way
+out is a **renewal**, not `resume`.
+
+**Subscriptions (a running term).** A workspace may carry a `subscription`: a
+running term with an **absolute expiry instant**. This is an engine feature, not
+a billing feature — the engine owns the clock and the enforcement and stores
+absolute instants (never a "days remaining" counter), so state is recomputed from
+stored times after a restart. A workspace with **no** subscription never expires
+and is never touched by the reaper; that is the default.
+
+- Create with a term: `POST /v1/workspaces` body
+  `{"subscription":{"duration":"30d"}}` **or**
+  `{"subscription":{"expires_at":"2027-01-01T00:00:00Z"}}`. The duration grammar
+  is summed `<number><unit>` pairs, units `s m h d w mo y`; `d`=24h, `w`=7d,
+  **`mo`=30d** and **`y`=365d** are fixed-length approximations, never
+  calendar-exact. A bare integer is refused. Zero/negative/unparseable durations
+  and non-future `expires_at` are `422 subscription_invalid`.
+- Extend (renew): `POST /v1/workspaces/{id}/subscription/extend` with the same
+  body. While the term is **live** the extension **ADDS** to the expiry (an early
+  renewer keeps the whole paid term; an absolute `expires_at` earlier than the
+  live one is refused, and a live term is never shortened). After it has
+  **lapsed** the extension starts from **now** and **unlocks** the workspace,
+  restoring service. A server `max_duration` ceiling is enforced. Extending a
+  deleted workspace is `404` and never resurrects it.
+- Locking (automatic, at `expires_at`): the reaper stops running runs, kills
+  sessions and detached processes, deletes tunnels and **unmounts the disk
+  image** (releasing `fuse2fs`) while keeping every byte of data. Refused while
+  locked (`403 subscription_expired`): `exec`, `runs`, `sessions`, `tunnels`,
+  `packages/install` and every mutating `files` op. Allowed while locked:
+  `GET /v1/workspaces/{id}` and its `summary`, `GET /v1/workspaces`, `GET /usage`,
+  file reads, and `DELETE`.
+- Deletion (automatic, at `expires_at + grace_period`): unmount, then purge the
+  files, `disk.img` and metadata. A manual `DELETE` works at any time, including
+  while locked.
+- Config: `subscription.enabled` (default true), `default_duration` (**empty =
+  no expiry**), `max_duration` (`365d`), `grace_period` (`168h`), `reap_interval`
+  (`60s`). The defaults change the behaviour of no existing workspace.
+- A **derived `summary`** is present on `GET /v1/workspaces/{id}` and on every
+  item of `GET /v1/workspaces`, computed from stored fields with no directory
+  walk: `state` (`active`/`expiring_soon`/`locked`/`unlimited`, threshold
+  `min(10% of the term, 24h)`), `age_sec`/`created_at`, `last_activity_at`,
+  `runs{total,active}`, `disk{used_bytes,limit_bytes}`, `profile`, and
+  `subscription{state,expires_at,remaining_sec,grace_ends_at,extensions,locked_at}`.
+  `remaining_sec` is clamped at 0 and is never negative; `state` disambiguates a
+  0. The numbers agree with enforcement: `remaining_sec: 0` with `state:locked`
+  means the workspace really is refusing compute.
 
 **`PATCH` — runtime-mutable settings.** All fields are optional; an absent field
 **or an explicit `null`** keeps the current value (a `null` never resets a field
@@ -564,7 +611,7 @@ What is **still not implemented** (the honest non-goal):
 
 Stated precisely: **stop-everything for a workspace exists natively now;
 supervision (desired-state restart/autostart) remains a documented non-goal for
-this version** (v0.0.18). Where such a capability would belong if built — an
+this version** (v0.0.19). Where such a capability would belong if built — an
 engine-level supervisor versus the frontend restarting runs — is recorded in
 [DECISIONS.md](DECISIONS.md) #61. **It is deliberately not implemented in this
 version.**

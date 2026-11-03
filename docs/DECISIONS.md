@@ -1781,12 +1781,194 @@ show the workspace its own size, and that `df`/`stat -f`/`os.statvfs` agree with
 the allowance while a write past it fails `ENOSPC`; measured `131 passed / 0
 failed / 2 skipped` (from 113/0/2), green five consecutive runs.
 
+## v0.0.19 — workspace subscriptions (a term) and a fast workspace summary
+
+Two features, designed as separate code: a **subscription** (a running term with
+an absolute expiry, enforced by a reaper) and a **workspace summary** (a cheap
+derived view on the get, the list and `/v1/meta`). Both are config-gated, and
+**their defaults change the behaviour of no existing workspace or gate**.
+
+### ADR 87 — the engine owns the clock, not the billing; absolute instants, no counters
+
+**Decision.** A workspace carries an optional `model.Subscription` holding
+*absolute instants*: `GrantedAt`, `ExpiresAt`, `RenewedAt`, `LockedAt`,
+`GraceEndsAt`, and an `Extensions` count. A **nil subscription (or a zero
+`ExpiresAt`) means NO expiry** and is the default. The set of automatic
+behaviours is decided by a **pure function** of `(now, subscription, config)` in
+`internal/subscription`, unit-testable without a daemon, and a single periodic
+reaper (copied from the shape of `disk_watchdog.go`, the only existing ticker — a
+goroutine with one `time.NewTicker` and one done channel) applies it.
+
+**Why.** This service is a **pure sandbox engine**. Accounts, billing, plans and
+quotas live in a separate Telegram-bot product that calls this API, so the engine
+must not implement billing or money. It owns the **clock** and the
+**enforcement**; the client owns *why* a term is what it is. Therefore the engine
+stores an **absolute expiry instant**, never a "days remaining" counter: a
+renewal is the client sending a new/extended expiry. This keeps billing out of
+the engine and makes restarts trivially correct — state is recomputed from
+stored absolute times and never from in-memory counters. The reaper holds **no**
+term state of its own.
+
+**Config-gated, defaults change nothing.** The `subscription:` block has
+`enabled` (default `true`), `default_duration` (**empty = no expiry**),
+`max_duration` (`365d`), `grace_period` (`168h`) and `reap_interval` (`60s`). A
+workspace created without a subscription (and with `default_duration` empty) has
+no `ExpiresAt`, is never selected by the reaper, and behaves exactly as before.
+With `enabled: false` the loop does not run at all, so nothing is automatically
+locked or deleted; a per-request term is still accepted and still reads `locked`
+once lapsed (reads never mutate, and the derived status is a pure function of the
+stored instants), but no resource teardown happens.
+
+**Proof.** Unit tests in `internal/subscription` and
+`internal/service/subscription_test.go` inject a mutable clock and assert the
+whole lifecycle without sleeping; `scripts/subscription-check.sh` drives the REAL
+service and nsjail with a compressed clock (`grace_period` seconds,
+`reap_interval` seconds) and asserts the same rules end to end.
+
+### ADR 88 — the duration grammar, and `mo`/`y` are fixed-length approximations
+
+**Decision.** A term is given as **either** a `duration` string (the engine
+computes `expires_at = now + duration`) **or** an absolute RFC3339 `expires_at`
+(the client owns its calendar). The duration grammar is one or more
+`<number><unit>` pairs summed together, units `s m h d w mo y`, where `d`=24h,
+`w`=7d, **`mo`=30d** and **`y`=365d**. A **bare integer is refused** (it is
+ambiguous: seconds? minutes?) — a unit suffix is required. Zero, negative,
+fractional and unparseable durations are `422 subscription_invalid`. Go's
+`time.ParseDuration` only reaches hours, so this is a small dedicated parser
+(`internal/subscription.ParseDuration`) with an explicit ceiling (100 years) so a
+typo cannot overflow `time.Duration`.
+
+**Why.** `mo` and `y` are **fixed-length approximations, never calendar-exact**:
+30 days is not a month and 365 days is not a year. This is documented here and in
+the API/config/ADR commentary, and the parser's `mo`/`y` handling is asserted in
+unit tests. A client that needs a calendar month or year must send an absolute
+`expires_at`; the engine never pretends to compute a calendar.
+
+### ADR 89 — `locked` is not `suspended`; the exact allow/refuse split
+
+**Decision.** A distinct `locked` status is added. It is **not** the same as the
+existing `suspended`: `suspended` is a **manual, reversible-by-API** action
+(`POST .../suspend` / `.../resume`, `409 workspace_suspended`); `locked` is the
+**automatic** consequence of a lapsed term and the way out is a **renewal**
+(`POST .../subscription/extend`), not `resume`. The refused code is a distinct
+`403 subscription_expired` so a client can tell the two causes apart. `active`
+and `deleted` stay. The derived status is a pure function of the stored instants
+(`now >= expires_at`, or a recorded `LockedAt`), so a lapsed workspace reads
+`locked` even before the reaper has physically torn it down; the reaper skips a
+`suspended` workspace (a manual operator action is left alone), and the persisted
+status is never overridden for `suspended`/`deleted`.
+
+**Locking actively stops using resources, not merely labels.** On locking the
+reaper stops running runs, kills sessions and detached processes, deletes the
+workspace's tunnels, and **unmounts the per-workspace disk image** (releasing the
+`fuse2fs` process) while keeping every byte of user data.
+
+**The exact split, stated and asserted:**
+
+- **Refused while locked** (`403 subscription_expired`): `exec`, `runs`,
+  `sessions`, `tunnels`, `packages/install`, and every **mutating** `files`
+  operation (`PUT /files/content`, `DELETE /files`, `POST /files/mkdir`,
+  `POST /files/rename`, `POST /files/upload`). A locked workspace cannot consume
+  compute — asserted: a running workload is stopped and the process inventory
+  drains to zero.
+- **Allowed while locked**: `GET /v1/workspaces/{id}` and its summary,
+  `GET /v1/workspaces` (list), `GET /usage`, `GET /files` and every file read
+  (`stat`, `content`, `download`), and `DELETE /v1/workspaces/{id}` so it can be
+  removed early.
+
+**Enforcement is API-side, not merely reaper-side.** `ensureActive` refuses on
+the *derived* status, so the lock is enforced from the stored instants even if
+the reaper has not yet run or is disabled. The mutating file methods gain the
+same gate. The summary and the gate read the same clock and the same pure
+function, so if the summary says `remaining_sec: 0` with `state: locked` the
+workspace really is refusing compute (asserted).
+
+### ADR 90 — extension semantics: additive while live, from-now when lapsed, never shorten
+
+**Decision.** `POST /v1/workspaces/{id}/subscription/extend` applies a renewal:
+
+- **While the term is still live:** the extension **ADDS** to the existing
+  expiry (`ExpiresAt += duration`), so a user who renews early is not penalised.
+  An absolute `expires_at` **earlier** than the live one is refused
+  (`422 subscription_would_shorten`); a live term is **never shortened** (silently
+  shortening a paid term is the worst option, so the engine refuses rather than
+  clamps).
+- **After the term has lapsed (`locked`):** the extension starts from **now** and
+  **unlocks** the workspace, restoring service. This is the renewal flow and the
+  most important case; it is asserted end to end (exec works after).
+- A server-side ceiling (`subscription.max_duration`, measured from now) is
+  enforced: beyond it is `422 max_duration_exceeded`.
+- Extending a `deleted` workspace is `404` and **never resurrects** a purged one
+  (asserted: the metadata does not come back).
+
+### ADR 91 — the reaper: pure decision, injected clock, idempotent, crash-safe, backwards-clock rule
+
+**Decision.** The reaper's decision is a **pure function** `Decide(now, sub,
+grace)` returning `none` / `lock` / `delete`:
+
+```
+no expiry                          -> none   (unlimited)
+now <  ExpiresAt                   -> none   (live)
+ExpiresAt <= now < GraceEndsAt     -> lock
+now >= GraceEndsAt                 -> delete
+```
+
+The loop is a single goroutine with one ticker (copied from `disk_watchdog.go`),
+started from `main` beside it, gated by `subscription.enabled`. The clock is
+**injected** (`func() time.Time`, the `now` field), so tests are deterministic
+and never sleep for days, and the acceptance harness drives a compressed clock
+through config.
+
+**Idempotent and crash-safe.** Lock and delete are safe to re-run after a crash
+mid-operation: an already-unmounted workspace is a no-op
+(`fusermount -u` on a non-mount returns nil), an already-gone `disk.img` is a
+no-op, and a delete of an already-gone tree is handled. Verified by re-running a
+tick twice (asserted) and by a `LockedAt` guard that keeps a second lock from
+overwriting the first. Tear-down order is **stop compute → unmount → (for delete)
+purge**, and nothing leaks: no `fuse2fs`, no mount, no cgroup, no netns, no orphan
+`disk.img` (asserted in the gate). One workspace's failure is logged and the loop
+continues to the others.
+
+**The backwards-clock rule.** A backwards wall-clock jump must not cause a
+delete. Every comparison is against a **stored absolute instant**, never an
+in-memory countdown, so a backwards jump can only *delay* an action. To make that
+explicit and robust, a `delete` is **refused while `now` is before the recorded
+`LockedAt`** (a non-monotonic reading): the workspace stays locked (service is
+already stopped) and is deleted on a later, monotonic tick. Asserted in the pure
+function (boundary: at exactly `LockedAt` a delete is allowed again) and against
+the real reaper (a workspace whose `LockedAt` is rewritten into the future
+survives ticks).
+
+### The fast workspace summary (Feature 2)
+
+**Decision.** A `WorkspaceSummary` is computed from stored fields and **cheap**
+syscalls only — no directory-tree walk, no heavy work — and is exposed inside
+`GET /v1/workspaces/{id}`, as a `summary` field on **every** item of
+`GET /v1/workspaces` (so a dashboard renders a list in one request), and
+advertised in `GET /v1/meta` under `subscriptions`. It carries `state`
+(`active`/`expiring_soon`/`locked`/`unlimited`, threshold
+`min(10% of the term, 24h)`), `age_sec`/`created_at`, `last_activity_at`,
+`runs{total,active}`, `disk{used_bytes,limit_bytes}` and `profile`. `disk.used`
+is a single `statvfs` of the already-mounted filesystem (0 when not mounted — it
+never walks). `remaining_sec` is clamped at 0 and is **never negative**; `state`
+disambiguates a 0 (unlimited vs locked vs the last second of a live term). The
+numbers agree with enforcement because both read the same pure function.
+
+**Status derivation.** The API renders the **derived** status (`DeriveStatus`),
+so a lapsed-but-not-yet-reaped workspace already reads `locked` and cannot
+contradict enforcement; the persisted `Status` is only changed by the reaper (to
+`locked`) and by a renewal (back to `active`, clearing `LockedAt`). A record
+edited so that it has an expiry but no `GraceEndsAt` still decides correctly:
+`Decide` derives the grace end from `ExpiresAt + grace` when the stored value is
+zero.
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.
 - **Error codes**: `unauthorized`, `forbidden`, `not_found`, `conflict`, `workspace_suspended`,
   `too_many_sessions`, `session_ended`, `tunnels_disabled`, `too_many_tunnels`,
-  `unknown_profile`, `session_needs_interpreter`, `validation`,
+  `unknown_profile`, `session_needs_interpreter`, `subscription_expired`, `subscription_invalid`,
+  `max_duration_exceeded`, `subscription_would_shorten`, `validation`,
   `unprocessable`, `not_directory`, `payload_too_large`, `timeout`, `tunnel_url_unavailable`,
   `unavailable`, `internal`. _Rationale_: fixed vocabulary mapped 1:1 from HTTP status.
 - **CWD default**: `/` normalizes to the workspace root `/workspace` inside the sandbox.

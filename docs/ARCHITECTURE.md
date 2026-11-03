@@ -5,7 +5,7 @@
 > sandbox. Diagrams are [Mermaid](https://mermaid.js.org/); they render on
 > GitHub/GitLab and in most Markdown viewers.
 
-- Version: **0.0.18** (pre-alpha)
+- Version: **0.0.19** (pre-alpha)
 - Language: Go 1.23+
 - Isolation: [`nsjail`](https://github.com/google/nsjail) (Linux namespaces,
   cgroups v2, seccomp, rlimits)
@@ -71,7 +71,7 @@ services** that call it on a user's behalf — not the users themselves.
 
 See [DECISIONS.md](DECISIONS.md) #54 for the decision and its consequences.
 
-### What it deliberately is *not* (v0.0.18)
+### What it deliberately is *not* (v0.0.19)
 
 Pre-alpha scope. It is a single-node, static-key service. Not yet: a hardened
 public-internet multi-tenant platform, a distributed scheduler, or a
@@ -149,6 +149,7 @@ flowchart TD
     SVC --> STORE
     SVC --> RUN
     SVC --> WS
+    SVC --> SUB["internal/subscription (pure: parser, decision, derivations)"]
 
     RUN --> CFGS["configs (embedded template)"]
     RUN --> MODEL
@@ -169,12 +170,13 @@ flowchart TD
 | `internal/model` | `types.go`, `errors.go` | Domain types (Workspace, Run, Limits), ULID IDs, API error type |
 | `internal/auth` | `auth.go` | Static bearer keys → `principal_id`, constant-time compare |
 | `internal/api` | `router.go`, `*.go` | chi routes, handlers, DTOs, JSON error envelope, Prometheus metrics, audit log |
-| `internal/service` | `service.go`, `files.go`, `exec.go`, `runs.go`, `control.go`, `packages.go`, `sessions.go` | Orchestration, ownership checks, limits, retention, run and session registries |
+| `internal/service` | `service.go`, `files.go`, `exec.go`, `runs.go`, `control.go`, `packages.go`, `sessions.go`, `subscription.go` | Orchestration, ownership checks, limits, retention, run and session registries, and the subscription lifecycle + reaper loop |
+| `internal/subscription` | `subscription.go` | The PURE subscription parts: the duration-grammar parser, the reaper decision function `Decide(now, sub, grace)`, and the derived summary numbers. No I/O, no daemon |
 | `internal/workspace` | `fs.go`, `path.go`, `diskfs.go` | Safe rooted filesystem, traversal/symlink defense, disk quota accounting, and the per-workspace fuse2fs ext4 image manager |
 | `internal/storage` | `store.go` | Atomic JSON metadata + run-log/session-output files on disk |
 | `internal/executor` | `executor.go`, `nsjail.go`, `live.go`, `identity.go`, `fake.go`, `pty_relay.py` | nsjail config rendering, UID/GID mapping, one-shot and interactive process lifecycles, capped capture, PTY relay helper |
 | `configs` | `nsjail_python.cfg.tmpl`, `embed.go` | nsjail TextProto template (also compiled into the binary) |
-| `scripts` | `acceptance.sh`, `session-nsjail-check.sh`, `nsjail-stub.py` | End-to-end acceptance transcript; privileged real-nsjail terminal-session acceptance; test stub |
+| `scripts` | `acceptance.sh`, `session-nsjail-check.sh`, `subscription-check.sh`, `nsjail-stub.py` | End-to-end acceptance transcript; privileged real-nsjail terminal-session + subscription acceptance; test stub |
 
 Total ≈ 6.4k lines of Go across 8 packages, plus one embedded template and an
 OpenAPI 3.1 spec (`api/openapi.yaml`).
@@ -423,6 +425,9 @@ stateDiagram-v2
     suspended --> active: POST /{id}/resume
     active --> active: POST /{id}/stop (stops runs, stays active)
     suspended --> suspended: POST /{id}/stop (idempotent)
+    active --> locked: subscription term lapses (reaper)
+    locked --> active: POST /{id}/subscription/extend (renewal)
+    locked --> [*]: grace ends (reaper deletes) / DELETE
 ```
 
 - **`suspend`** refuses *new* work (`exec`, run creation, session creation, and
@@ -434,6 +439,11 @@ stateDiagram-v2
 - **`stop`** kills the workspace's running/queued runs but leaves it `active`
   (new work is still accepted). It is a distinct control from `suspend`: same
   kill path, opposite policy on future work.
+- **`locked`** is the automatic consequence of a lapsed subscription term; it is
+  driven by a periodic reaper (not an API call) and the way out is a renewal
+  (`POST /{id}/subscription/extend`), not `resume`. The API renders the
+  **derived** status, so a lapsed-but-not-yet-reaped workspace already reads
+  `locked`. See §4.6.
 
 Both `status` and the mutable `limits` are written through `store.UpdateWorkspace`
 (atomic write-temp + rename), so a PATCH/suspend survives a process restart and
@@ -449,6 +459,40 @@ creation/input/output, and the read-only `GET .../usage` and `GET .../packages`
 observations. The split is not just naming: **suspension gates the
 work-starting control/data operations** (`exec`, `runs`, `sessions`, package
 management) while pure reads still answer.
+
+### 4.6 Subscriptions and the reaper (a term enforced by a clock, not a counter)
+
+A workspace may carry a **subscription**: a `model.Subscription` of *absolute*
+instants (`GrantedAt`, `ExpiresAt`, `RenewedAt`, `LockedAt`, `GraceEndsAt`,
+`Extensions`). This service is a pure sandbox engine, so it owns the **clock**
+and the **enforcement** but not billing: it stores an absolute expiry and a
+renewal is the client sending a new/extended expiry. Nothing about a term lives
+in memory — it is recomputed from the stored instants, so a restart is trivially
+correct.
+
+The pure half lives in `internal/subscription`:
+
+- `ParseDuration` — the `s m h d w mo y` grammar (`mo`=30d, `y`=365d are
+  fixed-length approximations). A bare integer is refused.
+- `Decide(now, sub, grace)` — the reaper's whole policy as one pure function:
+  `none` while live or when unlimited, `lock` from `expires_at`, `delete` from
+  `expires_at + grace`. A `delete` is refused while `now` is before a recorded
+  `LockedAt` (the backwards-clock rule).
+- `Derivations` — the cheap summary numbers (`state`, `remaining_sec`, …).
+
+The impure half is `internal/service/subscription.go`: `StartReaper` copies the
+`disk_watchdog.go` shape (one goroutine, one `time.NewTicker`, one done channel),
+started from `main` beside it and gated by `subscription.enabled`. Each tick
+calls `ReapSubscriptions(now)`, which for every workspace with an expiry applies
+the pure decision: **lock** (stop runs, kill sessions/detached processes, delete
+tunnels, unmount the disk image — keeping every byte of data) or **delete**
+(unmount, purge files/`disk.img`/metadata). Lock and delete are idempotent and
+crash-safe, one workspace's failure is logged and never stops the loop, and a
+workspace with no subscription is never selected. The clock is injected
+(`func() time.Time`) so a test — and the acceptance harness, through a compressed
+config clock — assert days-long semantics in seconds. The `summary` exposed on
+the get and the list is the same pure `Derivations` output, so it can never
+disagree with enforcement.
 
 ---
 
@@ -977,6 +1021,7 @@ flowchart LR
 | `POST .../{id}/suspend` | refuse new work + stop runs | 200 | 404 |
 | `POST .../{id}/resume` | accept work again | 200 | 404 |
 | `POST .../{id}/stop` | stop all runs, stay active | 200 | 404 |
+| `POST .../{id}/subscription/extend` | renew a term (additive live / from-now+unlock when locked) | 200 | 404, 422 `subscription_invalid`/`max_duration_exceeded`/`subscription_would_shorten` |
 | `GET .../{id}/usage` | disk bytes, run counters, limits | 200 | 404 |
 | `GET .../{id}/packages` | private-tier packages + shared status | 200 | 403, 404 |
 | `POST .../{id}/packages/install` | pip install into private tier | 200 | 422 bad req, 409 suspended, 503 |
@@ -1060,6 +1105,12 @@ sessions:                    # interactive terminal sessions (all defaulted)
   shell: "/bin/sh"           # default shell in the image
   kill_grace_sec: 3          # SIGHUP → SIGKILL grace
   start_probe_ms: 250        # startup reap window → honest failed vs running
+subscription:                # workspace terms (engine clock; no billing)
+  enabled: true              # false = the reaper does not run (no lock/delete)
+  default_duration: ""       # empty = a workspace that does not ask gets NO expiry
+  max_duration: "365d"       # server ceiling, measured from now
+  grace_period: "168h"       # 7 days locked before deletion
+  reap_interval: "60s"       # reaper tick
 keys:                        # service bearer keys → principal_id (1:N allowed);
                              # held by the frontend, never by end users
   - { key: "dev-key-please-rotate", principal_id: "user_dev" }
@@ -1153,11 +1204,11 @@ set `NSJAIL=/usr/local/bin/nsjail` and it will verify the binary is real.
 
 Deferred to v0.1 (documented, not bugs):
 
-- **SSE log streaming** — v0.0.18 polls logs with `offset`/`limit`.
+- **SSE log streaming** — v0.0.19 polls logs with `offset`/`limit`.
 - **Multi-node storage / sharding** — storage is a local filesystem.
 - **Dynamic/DB authentication** — keys are static in config (bearer auth itself
   is exercised by `TestAuth*`).
-- **Per-UID-per-workspace isolation** — v0.0.18 uses a shared `sandbox` UID/GID
+- **Per-UID-per-workspace isolation** — v0.0.19 uses a shared `sandbox` UID/GID
   with per-run user namespaces + cgroups.
 - **Kernel-enforced per-run disk quota** — disk is accounted on the file API
   path and rechecked with `du`; the sandbox process is bounded by `rlimit_fsize`
@@ -1181,7 +1232,12 @@ suspend vs stop, run filter/purge, usage accounting), the two-tier package model
 the conditional resolver mounts, terminal sessions (the PTY helper vs its
 alternatives, stdin-pipe vs `--pass_fd`, signal-vs-stop, idle/lifetime values,
 restart/cleanup, output reuse and injection-proofing), the engine/frontend
-product boundary (#54), and first-class file browsing/viewing (#55–58).
+product boundary (#54), first-class file browsing/viewing (#55–58), the
+per-workspace disk boundary and curated `/proc` (ADR 85/86), and workspace
+subscriptions: the engine clock and absolute instants (ADR 87), the duration
+grammar with `mo`/`y` approximations (ADR 88), `locked` vs `suspended` and the
+allow/refuse split (ADR 89), the extension semantics (ADR 90), and the reaper
+(pure decision, injected clock, idempotent, backwards-clock rule; ADR 91).
 
 ---
 

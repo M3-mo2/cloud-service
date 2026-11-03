@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: sandboxd API
-  version: 0.0.18
+  version: 0.0.19
   description: |
     Secure per-principal code execution backend. All `/v1` endpoints require a
     static bearer API key. All timestamps are RFC3339 UTC.
@@ -203,6 +203,37 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+  /v1/workspaces/{workspaceId}/subscription/extend:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceId"
+    post:
+      operationId: postv1_workspaces_workspaceId_subscription_extend
+      tags: [Workspaces]
+      summary: Extend (renew) a workspace's subscription term
+      description: >
+        Applies a renewal. While the term is live the extension ADDS to the
+        existing expiry (an early renewer keeps the whole paid term; an absolute
+        expires_at earlier than the live one is refused with 422
+        subscription_would_shorten; a live term is never shortened). After the
+        term has lapsed (locked) the extension starts from NOW and UNLOCKS the
+        workspace, restoring service. A server-side max_duration ceiling is
+        enforced (422 max_duration_exceeded). Extending a deleted workspace is
+        404 and never resurrects it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SubscriptionRequest" }
+      responses:
+        "200":
+          description: Extended
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceAction" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
   /v1/workspaces/{workspaceId}/stop:
     parameters:
       - $ref: "#/components/parameters/WorkspaceId"
@@ -1185,6 +1216,10 @@ components:
         - too_many_tunnels
         - unknown_profile
         - session_needs_interpreter
+        - subscription_expired
+        - subscription_invalid
+        - max_duration_exceeded
+        - subscription_would_shorten
         - validation
         - unprocessable
         - not_directory
@@ -1280,7 +1315,7 @@ components:
       type: object
       required: [version, api_version, runtimes, limits_defaults]
       properties:
-        version: { type: string, examples: ["0.0.18"] }
+        version: { type: string, examples: ["0.0.19"] }
         api_version: { type: string, examples: [v1] }
         runtimes:
           type: array
@@ -1377,6 +1412,29 @@ components:
             reporting: { type: string }
             enforcement: { type: string }
             limits: { type: string }
+        subscriptions:
+          type: object
+          description: >-
+            Workspace-subscription capability, reported truthfully. `enabled` is
+            whether the reaper loop runs; `default_duration` is the term a create
+            gets with no subscription (empty = NO expiry, unchanged behaviour);
+            `duration_grammar` repeats that mo=30d and y=365d are fixed-length
+            approximations; `expiry_semantics` states add-while-live /
+            from-now-when-lapsed / never-shorten; `locked_status` states that
+            locked is automatic (distinct from suspended), refused work is 403
+            subscription_expired, and reads/usage/delete stay allowed.
+          properties:
+            enabled: { type: boolean }
+            default_duration: { type: string }
+            max_duration: { type: string }
+            grace_period: { type: string }
+            reap_interval: { type: string }
+            duration_grammar: { type: string }
+            expiry_semantics: { type: string }
+            locked_status: { type: string }
+            summary_present_on:
+              type: array
+              items: { type: string }
     Limits:
       type: object
       properties:
@@ -1404,9 +1462,77 @@ components:
           description: "The named, explicit-allowlist tool profile the workspace was created with. Immutable: it decides which tools exist in the workspace."
           examples: ["python"]
         created_at: { type: string, format: date-time }
-        status: { type: string, enum: [active, suspended, deleted] }
+        status:
+          type: string
+          enum: [active, suspended, locked, deleted]
+          description: "The DERIVED status: active; suspended (a manual operator action); locked (the automatic consequence of a lapsed subscription term — the way out is a renewal, not resume); deleted (terminal). A lapsed-but-not-yet-reaped workspace already reads locked, so it cannot contradict enforcement."
         limits: { $ref: "#/components/schemas/Limits" }
         last_activity_at: { type: string, format: date-time }
+        subscription:
+          allOf:
+            - $ref: "#/components/schemas/Subscription"
+          description: "The stored term, or absent for a workspace with no expiry (the default)."
+        summary:
+          allOf:
+            - $ref: "#/components/schemas/WorkspaceSummary"
+          description: "Cheap derived view, present on the get and on every list item."
+    Subscription:
+      type: object
+      description: "A workspace's running term, stored as ABSOLUTE instants (never a days-remaining counter). A nil/absent subscription or a zero expires_at means no expiry (unlimited)."
+      properties:
+        granted_at: { type: string, format: date-time, description: "When the current term began (first grant)." }
+        expires_at: { type: string, format: date-time, description: "The absolute enforcement point. Absent/zero = no expiry." }
+        renewed_at: { type: string, format: date-time, description: "Last extension (absent when never)." }
+        locked_at: { type: string, format: date-time, description: "When the reaper locked it (absent when never). Cleared by a renewal." }
+        grace_ends_at: { type: string, format: date-time, description: "expires_at + the configured grace; the deletion instant." }
+        extensions: { type: integer, description: "How many times the term was extended." }
+    SubscriptionRequest:
+      type: object
+      description: "A create/extend term: exactly one of duration or expires_at. duration is summed <number><unit> pairs (s m h d w mo y); mo=30d and y=365d are FIXED-LENGTH approximations, never calendar-exact. A bare integer is refused."
+      properties:
+        duration:
+          type: string
+          description: "e.g. 30d, 1d12h, 1mo. The engine computes expires_at = now + duration (additive while a term is live)."
+          examples: ["30d", "1d12h"]
+        expires_at:
+          type: string
+          format: date-time
+          description: "An absolute RFC3339 instant (the client owns its calendar). Must be in the future."
+    WorkspaceSummary:
+      type: object
+      required: [state, age_sec, runs, disk, profile]
+      properties:
+        state: { type: string, enum: [active, expiring_soon, locked, unlimited], description: "expiring_soon when <= min(10% of the term, 24h) remains." }
+        age_sec: { type: integer, format: int64, description: "Seconds since created_at (0 if the clock is behind)." }
+        created_at: { type: string, format: date-time }
+        last_activity_at: { type: string, format: date-time }
+        runs:
+          type: object
+          required: [total, active]
+          properties:
+            total: { type: integer }
+            active: { type: integer }
+        disk:
+          type: object
+          required: [used_bytes, limit_bytes]
+          properties:
+            used_bytes: { type: integer, format: int64, description: "A single statvfs of the mounted filesystem; 0 when not mounted (never a directory walk)." }
+            limit_bytes: { type: integer, format: int64 }
+        profile: { type: string }
+        subscription:
+          allOf:
+            - $ref: "#/components/schemas/SubscriptionSummary"
+          description: "Present only for a workspace with an expiry."
+    SubscriptionSummary:
+      type: object
+      required: [state, remaining_sec, extensions]
+      properties:
+        state: { type: string, enum: [active, expiring_soon, locked, unlimited] }
+        expires_at: { type: string, format: date-time }
+        remaining_sec: { type: integer, format: int64, description: "Whole seconds until expiry, CLAMPED AT 0 and never negative. state disambiguates a 0 (unlimited vs locked vs the last second of a live term)." }
+        grace_ends_at: { type: string, format: date-time }
+        extensions: { type: integer }
+        locked_at: { type: string, format: date-time }
     CreateWorkspaceRequest:
       type: object
       required: [name]
@@ -1417,6 +1543,10 @@ components:
           description: "Tool profile name from GET /v1/meta's profiles list. Omit to use the server default. An unknown name is 422 unknown_profile."
           examples: ["python"]
         limits: { $ref: "#/components/schemas/Limits" }
+        subscription:
+          allOf:
+            - $ref: "#/components/schemas/SubscriptionRequest"
+          description: "Grant a term. Omit to get the configured default (no expiry unless subscription.default_duration is set)."
     PatchLimits:
       type: object
       description: "Partial limits update. An absent field or explicit null keeps the current value."

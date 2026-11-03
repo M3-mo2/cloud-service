@@ -1,6 +1,6 @@
 # Verification
 
-Results for sandboxd v0.0.18 against the acceptance criteria in the spec.
+Results for sandboxd v0.0.19 against the acceptance criteria in the spec.
 
 Environment:
 
@@ -103,7 +103,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **353** (349 unit + 4 `integration`-tagged), including regression
+Test functions: **390** (386 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -142,14 +142,37 @@ tunnels (`TestAllocatorReserveRelease`, `TestMatchTunnelURL`,
 `TestDeleteTunnelStopsProcessAndRecord`, `TestStopSuspendDeleteReleaseTunnels`,
 `TestPatchAllowTunnelsRejectedWhenServerDisabled`,
 `TestCreateWorkspaceAllowTunnelsRejectedWhenServerDisabled`,
-`TestMetaReportsTunnelsCapability`; see §9g).
+`TestMetaReportsTunnelsCapability`; see §9g), and for workspace subscriptions
+(the duration parser, the pure decision function and the summary derivation,
+including the boundary instants exactly at expiry and exactly at grace end:
+`TestParseDurationValid`, `TestParseDurationInvalid`,
+`TestParseDurationZeroSumIsRejected`, `TestParseDurationOverflow`,
+`TestDecideBoundaries`, `TestDecideBackwardsClockNeverDeletes`,
+`TestDecideGraceFromStoredGraceEndsAt`, `TestDerivationsUnlimited`,
+`TestDerivationsStates`, `TestDerivationsShortTermNotAlwaysExpiringSoon`,
+`TestExpiringSoonWindow`, `TestApproximationConstants`; and the lifecycle with an
+injected clock: `TestCreateWithDurationSetsExpiry`,
+`TestCreateWithNoSubscriptionIsUnlimited`, `TestCreateDefaultDurationConfig`,
+`TestCreateWithAbsoluteExpiresAt`, `TestCreateSubscriptionValidation`,
+`TestExtendWhileLiveAddsForward`, `TestExtendLiveWithEarlierExpiresAtRefused`,
+`TestExtendLiveWithLaterExpiresAtAccepted`, `TestReaperLocksAtExpiry`,
+`TestReaperDeleteAfterGrace`, `TestExtendWhileLockedUnlocks`,
+`TestExtendDeletedFails`, `TestReaperIdempotent`,
+`TestReaperBackwardsClockDoesNotDelete`, `TestReaperSkipsSuspended`,
+`TestSummaryDerivationAgreesWithLock`; and the API surface:
+`TestCreateWithDurationShowsSubscriptionAndSummary`,
+`TestCreateWithoutSubscriptionIsUnlimited`,
+`TestCreateSubscriptionValidation`, `TestExtendWhileLiveMovesForward`,
+`TestExtendWouldShortenRefused`, `TestListItemsCarrySummary`,
+`TestLockedRefusesComputeAllowsReads`, `TestExtendLockedRestoresService`,
+`TestMetaAdvertisesSubscriptions`; see §9l).
 
 The count is the number of `^func Test` declarations across every `*_test.go`
 file (the same measure `scripts/docs-consistency.sh` asserts against):
 
 ```
 $ find . -name '*_test.go' -exec grep -hE '^func Test' {} + | wc -l
-316
+390
 ```
 
 ## 2. Probes
@@ -1861,9 +1884,152 @@ measured real egress IP — no gate regresses. `go test ./...` passes; the suite
 adds `11` test functions (net `347`, from `336`), and
 `scripts/docs-consistency.sh` stays green.
 
+## 9l. Workspace subscriptions (this revision)
+
+A workspace may carry a **subscription**: a running term with an **absolute
+expiry instant**. This is an engine feature, not a billing feature — the engine
+owns the **clock** and the **enforcement** and stores absolute instants (never a
+"days remaining" counter), so state is recomputed from stored times after a
+restart and is never held in memory. A workspace with **no** subscription never
+expires and is never touched by the reaper; that is the default, so the feature
+changes the behaviour of no existing workspace. The pure parts (the duration
+parser, the reaper decision, the summary derivation) live in
+`internal/subscription` and are unit-tested with injected boundary instants; the
+loop and the effects live in `internal/service/subscription.go`.
+
+### 9l.1 The binary under test
+
+The tested binary is a **fresh build of the committed tree** and carries a
+`strings`-level positive control, so a stale artifact cannot pass the gate:
+
+```
+$ go build -o /tmp/sbx-verify ./cmd/sandboxd
+$ md5sum /tmp/sbx-verify
+09d022b48b89e98ab948bd39bf42765b  /tmp/sbx-verify
+$ grep -aoF 'zcp-subscription-reaper-v0.0.19' /tmp/sbx-verify
+zcp-subscription-reaper-v0.0.19
+```
+
+The gate itself performs this check (`grep -aF "$MARKER" "$BIN"`) and reports
+`PASS build marker present (zcp-subscription-reaper-v0.0.19)`. It also confirms
+the port is free before starting, and proves the daemon owns it (`ss -ltnp`
+shows `pid=<SRV>`), so the "two daemons on one port" failure cannot masquerade as
+broken code.
+
+### 9l.2 The compressed-clock acceptance transcript
+
+`scripts/subscription-check.sh` drives the REAL service and nsjail with a
+compressed clock via config (`grace_period: 10s`, `reap_interval: 1s`), so the
+whole days-long lifecycle is asserted in under a minute. Measured
+`61 passed / 0 failed`, exit 0, run on the host (root) with the real nsjail:
+
+```
+=== 1) create with a duration: active, expires_at, summary remaining ===
+  PASS  create with duration status (201)
+  PASS  create status active (active)
+  PASS  expires_at is set (yes)
+  PASS  summary remaining > 0 (yes)
+=== 2) extend while live: expiry moves FORWARD by the added duration ===
+  PASS  extend while live status (200)
+  PASS  expiry moved forward (yes)
+  PASS  extension added exactly 20s (20)
+  PASS  extensions counter (1)
+=== 3) lapse -> reaper LOCKS; compute refused; teardown is real ===
+  PASS  create s2 status (201)
+  PASS  start long run status (202)
+  PASS  workload running before lock (yes)
+  PASS  disk mounted before lock (yes)
+  PASS  reaper locks s2 at expiry (yes)
+  PASS  lock tore down process and disk mount (yes)
+  PASS  process inventory empty after lock (0)
+  PASS  disk unmounted after lock (no)
+  PASS  exec refused while locked (403)
+  PASS  refusal code (subscription_expired)
+  PASS  run creation refused while locked (403)
+  PASS  session refused while locked (403)
+  PASS  file write refused while locked (403)
+  PASS  get while locked (200)
+  PASS  read file while locked (200)
+  PASS  usage while locked (200)
+  PASS  locked workspace kept its data (keep-me)
+=== 4) extend while locked -> UNLOCKS and serves again ===
+  PASS  extend while locked status (200)
+  PASS  status active after renewal (active)
+  PASS  locked_at cleared (null)
+  PASS  exec works after renewal (200)
+=== 5) grace lapses -> reaper DELETES; nothing leaked ===
+  PASS  create s3 status (201)
+  PASS  s3 locks at expiry (yes)
+  PASS  s3 deleted after grace (yes)
+  PASS  s3 tree gone (yes)
+  PASS  s3 disk.img gone (yes)
+  PASS  s3 has no mount (yes)
+  PASS  no fuse2fs leak (count back to baseline) (yes)
+=== 6) manual DELETE of a locked workspace works ===
+  PASS  s4 locks at expiry (yes)
+  PASS  manual delete of locked 204 (204)
+  PASS  s4 gone after manual delete (404)
+  PASS  s4 tree gone (yes)
+=== 7) a workspace WITHOUT a subscription is never touched ===
+  PASS  no-sub has no subscription (null)
+  PASS  no-sub summary state (unlimited)
+  PASS  no-sub still active (active)
+  PASS  no-sub still exists (200)
+=== 8) a backwards clock reading does not delete ===
+  PASS  s6 locks at expiry (yes)
+  PASS  meta rewritten with future locked_at (yes)
+  PASS  s6 survived a backwards clock reading (200)
+  PASS  s6 tree still present (yes)
+=== 9) re-running reaper ticks is idempotent ===
+  PASS  daemon healthy after many ticks (200)
+  PASS  deleted s3 did not reappear (404)
+  PASS  s7 locks at expiry (yes)
+  PASS  s7 deleted after grace (yes)
+  PASS  daemon healthy after idempotent ticks (200)
+=== leak check: no cgroup growth, no mount under the data dir ===
+  PASS  cgroups did not grow past baseline (yes)
+  PASS  no mount left under the data dir (0)
+  PASS  no fuse2fs process left for this run (<= baseline) (yes)
+
+================ subscription acceptance: 61 passed / 0 failed ================
+```
+
+What each group proves:
+
+- **create with a duration** — `expires_at` is set, the status is `active`, and
+  the derived `summary.subscription.remaining_sec` is positive.
+- **extend while live** — the expiry moves **forward by exactly the added
+  duration** (20s), never backwards, and `extensions` increments.
+- **lapse** — the real reaper **locks** the workspace at `expires_at`; `exec`,
+  runs, sessions and file writes are refused with `403 subscription_expired`
+  while `GET`, `GET /usage` and file reads still work; the **running workload's
+  process is stopped** (inventory drains to 0) and the **disk mount is unmounted**
+  (`findmnt` finds none), proving locking actively stops using resources rather
+  than merely labelling; the user's file survives byte-for-byte (`keep-me`).
+- **extend while locked** — the renewal starts from now, **unlocks** the
+  workspace (`status: active`, `locked_at` cleared) and **exec works again**.
+- **grace lapses** — the reaper **deletes** the workspace: its tree, `disk.img`
+  and metadata are gone, `findmnt` finds no mount, and the `fuse2fs` count
+  returns to baseline.
+- **manual delete of a locked workspace** — `DELETE` returns 204 and removes it.
+- **no subscription** — a workspace with no term is never locked or deleted,
+  even across many grace periods and reap ticks; its summary reads `unlimited`.
+- **backwards clock** — a workspace whose recorded `locked_at` is rewritten into
+  the future (a non-monotonic reading) survives ticks that would otherwise
+  delete it.
+- **idempotency** — the daemon stays healthy across many ticks, a deleted
+  workspace does not reappear, and a second delete tick is a no-op.
+
+`tests` — the `internal/subscription` package adds pure unit tests for the parser
+(valid, invalid, zero-sum, overflow), the decision function (every boundary
+instant: exactly at expiry, exactly at grace end; the backwards-clock rule) and
+the derivations (unlimited, active, expiring-soon, locked, clamped-at-0); the
+service adds the whole lifecycle with an injected clock; the API adds the
+request/response contract. Suite total `390` test functions (see §1).
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **86** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **91** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-
@@ -1898,8 +2064,13 @@ per-profile materialization choice, and what a profile can and cannot promise.
 **#84** records the egress decoy (a plausible invented public IP, not a security
 boundary; see §9k), **#85** records the per-workspace disk allowance as a real
 filesystem (kernel boundary) with a sampled counter as the documented fallback,
-and **#86** records the curated per-workspace `/proc` so `free`/`vmstat`/`df`
-report the workspace's own limits (see §14).
+**#86** records the curated per-workspace `/proc` so `free`/`vmstat`/`df`
+report the workspace's own limits (see §14), and **#87–#91** record workspace
+subscriptions: the engine owns the clock and stores absolute instants (#87), the
+duration grammar with `mo`/`y` fixed-length approximations (#88), `locked` vs
+`suspended` and the exact allow/refuse split (#89), the extension semantics
+(add-while-live, from-now-when-lapsed, never-shorten; #90), and the reaper (pure
+decision, injected clock, idempotent, backwards-clock rule; #91). See §9l.
 
 ## 11. OpenAPI
 

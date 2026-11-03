@@ -264,6 +264,94 @@ else
   fail "makefile.phony.egress-decoy-check" "'egress-decoy-check' is not in .PHONY"
 fi
 
+# --- 4d-quater. the subscription acceptance harness exists and is documented ---
+# subscription-check.sh is the only check that drives the REAL reaper against a
+# real sandbox and a real FUSE disk, so it must exist, be executable, be named in
+# VERIFICATION.md and be wired into the Makefile -- it cannot silently rot.
+
+if [ -f scripts/subscription-check.sh ]; then
+  ok "subscription-harness.exists"
+else
+  fail "subscription-harness.exists" "scripts/subscription-check.sh is missing"
+fi
+if [ -x scripts/subscription-check.sh ]; then
+  ok "subscription-harness.executable"
+else
+  fail "subscription-harness.executable" "scripts/subscription-check.sh is not executable"
+fi
+if grep -qF 'subscription-check.sh' docs/VERIFICATION.md; then
+  ok "subscription-harness.documented"
+else
+  fail "subscription-harness.documented" "docs/VERIFICATION.md does not mention scripts/subscription-check.sh"
+fi
+if grep -qE '^subscription-check:' Makefile; then
+  ok "makefile.target.subscription-check"
+else
+  fail "makefile.target.subscription-check" "Makefile has no 'subscription-check:' target"
+fi
+if grep -qE 'bash scripts/subscription-check.sh' Makefile; then
+  ok "makefile.sudo.subscription-check"
+else
+  fail "makefile.sudo.subscription-check" "Makefile's 'subscription-check' target does not run scripts/subscription-check.sh"
+fi
+if grep -qE '^\.PHONY:.*\bsubscription-check\b' Makefile; then
+  ok "makefile.phony.subscription-check"
+else
+  fail "makefile.phony.subscription-check" "'subscription-check' is not in .PHONY"
+fi
+
+# The subscription feature (this iteration): the config section, the ADRs, the
+# locked-vs-suspended distinction, the allow/refuse split, the duration
+# approximation caveat, the absolute-instant recovery model and the
+# backwards-clock rule must all be documented and wired, so they cannot silently
+# regress out of the docs.
+if grep -qF 'subscription:' configs/config.example.yaml && grep -qF 'Subscription SubscriptionConfig' internal/config/config.go; then
+  ok "subscription.config"
+else
+  fail "subscription.config" "the subscription section is missing from configs/config.example.yaml or internal/config/config.go"
+fi
+if grep -qF 'default_duration: ""' configs/config.example.yaml; then
+  ok "subscription.config-default-empty"
+else
+  fail "subscription.config-default-empty" "configs/config.example.yaml must show default_duration: \"\" (no expiry by default)"
+fi
+if grep -qF 'ADR 87' docs/DECISIONS.md && grep -qF 'ADR 88' docs/DECISIONS.md; then
+  ok "subscription.adrs"
+else
+  fail "subscription.adrs" "docs/DECISIONS.md is missing ADR 87 (subscription model) or ADR 88 (duration grammar)"
+fi
+if grep -qi 'locked' docs/DECISIONS.md && grep -qi 'suspended' docs/DECISIONS.md && grep -qi 'subscription_expired' docs/DECISIONS.md; then
+  ok "subscription.locked-vs-suspended"
+else
+  fail "subscription.locked-vs-suspended" "the locked-vs-suspended distinction / subscription_expired code is not in docs/DECISIONS.md"
+fi
+if grep -qiF 'FIXED-LENGTH' docs/DECISIONS.md && grep -qiE '30.?(day|d)|365' docs/DECISIONS.md; then
+  ok "subscription.duration-approximation"
+else
+  fail "subscription.duration-approximation" "the mo=30d / y=365d approximation caveat is not in docs/DECISIONS.md"
+fi
+if grep -qiF 'backwards' docs/DECISIONS.md && grep -qiF 'absolute' docs/DECISIONS.md; then
+  ok "subscription.backwards-clock-and-absolute-instants"
+else
+  fail "subscription.backwards-clock-and-absolute-instants" "the backwards-clock rule or the absolute-instant recovery model is not in docs/DECISIONS.md"
+fi
+if grep -qF 'subscription' api/openapi.yaml && grep -qF 'subscription' docs/API.md; then
+  ok "subscription.documented"
+else
+  fail "subscription.documented" "subscription is not documented in docs/API.md and api/openapi.yaml"
+fi
+if grep -qiF 'expiring_soon' docs/API.md && grep -qiF 'remaining_sec' docs/API.md; then
+  ok "subscription.summary-documented"
+else
+  fail "subscription.summary-documented" "the summary states (expiring_soon/remaining_sec) are not documented in docs/API.md"
+fi
+# The pure decision function and the parser must exist in the subscription pkg.
+if [ -f internal/subscription/subscription.go ] && grep -qF 'func Decide(' internal/subscription/subscription.go && grep -qF 'func ParseDuration(' internal/subscription/subscription.go; then
+  ok "subscription.pure-functions"
+else
+  fail "subscription.pure-functions" "internal/subscription is missing the pure Decide or ParseDuration function"
+fi
+
 # The masking shim source and the embedded artifact must both be present, so a
 # stale or missing .so cannot silently disable the mask.
 if [ -f internal/executor/hostmask/hostmask.c ]; then

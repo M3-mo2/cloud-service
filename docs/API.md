@@ -85,7 +85,11 @@ additional code the router emits:
 | `too_many_tunnels` | 422 | Per-workspace tunnel cap reached | `POST .../tunnels` when `tunnels.max_per_workspace` active tunnels already exist. |
 | `unknown_profile` | 422 | A workspace create named a profile that is not offered | `POST /v1/workspaces` with `profile` set to a name not in `GET /v1/meta`'s `profiles` list. The name is preserved in `details.profile`; it is never silently replaced by the default. |
 | `session_needs_interpreter` | 422 | A terminal session was requested for a profile without Python | `POST .../sessions` on a workspace whose profile does not provide `python3` (e.g. `minimal`). The PTY relay that backs a session is a Python program, so a shell-only profile cannot host one. |
-| `workspace_suspended` | 409 | Work refused because the workspace is suspended | `POST .../exec`, `POST .../runs`, `POST .../sessions` or a session sub-resource on a `suspended` workspace. |
+| `workspace_suspended` | 409 | Work refused because the workspace is suspended | `POST .../exec`, `POST .../runs`, `POST .../sessions` or a session sub-resource on a `suspended` workspace (a manual operator action). |
+| `subscription_expired` | 403 | Work refused because the subscription term lapsed and the workspace is `locked` | `POST .../exec`, `.../runs`, `.../sessions`, `.../tunnels`, `.../packages/install` and every **mutating** `files` operation (`PUT /files/content`, `DELETE /files`, `POST /files/mkdir`, `POST /files/rename`, `POST /files/upload`) on a `locked` workspace. Reads, `GET /usage`, the summary and `DELETE /v1/workspaces/{id}` stay allowed; renew with `POST .../subscription/extend`. |
+| `subscription_invalid` | 422 | A subscription create/extend is malformed | A create/extend whose `duration` is zero, negative, unparseable or missing a unit (the grammar is `s m h d w mo y`, summed, e.g. `1d12h`; a bare integer is refused), whose `expires_at` is not in the future, that supplies both `duration` and `expires_at`, or that supplies neither. `details.field` names the offender. |
+| `max_duration_exceeded` | 422 | A subscription would run past the server ceiling | A create/extend whose expiry would land more than `subscription.max_duration` (default `365d`) in the future. |
+| `subscription_would_shorten` | 422 | An extension tried to shorten a live term | `POST .../subscription/extend` with an absolute `expires_at` earlier than the still-live `expires_at`. The engine never silently shortens a paid term; a duration extension is always additive while live. |
 | `too_many_sessions` | 409 | Per-workspace concurrent-session cap reached | `POST .../sessions` when `sessions.max_per_workspace` is already in use. |
 | `session_ended` | 409 | Operation on a terminal session | `input`/`signal`/`resize` (or `output` after `DELETE`) on a session that has ended; the workspace check wins while suspended. |
 | `validation` | 400 | Malformed or invalid request | Bad JSON, unknown JSON field, failing `validate` tag, missing query/body field, bad `stream`/`status`/`kind` filter, unknown route body. Also carries the **405** status for method-not-allowed. |
@@ -206,9 +210,20 @@ default per-workspace limits.
 
   ```json
   {
-    "version": "0.0.18",
+    "version": "0.0.19",
     "api_version": "v1",
     "runtimes": ["python3"],
+    "subscriptions": {
+      "enabled": true,
+      "default_duration": "",
+      "max_duration": "8760h0m0s",
+      "grace_period": "168h0m0s",
+      "reap_interval": "60s",
+      "duration_grammar": "s m h d w mo y (summed, e.g. 1d12h); mo=30d and y=365d are FIXED-LENGTH approximations, never calendar-exact",
+      "expiry_semantics": "absolute instants; extend adds while live, restarts from now when lapsed and unlocks; a live term is never shortened",
+      "locked_status": "locked (automatic, lapsed term) is distinct from suspended (manual); refused work is 403 subscription_expired, reads/usage/delete stay allowed",
+      "summary_present_on": ["GET /v1/workspaces/{id}", "GET /v1/workspaces"]
+    },
     "interpreters": ["bash", "node", "perl", "python3"],
     "runnable_extensions": [".bash", ".cjs", ".js", ".mjs", ".pl", ".pm", ".py", ".sh"],
     "limits_defaults": {
@@ -311,6 +326,16 @@ default per-workspace limits.
   embedded in the binary, overridable via `profiles.dir`): adding a language means
   adding a file, never editing the engine. See
   [Workspace profiles](#workspace-profiles).
+  `subscriptions` reports the workspace-subscription capability:
+  `enabled` is whether the reaper loop runs (`subscription.enabled`),
+  `default_duration` is the term a create gets with no `subscription` (empty =
+  **no expiry**, unlimited), `max_duration`/`grace_period`/`reap_interval` are the
+  configured bounds, `duration_grammar` is the accepted grammar (and repeats that
+  `mo`/`y` are fixed-length approximations), `expiry_semantics` states the
+  additive-while-live / from-now-when-lapsed / never-shorten rules, and
+  `locked_status` states that `locked` is automatic (distinct from `suspended`),
+  that refused work is `403 subscription_expired`, and that reads/usage/delete
+  stay allowed. See [Subscriptions](#subscriptions).
 
 ```sh
 KEY=dev-key-please-rotate
@@ -328,6 +353,7 @@ Create a workspace owned by the authenticated principal.
   | `name` | `string` | `name` | yes | `required,min=1,max=128` | — (400 if missing/empty/>128) |
   | `profile` | `string` | `profile` | no | must name a profile from `GET /v1/meta`'s `profiles` list | server `profiles.default` (`python`) |
   | `limits` | `*limitsJSON` | `limits` | no | none | server `limits` defaults |
+  | `subscription` | `*subscriptionRequestJSON` | `subscription` | no | `duration` XOR `expires_at`, see below | server `subscription.default_duration`; empty means **no expiry** (unlimited) |
 
   `profile` is a **top-level field**, not under `limits`: the profile selects the
   workspace's toolchain, which is orthogonal to its resource limits. An unknown
@@ -357,12 +383,28 @@ Create a workspace owned by the authenticated principal.
     "profile":"python",
     "created_at":"2026-01-02T15:04:05Z","status":"active",
     "limits":{"cpu_cores":1,"memory_mb":256,"disk_mb":1024,
-              "max_wall_time_sec":300,"max_runs":3,"allow_net":false}}}
+              "max_wall_time_sec":300,"max_runs":3,"allow_net":false},
+    "subscription":{"granted_at":"2026-01-02T15:04:05Z",
+                    "expires_at":"2026-02-01T15:04:05Z",
+                    "grace_ends_at":"2026-02-08T15:04:05Z","extensions":0},
+    "summary":{"state":"active","age_sec":0,"created_at":"2026-01-02T15:04:05Z",
+               "runs":{"total":0,"active":0},
+               "disk":{"used_bytes":0,"limit_bytes":1073741824},
+               "profile":"python",
+               "subscription":{"state":"active","expires_at":"2026-02-01T15:04:05Z",
+                               "remaining_sec":2592000,"extensions":0}}}}
   ```
+
+  A workspace created **without** a `subscription` (and with
+  `subscription.default_duration` empty) has no `subscription` object and its
+  summary has `"state":"unlimited"` and no nested subscription. The `summary`
+  object is the cheap derived view (see [Subscriptions](#subscriptions)).
 - **Errors:** 400 `validation` (bad JSON / failed tag), 401 `unauthorized`,
   413 `payload_too_large` (body > `json_body_mb`), 422 `unprocessable` (a limit
   above the server maximum), 422 `unknown_profile` (`profile` not in the
-  catalogue; `details.profile` carries the requested name).
+  catalogue; `details.profile` carries the requested name), 422
+  `subscription_invalid` / `max_duration_exceeded` (a malformed or too-long
+  term; see [Subscriptions](#subscriptions)).
 - **Semantics:** `allow_net` is always taken from the request when a `limits`
   object is present (so `{"limits":{}}` sets `allow_net` to `false`), and only
   from the server default when `limits` is omitted entirely. Numeric limits are
@@ -384,12 +426,15 @@ curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 List the caller's workspaces.
 
 - **Response 200:** `{"workspaces":[ <workspace>, ... ]}`, newest first, with
-  both `status:"active"` and `status:"suspended"` entries (only the internal
+  `status:"active"`, `"suspended"` and `"locked"` entries (only the internal
   `deleted` marker, which deletion never writes because it removes the tree, is
-  filtered out).
+  filtered out). Each item carries the cheap derived `summary` object, so a
+  dashboard renders a list in **one** request.
 - **Errors:** 401 `unauthorized`.
 - **Semantics:** empty result is `{"workspaces":[]}` (never `null`). A
-  suspended workspace is still listed; use its `status` field to tell.
+  suspended or locked workspace is still listed; use its `status` field to tell.
+  `status:"locked"` is the derived status (the term lapsed), so it can appear
+  before the reaper has physically torn the workspace down.
 
 ```sh
 curl -s -H "Authorization: Bearer $KEY" localhost:8080/v1/workspaces
@@ -468,6 +513,45 @@ Delete a workspace.
 curl -s -o /dev/null -w '%{http_code}\n' -X DELETE \
   -H "Authorization: Bearer $KEY" localhost:8080/v1/workspaces/$WS
 # 204
+```
+
+### POST /v1/workspaces/{workspaceID}/subscription/extend
+
+Renew (extend) a workspace's subscription term. This is the renewal path.
+
+- **Path parameter:** `workspaceID`.
+- **Request body:** exactly one of `duration` or `expires_at` (the same grammar
+  as create; a bare integer is refused).
+
+  | Field | JSON | Notes |
+  |-------|------|-------|
+  | `duration` | `string` | e.g. `"30d"`, `"1d12h"`, `"1mo"`. Summed units `s m h d w mo y`; `mo`=30d and `y`=365d are **fixed-length approximations**, never calendar-exact. |
+  | `expires_at` | `string` | an RFC3339 absolute instant (the client owns its calendar). Must be in the future. |
+
+- **Response 200:** `{"workspace": <workspace>}`, the same shape as
+  `GET /v1/workspaces/{workspaceID}`, with `subscription.expires_at` advanced and
+  `subscription.extensions` incremented.
+- **Errors:** 401, 403, 404, 422 `subscription_invalid` /
+  `max_duration_exceeded` / `subscription_would_shorten` (`details` carries the
+  offending field). Extending a deleted workspace is `404` and **never
+  resurrects** it.
+- **Semantics — stated and asserted:**
+  - **While the term is still live:** the extension **ADDS** to the existing
+    expiry (`expires_at += duration`), so a user who renews early keeps the whole
+    paid term. An absolute `expires_at` **earlier** than the live one is refused
+    (`422 subscription_would_shorten`); a live term is **never shortened**.
+  - **After the term has lapsed (`locked`):** the extension starts from **now**
+    and **unlocks** the workspace, restoring service (the next `exec`/run works).
+  - The new expiry may not land further than `subscription.max_duration` from now
+    (`422 max_duration_exceeded`).
+
+```sh
+# renew while live: the term grows by 30 days
+curl -s -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"duration":"30d"}' localhost:8080/v1/workspaces/$WS/subscription/extend
+# renew with an absolute instant the billing product computed
+curl -s -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"expires_at":"2027-01-01T00:00:00Z"}' localhost:8080/v1/workspaces/$WS/subscription/extend
 ```
 
 ### POST /v1/workspaces/{workspaceID}/suspend
@@ -2177,18 +2261,133 @@ curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 | `identity:` | `kernel_version` | `#1 SMP` | the generic `uname.version` a workspace is told |
 | `identity:` | `shim_path` | `""` | optional override of the compiled shim; empty uses the embedded copy |
 
+## Subscriptions
+
+A workspace may carry a **subscription**: a running term with an **absolute
+expiry instant**. This is an engine feature, not a billing feature: the engine
+owns the **clock** and the **enforcement**, and stores absolute instants (never
+a "days remaining" counter), while a separate product owns *why* a term is what
+it is. Because every value is absolute, state is recomputed from stored times
+after a restart and is never held in memory. A workspace with **no**
+subscription never expires and is never touched by the reaper — that is the
+default, so nothing changes for a workspace that does not ask.
+
+### The duration grammar
+
+A term is given as either a `duration` string or an absolute `expires_at`
+(RFC3339). The duration grammar is one or more `<number><unit>` pairs summed
+together:
+
+| Unit | Meaning | Exactness |
+|------|---------|-----------|
+| `s` | seconds | exact |
+| `m` | minutes | exact |
+| `h` | hours | exact |
+| `d` | days (24 h) | exact |
+| `w` | weeks (7 d) | exact |
+| `mo` | **30 days** | a **fixed-length approximation**, never a calendar month |
+| `y` | **365 days** | a **fixed-length approximation**, never a calendar year |
+
+Combinations are allowed: `1d12h`, `1w2d`, `12h30m`. A **bare integer is
+refused** (`"30"` is ambiguous); a unit suffix is required. Zero, negative,
+fractional and unparseable durations are `422 subscription_invalid`. A client
+that needs calendar months must send an absolute `expires_at`.
+
+### States and the summary
+
+Every workspace carries a cheap **derived** `summary` (on the get **and** on
+each list item), computed from stored fields with **no directory walk**:
+
+| Field | Meaning |
+|-------|---------|
+| `summary.state` | `active`, `expiring_soon`, `locked` or `unlimited` |
+| `summary.age_sec` / `created_at` | how long the workspace has existed |
+| `summary.last_activity_at` | last run/mutation time |
+| `summary.runs.total` / `active` | run counters |
+| `summary.disk.used_bytes` / `limit_bytes` | disk (used is a cheap statvfs of the already-mounted filesystem) |
+| `summary.profile` | the workspace's profile |
+| `summary.subscription.state` | the term state: `active`, `expiring_soon`, `locked`, `unlimited` |
+| `summary.subscription.expires_at` | the absolute expiry (absent when unlimited) |
+| `summary.subscription.remaining_sec` | whole seconds until expiry, **clamped at 0, never negative** |
+| `summary.subscription.grace_ends_at` | `expires_at + grace_period` (deletion instant) |
+| `summary.subscription.extensions` | how many times the term was extended |
+| `summary.subscription.locked_at` | when the reaper locked it (absent when never) |
+
+The threshold for `expiring_soon` is `min(10% of the granted term, 24 h)`.
+`remaining_sec` is `0` for `unlimited` (no limit), for `locked` (expired), and
+for a live term in its final second; `state` disambiguates. **The numbers agree
+with enforcement**: if the summary says `remaining_sec` is `0` with
+`state:locked`, the workspace is actually refusing compute.
+
+### Enforcement: lock, refuse, delete
+
+When a term lapses the reaper **locks** the workspace. Locking stops using
+resources, not merely labels the workspace: it stops running runs, kills
+sessions and detached processes, deletes tunnels, and **unmounts the
+per-workspace disk image** (releasing the `fuse2fs` process) while keeping every
+byte of data.
+
+- **Refused while locked** (`403 subscription_expired`): `exec`, `runs`,
+  `sessions`, `tunnels`, `packages/install`, and every **mutating** `files`
+  operation (`PUT /files/content`, `DELETE /files`, `POST /files/mkdir`,
+  `POST /files/rename`, `POST /files/upload`).
+- **Allowed while locked**: `GET /v1/workspaces/{id}` (and its summary),
+  `GET /v1/workspaces`, `GET /usage`, `GET /files` and every file read
+  (`stat`, `content`, `download`), and `DELETE /v1/workspaces/{id}` so it can be
+  removed early. A locked workspace cannot consume compute.
+
+After `expires_at + grace_period` (default `168h` = 7 days) the reaper
+**deletes** the workspace: stop compute, unmount, then purge the files,
+`disk.img` and the metadata. A manual `DELETE` works at any time, including while
+locked.
+
+### Configuration
+
+| `subscription:` key | Default | Meaning |
+|---------------------|---------|---------|
+| `enabled` | `true` | the reaper switch. `false` = the loop does not run, so nothing is automatically locked or deleted. |
+| `default_duration` | `""` | the term a create gets when it names none. **Empty means NO expiry** (unchanged behaviour). |
+| `max_duration` | `365d` | server ceiling measured from now; beyond it is `422 max_duration_exceeded`. |
+| `grace_period` | `168h` | how long a lapsed workspace stays locked before deletion. |
+| `reap_interval` | `60s` | reaper tick interval. |
+
+These defaults change the behaviour of **no** existing workspace: a workspace
+without a subscription is never locked or deleted.
+
+```sh
+# create with a 30-day term
+curl -s -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"trial","subscription":{"duration":"30d"}}' \
+  localhost:8080/v1/workspaces
+# renew early (adds 30 days to the live term) or renew a locked workspace
+curl -s -X POST -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"duration":"30d"}' localhost:8080/v1/workspaces/$WS/subscription/extend
+```
+
 ## Lifecycle and limits
 
 ### Workspace lifecycle
 
-A workspace has a `status` of `active` or `suspended`:
+A workspace has a `status` of `active`, `suspended` or `locked`:
 
 ```
 create ──► active ──suspend──► suspended
               ▲                   │
               └──── resume ───────┘
                 (stop leaves active)
+
+           active ──term lapses──► locked ──renew──► active
+                                     │
+                              grace ends (reaper) ──► deleted
 ```
+
+`suspended` is a **manual, reversible-by-API** action (`suspend`/`resume`).
+`locked` is the **automatic** consequence of a lapsed subscription term: the
+reaper stops the workspace's compute and unmounts its disk (keeping every byte of
+data), refuses work with `403 subscription_expired`, and the way out is a
+**renewal** (`POST .../subscription/extend`), not `resume`. After the grace
+period the reaper deletes it (or you delete it manually at any time). See
+[Subscriptions](#subscriptions).
 
 - **Create** — `POST /v1/workspaces`. The caller may override, at creation time,
   `limits.cpu_cores`, `memory_mb`, `disk_mb`, `max_wall_time_sec`, `max_runs`

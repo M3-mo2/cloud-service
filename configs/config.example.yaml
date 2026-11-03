@@ -304,6 +304,41 @@ disk:
   # host-identity masking is also on, so the two channels can never disagree.
   proc_enabled: true
 
+# Workspace subscriptions: a running term with an ABSOLUTE expiry instant.
+#
+# This is an ENGINE feature, not a billing feature. The engine owns the clock and
+# the enforcement and stores absolute instants (never a "days remaining"
+# counter); a separate product owns WHY a term is what it is (a renewal is the
+# client sending a new/extended expiry). Because every value is absolute, state
+# is recomputed from stored times after a restart and is never held in memory.
+#
+# DEFAULTS CHANGE NOTHING: default_duration is EMPTY, so a workspace that does
+# not ask for a term gets NO expiry and is never locked or deleted. The reaper is
+# a no-op for a workspace without an expiry.
+subscription:
+  # Reaper switch. true (the default) runs one periodic loop (beside the disk
+  # watchdog) that locks a lapsed term and deletes it after the grace period.
+  # false = nothing is ever automatically locked or deleted; per-request terms
+  # are still accepted and still enforce on read (a lapsed workspace reads
+  # `locked`), but no resource teardown happens.
+  enabled: true
+  # The term a workspace gets when its create names no subscription. Empty (the
+  # default) means NO expiry: behaviour is unchanged for a workspace that does
+  # not ask. A non-empty value (e.g. "30d") makes every new workspace get that
+  # term unless the request overrides it with a duration or an absolute
+  # expires_at. Grammar: s m h d w mo y, summed (e.g. "1d12h"); a bare integer is
+  # refused. `mo`=30d and `y`=365d are FIXED-LENGTH approximations, never
+  # calendar-exact.
+  default_duration: ""
+  # Server ceiling on a term, measured from now. A create/extend whose expiry
+  # would land further out is refused with 422 max_duration_exceeded.
+  max_duration: "365d"
+  # How long a lapsed workspace stays LOCKED (service stopped, data and disk
+  # image intact) before the reaper deletes it. Default 168h = 7 days.
+  grace_period: "168h"
+  # How often the reaper tick runs.
+  reap_interval: "60s"
+
 # Static API keys. Each entry maps a key to a principal_id.
 # Multiple keys may share a principal_id.
 keys:
