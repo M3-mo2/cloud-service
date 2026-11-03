@@ -151,7 +151,8 @@ Readiness probe. Unauthenticated.
 - **Response 200 (ready) / 503 (not ready):** `{"status":"ready"|"not_ready",
   "nsjail":bool,"cgroups":bool,"data_dir":bool,"network":{...},
   "tunnels":{...},"identity_masking":{"enabled":bool,"ready":bool,"reason":str},
-  "provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str}}`.
+  "provider_tools_hidden":{"enabled":bool,"ready":bool,"reason":str},
+  "egress_decoy":{"enabled":bool,"ready":bool,"reason":str}}`.
 - **Errors:** none; unsuitability is expressed by the 503 and the boolean fields.
 - **Semantics:** `data_dir` is true when a temp file can be created under the
   data directory; `nsjail` when the nsjail binary is found; `cgroups` when the
@@ -163,7 +164,10 @@ Readiness probe. Unauthenticated.
   `provider_tools_hidden.enabled` is true, `ready` reports whether the curated
   `/usr/local` and `/etc/ssl/certs` overlays could be materialized; here too,
   enabled-but-not-ready makes the probe 503, so a deploy that would expose the
-  platform's own tooling is never reported ready.
+  platform's own tooling is never reported ready. When `egress_decoy.enabled` is
+  true, `ready` reports whether the decoy CA and profile materialized;
+  enabled-but-not-ready makes the probe 503, so a deploy that would serve the
+  real identity is never reported ready. See `docs/EGRESS-DECOY.md` and ADR 84.
 
 ```sh
 curl -s localhost:8080/readyz
@@ -227,6 +231,12 @@ default per-workspace limits.
       "mechanism": "profile-materialized read-only /usr (also bound at /bin, /sbin, /lib, /lib64), plus filtered /etc/{passwd,group,ssl/certs}",
       "limits": "a workspace sees only the tools its profile names (an explicit allowlist) plus engine base commands, shared libraries and loaders; a profile entry naming the engine/platform is refused (fail loud), and it cannot change the provider the egress address is registered to"
     },
+    "egress_decoy": {
+      "enabled": false, "ready": false,
+      "reason": "network.decoy.enabled is false",
+      "mechanism": "in-namespace stub DNS resolver + stub HTTP/TLS responder, one consistent per-workspace decoy profile, with a generated CA trusted inside the workspace and in-namespace nft rules forcing DNS to the stub",
+      "limits": "a decoy layer, NOT a security boundary: a tenant's OWN endpoint (they read the peer address in their own logs) is unfixable; a hardcoded-IP endpoint outside the covered set, intermediate traceroute hops, and MTU/ICMP fingerprinting are out of scope; a knowledgeable tenant can recognise a documentation-range address"
+    },
     "profiles": {
       "ready": true,
       "default": "python",
@@ -265,6 +275,13 @@ default per-workspace limits.
   naming the engine/platform is refused, fail loud) but that it cannot change the
   provider the egress address is registered to (see
   [DECISIONS.md](DECISIONS.md) ADR 74/76/83).
+  `egress_decoy` reports the egress-decoy capability (`network.decoy.enabled`,
+  default false): `enabled` is the switch, `ready` whether the decoy CA and
+  profile materialized, and `mechanism`/`limits` state that a workspace's
+  IP-discovery is answered with one consistent invented identity and that it is a
+  **decoy, not a security boundary** (a tenant's own endpoint, traceroute hops,
+  and hardcoded-IP endpoints are out of scope). See
+  [EGRESS-DECOY.md](EGRESS-DECOY.md) and [DECISIONS.md](DECISIONS.md) ADR 84.
   `profiles` reports the tool profiles a client can choose from: `default` is the
   profile a workspace gets when its create omits one, `ready` is whether the
   registry loaded and the default exists (`reason` explains a `ready:false`), and

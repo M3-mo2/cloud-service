@@ -147,6 +147,40 @@ network:
   # HTTP(S)_PROXY/ALL_PROXY environment variables, so a program that ignores
   # them, or opens an address directly, is not constrained by it.
   egress_proxy: ""
+  # Egress decoy: answer a workspace's attempts to learn its own public IP with
+  # a plausible invented identity, while ordinary internet (pip/npm/github) is
+  # untouched. DEFAULT OFF: nothing changes unless enabled is true. This is a
+  # DECOY, not a security boundary: a tenant who controls their own endpoint
+  # reads the real peer address in their own logs and cannot be stopped; see
+  # docs/EGRESS-DECOY.md and docs/DECISIONS.md ADR 84. The one-line enable:
+  #
+  #   network: { decoy: { enabled: true } }
+  decoy:
+    enabled: false
+    # The address range the per-workspace decoy address is drawn from. The
+    # documentation range is the safe default (a real dotted quad that resolves
+    # to nothing); a knowledgeable tenant can recognise it, so an operator may
+    # prefer a range he owns.
+    address_range: "198.51.100.0/24"
+    # The shared decoy identity served by EVERY covered channel (address, org,
+    # ASN text, city, country, region, reverse-DNS), so no channel contradicts
+    # another -- a mismatch teaches a tenant more than the truth would.
+    org: "Example Transit Networks"
+    asn: "AS64500"
+    city: "Frankfurt"
+    country: "DE"
+    region: "Hesse"
+    rdns: "example-transit.net"
+    # In-namespace ports the stubs bind; the in-namespace nft rules redirect
+    # 53/80/443/853 to them. Change only if these collide.
+    resolver_port: 15353
+    http_port: 18080
+    https_port: 18443
+    dot_port: 18853
+    # Extra hostnames (exact, or ".suffix" for a suffix) or regular expressions
+    # to intercept, beyond the built-in shape patterns.
+    extra_hosts: []
+    extra_patterns: []
 
 # Quick Cloudflare tunnels (one command -> public URL).
 #

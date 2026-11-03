@@ -1509,6 +1509,78 @@ under it, `python3`/`python`/`node`/`git`/`gcc`/`curl` are absent by execution.
 `python` (`IS_TTY`, `/dev/pts/N`, `stty size` → `24 80`). See
 [VERIFICATION.md](VERIFICATION.md).
 
+### ADR 84 — the egress decoy: a plausible invented public IP, not a security boundary
+
+**Problem.** The workspace's public IP (`93.185.106.128`, a platform-shared NAT)
+and its registration name the hosting platform: `curl https://ipinfo.io/org` →
+`AS43541 VSHosting s.r.o.`, the RDAP record for the `/24` reads "ZEROPS-IO", and
+a neighbour's rDNS is `gateway2.zerops.io`. A tenant who is "playing around"
+learns which platform they are on in one command.
+
+**This is the FIRST and MOST IMPORTANT sentence: the egress decoy is a decoy
+layer, not a security boundary.** It removes the problem for casual discovery.
+It is defeated by a tenant who controls their own endpoint, because the address
+is decided by whoever exits to the internet, and no host-side interception can
+change that. It is stated here first so no later sentence implies a stronger
+guarantee:
+
+1. **A tenant's own endpoint defeats it entirely.** `ssh user@their-server`,
+   `curl https://their-server/`, `nc their-server 9999`, `ping their-server`,
+   SMTP/NTP/IRC/a game server — any protocol that reaches a party the tenant
+   controls reveals the peer address **to them**. Unfixable. Declared, not
+   half-fixed.
+2. **Path inspection (`traceroute`/`mtr`) exposes intermediate hops** and the
+   platform's own router names; hiding them would break normal routing, so it is
+   declared out of scope.
+3. A **hardcoded-IP endpoint** not in the covered set, and **novel services**
+   whose hostname matches no shape pattern, are not intercepted.
+4. **MTU/ICMP/timing fingerprinting** is out of scope.
+5. A knowledgeable tenant can **recognise a documentation-range address**.
+
+**Decision — intercept at the network layer inside the workspace netns.** A
+command-name filter covers only the clients someone thought of, breaks on a
+statically linked binary, and is trivially bypassed by
+`python -c "import urllib.request; …"`. Four cooperating pieces, all inside the
+workspace's own network namespace, none on the host:
+
+- **A stub resolver** at `127.0.0.1` (the workspace's `/etc/resolv.conf` names
+  it). It answers the DNS echo names (A and TXT) and covered hostnames with the
+  decoy and forwards everything else to the configured public resolvers, so
+  `pip`/`npm`/`github` resolution is untouched. Its upstream queries carry
+  `SO_MARK = 0x24` so the port-53 redirect passes them through.
+- **A stub HTTP/TLS responder** and a **generated CA trusted inside the
+  workspace** (appended to the curated `/etc/ssl/certs` bundle and to its
+  OpenSSL-hashed name). Per-hostname certificates are minted on demand so TLS
+  interception is seamless; a no-SNI client (a bare resolver IP) gets a
+  certificate carrying the covered resolver IPs as SANs. The same port answers
+  DNS-over-TLS, so `dig +tls @1.1.1.1` is covered. **A certificate warning is
+  worse than nothing** (it tells the tenant the environment is tampered with),
+  so the acceptance suite asserts its absence for curl, wget and python.
+- **In-namespace nft rules** forcing port 53 to the stub and covering the
+  well-known DoH/DoT resolver addresses, in an engine-owned table that is
+  deleted on teardown. The rules never touch the host.
+- **Consistency is the whole illusion.** Every channel serves ONE profile: same
+  address, org, ASN, city, country, rDNS. A mismatch teaches the tenant more
+  than the truth would. The profile is derived per workspace from the workspace
+  id, so two tenants comparing notes see different addresses.
+
+**Configuration, default OFF.** `network.decoy.enabled: false` is the default, so
+no existing gate regresses. The whole profile is configurable (`address_range`,
+`org`, `asn`, `city`, `country`, `region`, `rdns`, ports, extra hosts/patterns).
+The safe default address range is a **documentation range** (`198.51.100.0/24`):
+a real dotted quad that resolves to nothing, with a private-ish ASN text
+(`AS64500`). The trade-off is recorded above (limit 5): a knowledgeable tenant
+can recognise it, so an operator may prefer a range he owns — a config change,
+not a code change.
+
+**Proof.** `scripts/egress-decoy-check.sh` runs the real service against real
+nsjail with the decoy ON and asserts every covered channel (HTTP services, an
+invented hostname, all four DNS methods, DoH/DoT/direct resolver, all client
+runtimes, and cross-channel consistency) answers the decoy and not the truth,
+and that `pip download`/github/npm/pypi still succeed. Measured this session:
+`57 passed / 0 failed / 0 skipped`. See [EGRESS-DECOY.md](EGRESS-DECOY.md) for
+the full Part 1 enumeration and Part 2 design.
+
 ## Additional defaults chosen during implementation
 
 - **Auth header format**: `Authorization: Bearer <key>`. _Rationale_: conventional bearer scheme.

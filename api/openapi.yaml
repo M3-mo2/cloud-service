@@ -1247,6 +1247,18 @@ components:
             enabled: { type: boolean }
             ready: { type: boolean }
             reason: { type: string }
+        egress_decoy:
+          type: object
+          description: >-
+            Egress-decoy capability, reported truthfully. `enabled` is the
+            switch (network.decoy.enabled, default false); `ready` is whether the
+            decoy CA and profile materialized. A DECOY, not a security boundary:
+            a tenant's own endpoint is unfixable. Enabled-but-not-ready makes the
+            probe 503.
+          properties:
+            enabled: { type: boolean }
+            ready: { type: boolean }
+            reason: { type: string }
     Meta:
       type: object
       required: [version, api_version, runtimes, limits_defaults]
@@ -1309,6 +1321,22 @@ components:
             whether the curated /usr/local and /etc/ssl/certs trees were
             materialized; `mechanism`/`limits` state what it hides and that it
             cannot change the provider the egress address is registered to.
+          properties:
+            enabled: { type: boolean }
+            ready: { type: boolean }
+            reason: { type: string }
+            mechanism: { type: string }
+            limits: { type: string }
+        egress_decoy:
+          type: object
+          description: >-
+            Egress-decoy capability, reported truthfully. `enabled` is the
+            switch (network.decoy.enabled, default false); `ready` is whether the
+            decoy CA and profile materialized; `mechanism`/`limits` state that a
+            workspace's IP-discovery is answered with a consistent invented
+            identity, and that it is a DECOY, not a security boundary (a tenant's
+            own endpoint, traceroute hops and hardcoded-IP endpoints are out of
+            scope).
           properties:
             enabled: { type: boolean }
             ready: { type: boolean }

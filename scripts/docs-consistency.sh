@@ -232,6 +232,38 @@ else
   fail "identity-harness.documented" "docs/VERIFICATION.md does not mention scripts/identity-check.sh"
 fi
 
+# --- 4d-ter. the egress-decoy acceptance harness exists and is documented ----
+# egress-decoy-check.sh is the only check that measures, from a real workspace
+# with the decoy ON, that every covered channel answers the invented identity and
+# that ordinary internet still works, so it must exist, be executable, and be
+# named in VERIFICATION.md and wired into the Makefile.
+
+if [ -f scripts/egress-decoy-check.sh ]; then
+  ok "egress-decoy-harness.exists"
+else
+  fail "egress-decoy-harness.exists" "scripts/egress-decoy-check.sh is missing"
+fi
+if [ -x scripts/egress-decoy-check.sh ]; then
+  ok "egress-decoy-harness.executable"
+else
+  fail "egress-decoy-harness.executable" "scripts/egress-decoy-check.sh is not executable"
+fi
+if grep -qF 'egress-decoy-check.sh' docs/VERIFICATION.md; then
+  ok "egress-decoy-harness.documented"
+else
+  fail "egress-decoy-harness.documented" "docs/VERIFICATION.md does not mention scripts/egress-decoy-check.sh"
+fi
+if grep -qE '^egress-decoy-check:' Makefile; then
+  ok "makefile.target.egress-decoy-check"
+else
+  fail "makefile.target.egress-decoy-check" "Makefile has no 'egress-decoy-check:' target"
+fi
+if grep -qE '^\.PHONY:.*\begress-decoy-check\b' Makefile; then
+  ok "makefile.phony.egress-decoy-check"
+else
+  fail "makefile.phony.egress-decoy-check" "'egress-decoy-check' is not in .PHONY"
+fi
+
 # The masking shim source and the embedded artifact must both be present, so a
 # stale or missing .so cannot silently disable the mask.
 if [ -f internal/executor/hostmask/hostmask.c ]; then
@@ -272,6 +304,49 @@ if grep -qi 'egress_proxy' configs/config.example.yaml && grep -qi 'ZEROPS-IO\|R
   ok "egress-address.documented"
 else
   fail "egress-address.documented" "the egress-address ADR / egress_proxy knob is not documented"
+fi
+# The egress-decoy work (this iteration): the switch, the capability, the honest
+# limits and the shape-pattern approach must all be documented and wired, so they
+# cannot silently regress out of the docs.
+if grep -qi 'egress_decoy' docs/API.md && grep -qi 'egress_decoy' api/openapi.yaml; then
+  ok "egress-decoy.documented"
+else
+  fail "egress-decoy.documented" "egress_decoy is not documented in docs/API.md and api/openapi.yaml"
+fi
+if grep -qF 'network.decoy.enabled' internal/config/config.go && grep -qF 'decoy:' configs/config.example.yaml; then
+  ok "egress-decoy.config"
+else
+  fail "egress-decoy.config" "network.decoy is missing from internal/config/config.go or configs/config.example.yaml"
+fi
+if grep -qiF 'decoy layer, not a security boundary' docs/DECISIONS.md; then
+  ok "egress-decoy.adr-boundary-statement"
+else
+  fail "egress-decoy.adr-boundary-statement" "ADR 84's 'a decoy layer, not a security boundary' sentence is missing"
+fi
+if grep -qF 'ADR 84' docs/DECISIONS.md && grep -qiF 'own endpoint' docs/DECISIONS.md; then
+  ok "egress-decoy.adr-own-endpoint"
+else
+  fail "egress-decoy.adr-own-endpoint" "ADR 84 or its own-endpoint limit is missing"
+fi
+if [ -f docs/EGRESS-DECOY.md ] && grep -qiF 'not a security boundary' docs/EGRESS-DECOY.md; then
+  ok "egress-decoy.enumeration-doc"
+else
+  fail "egress-decoy.enumeration-doc" "docs/EGRESS-DECOY.md is missing or lacks the boundary statement"
+fi
+if grep -qF 'hostPatterns' internal/decoy/profile.go && grep -qF 'MatchesHost' internal/decoy/profile.go; then
+  ok "egress-decoy.pattern-not-list"
+else
+  fail "egress-decoy.pattern-not-list" "the decoy hostname SHAPE patterns are missing from internal/decoy/profile.go"
+fi
+if grep -qF 'invented.agrees_with_decoy' scripts/egress-decoy-check.sh; then
+  ok "egress-decoy.harness-invented"
+else
+  fail "egress-decoy.harness-invented" "scripts/egress-decoy-check.sh has no invented-hostname assertion"
+fi
+if grep -qF 'control.pip_download' scripts/egress-decoy-check.sh; then
+  ok "egress-decoy.harness-negative-control"
+else
+  fail "egress-decoy.harness-negative-control" "scripts/egress-decoy-check.sh has no pip negative control"
 fi
 # The identity harness must assert the two new groups (provider tools + dlsym).
 if grep -qF 'provider.no_vendor_strings' scripts/identity-check.sh; then

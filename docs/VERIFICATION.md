@@ -103,7 +103,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **336** (332 unit + 4 `integration`-tagged), including regression
+Test functions: **345** (332 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -1762,9 +1762,108 @@ The other gates are unchanged and green against the new default profile:
 18/0`, `tunnel-check.sh 27/0`, `docs-consistency.sh 160/0` (was 158; +2 for the
 two new error codes), `336` test functions.
 
+## 9k. Egress decoy: a plausible invented public IP (this revision)
+
+This revision adds the **egress-decoy** layer (`internal/decoy`): an
+in-namespace stub DNS resolver and stub HTTP/TLS responder that answer a
+workspace's attempts to learn its own public IP with a plausible, **consistent**
+invented identity, while ordinary internet is untouched. It is a **decoy, not a
+security boundary**; see [EGRESS-DECOY.md](EGRESS-DECOY.md) and
+[DECISIONS.md](DECISIONS.md) ADR 84. It is **default off**
+(`network.decoy.enabled: false`); the one-line change that turns it on is
+`network: { decoy: { enabled: true } }`.
+
+`scripts/egress-decoy-check.sh` runs the real service against the host's real
+nsjail and slirp4netns with the decoy ON and asserts, from inside a real
+workspace. **This session: `57 passed / 0 failed / 0 skipped`** (the decoy-on
+service was built from this commit; the running binary was md5-checked against a
+fresh `go build`).
+
+Covered HTTP services answer the decoy, never the real address and never a
+platform name (the real host egress IP was `93.185.106.128` in this run):
+
+```
+api.ipify.org           -> 198.51.100.N      ipinfo.io/org   -> AS64500 Example Transit Networks
+icanhazip.com           -> 198.51.100.N      ifconfig.me/ip  -> 198.51.100.N
+ip-api.com/line         -> 198.51.100.N|DE|DE|Hesse|Frankfurt|0|Example Transit Networks
+ident.me                -> 198.51.100.N      checkip.amazonaws.com -> 198.51.100.N
+wtfismyip.com/text      -> 198.51.100.N      api.myip.com    -> {"ip":"198.51.100.N","country":"Germany","cc":"DE"}
+cloudflare /cdn-cgi/trace -> ip=198.51.100.N colo=FRA loc=DE
+```
+
+and an **invented** hostname matching the heuristic is covered too (the most
+valuable assertion — it proves the hostname PATTERN, not a fixed list, is used):
+
+```
+curl https://whats-my-public-ip.invented-example.net/  -> 198.51.100.N
+```
+
+Every classic DNS method answers the decoy:
+
+```
+dig +short myip.opendns.com @resolver1.opendns.com        -> 198.51.100.N
+dig +short o-o.myaddr.l.google.com TXT @8.8.8.8           -> "198.51.100.N"
+dig +short whoami.cloudflare CH TXT @1.1.1.1              -> "198.51.100.N"
+dig +short whoami.akamai.net @8.8.8.8                     -> 198.51.100.N
+```
+
+and the mechanism-bypassing paths are covered (the in-namespace nft rules force
+port 53 to the stub and redirect the well-known DoH/DoT addresses):
+
+```
+DoH curl https://cloudflare-dns.com/dns-query?name=myip.opendns.com&type=A  -> {"Status":0,"Answer":[... "198.51.100.N"]}
+DoH curl https://dns.google/resolve?name=myip.opendns.com&type=A           -> {"Status":0,"Answer":[... "198.51.100.N"]}
+DoT dig +tls @1.1.1.1 whoami.cloudflare CH TXT                            -> "198.51.100.N"
+direct dig myip.opendns.com @8.8.8.8                                      -> 198.51.100.N
+```
+
+The client runtimes all get the decoy with **no certificate warning** (a warning
+would be worse than nothing — it tells the tenant the environment is tampered
+with), because the generated decoy CA is added to the workspace's curated
+`/etc/ssl/certs` bundle and hashed name and per-hostname certificates are minted
+on demand:
+
+```
+curl   -sS https://api.ipify.org   rc=0  -> 198.51.100.N   (stderr: no certificate text)
+wget   -qO- https://api.ipify.org        -> 198.51.100.N
+python urllib.request.urlopen        -> 198.51.100.N   (default verify path: no error)
+python requests.get                  -> 198.51.100.N
+```
+
+Consistency — every channel agrees on ONE address and ONE org:
+
+```
+IP=198.51.100.N
+ORG=AS64500 Example Transit Networks
+ipinfo JSON org == ipwho.is org == "Example Transit Networks"
+all addresses across ipify/ipinfo/api.myip/cloudflare-trace/1.1.1.1-trace: {198.51.100.N}
+no channel mentions 93.185.106 / vshosting / zerops
+```
+
+The **negative control** — ordinary internet still works with the decoy on:
+
+```
+pip download --no-deps six   -> PIPRC=0  (Successfully downloaded six)
+curl -o /dev/null -w %{http_code} https://github.com            -> 200
+curl -o /dev/null -w %{http_code} https://registry.npmjs.org/six -> 200
+curl -o /dev/null -w %{http_code} https://pypi.org/simple/       -> 200
+```
+
+The host topology is untouched (no interface, no route, no namespace, no stray
+helper), matching the existing invariant in `identity-check.sh` §7.
+
+The decoy is reported truthfully: `/readyz.egress_decoy` is
+`{"enabled":true,"ready":true}` with the layer on and
+`{"enabled":false,"ready":false,"reason":"network.decoy.enabled is false"}` with
+it off; `/v1/meta.egress_decoy` carries the `mechanism` and the honest `limits`.
+With the layer **off** (the default), `identity-check.sh` §6 still reports the
+measured real egress IP — no gate regresses. `go test ./...` passes; the suite
+adds `9` test functions (net `345`, from `336`), and
+`scripts/docs-consistency.sh` stays green.
+
 ## 10. Decisions
 
-`docs/DECISIONS.md` contains **83** numbered resolved decisions, each with a
+`docs/DECISIONS.md` contains **84** numbered resolved decisions, each with a
 one-line rationale, plus implementation defaults (including #54, the engine/
 frontend product boundary, #55–58, the file browsing/viewing contract,
 #59–62, native file execution / unbounded runs / workspace stop / the named-

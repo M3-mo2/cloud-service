@@ -3,7 +3,7 @@ PKG := ./...
 GO ?= go
 CC ?= cc
 
-.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check identity-check docs-check
+.PHONY: all build shim test test-race lint fmt vet run clean tidy integration acceptance session-check process-check tunnel-check identity-check egress-decoy-check docs-check
 
 all: fmt vet shim build test
 
@@ -100,6 +100,16 @@ tunnel-check:
 # address, and that the host topology is untouched.
 identity-check:
 	sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh
+
+# Egress-decoy acceptance against REAL nsjail, slirp4netns and nft on the host
+# (needs root, no container). It asserts, from inside a real workspace with the
+# decoy ON, that every covered channel (HTTP echo services, an invented hostname,
+# all four DNS echo methods, DoH/DoT/direct resolver, all client runtimes) answers
+# a consistent invented identity and NOT the real address nor a platform name,
+# with no certificate warning, and that pip/github/npm/pypi still work. The layer
+# is DEFAULT OFF; this target turns it on only for the check.
+egress-decoy-check:
+	sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin:/usr/sbin" bash scripts/egress-decoy-check.sh
 
 # Documentation-consistency gate. It derives its assertions from the code
 # (router, error constants, test count) rather than the prose, so it fails when
