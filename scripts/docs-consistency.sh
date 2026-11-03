@@ -1067,6 +1067,70 @@ else
   fi
 fi
 
+# --- 10. the integration guide ----------------------------------------------
+# docs/INTEGRATION-GUIDE.md is the usage contract a frontend implements against.
+# It cannot silently drift from the code, so every assertion below is derived
+# from the code (the OpenAPI spec, the error constants, model.Version, the meta
+# handler) rather than from a literal list retyped into this script.
+
+GUIDE="docs/INTEGRATION-GUIDE.md"
+
+# 10a. every path in api/openapi.yaml is mentioned in the guide.
+openapi_paths() {
+  grep -E '^  /' api/openapi.yaml | sed -E 's/^  ([^:]+):.*/\1/'
+}
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  if grep -qF -- "$p" "$GUIDE"; then
+    ok "guide.path $p"
+  else
+    fail "guide.path.$p" "not mentioned in $GUIDE"
+  fi
+done <<< "$(openapi_paths)"
+
+# 10b. every error-code constant in internal/model appears in the guide.
+while IFS= read -r code; do
+  [ -n "$code" ] || continue
+  if grep -qF -- "$code" "$GUIDE"; then
+    ok "guide.code $code"
+  else
+    fail "guide.code.$code" "error code not in $GUIDE"
+  fi
+done <<< "$CODES"
+
+# 10c. the guide states the current service version (MODEL_VERSION from section 9).
+if grep -qF -- "$MODEL_VERSION" "$GUIDE"; then
+  ok "guide.version $MODEL_VERSION"
+else
+  fail "guide.version" "$GUIDE does not state the current service version $MODEL_VERSION"
+fi
+
+# 10d. every top-level key of the GET /v1/meta response appears in the guide.
+# The key list is extracted from the handler's final writeJSON map literal in
+# internal/api/router.go, so a new advertised capability fails the gate until it
+# is documented. Nested map literals are indented deeper than the two tabs of a
+# top-level key, so the awk block yields exactly the top-level keys.
+meta_keys() {
+  awk '
+  /^func \(s \*Server\) handleMeta/ { f=1 }
+  f && /writeJSON\(w, http\.StatusOK, map\[string\]any\{/ { b=1; next }
+  b && /^\t\}\)/ { b=0; f=0; next }
+  b && /^\t\t"[a-z_]+":/ {
+    k=substr($0, index($0,"\"")+1)
+    sub(/".*/, "", k)
+    print k
+  }
+  ' internal/api/router.go
+}
+while IFS= read -r key; do
+  [ -n "$key" ] || continue
+  if grep -qF -- "$key" "$GUIDE"; then
+    ok "guide.meta-key $key"
+  else
+    fail "guide.meta-key.$key" "top-level /v1/meta key not in $GUIDE"
+  fi
+done <<< "$(meta_keys)"
+
 # --- tally ------------------------------------------------------------------
 
 printf '\npassed=%d failed=%d\n' "$PASS" "$FAIL"

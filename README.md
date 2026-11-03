@@ -88,7 +88,12 @@ product's job; this service authenticates only static per-principal API keys.
   [docs/DECISIONS.md](docs/DECISIONS.md) #85/#86 and
   [docs/VERIFICATION.md](docs/VERIFICATION.md) §14.
 
-See [docs/API.md](docs/API.md) for the full endpoint reference.
+See [docs/API.md](docs/API.md) for the full endpoint reference. If you are
+building a client (a bot, a web console, a CLI), start with the
+[client integration guide](docs/INTEGRATION-GUIDE.md) — the usage contract,
+in call order, with the exact request/response fields to depend on — and
+[docs/INTEGRATION-VERIFICATION.md](docs/INTEGRATION-VERIFICATION.md) for the
+real transcripts behind it.
 
 ## Quick start
 
