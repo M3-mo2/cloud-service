@@ -374,3 +374,27 @@ func TestWatchdogDisabledChangesNothing(t *testing.T) {
 		t.Fatalf("disabled watchdog must never refuse a write: %v", err)
 	}
 }
+
+// TestForgetClearsRateState: deleting a workspace drops its write-rate state, so
+// the watchdog map does not grow without bound and no stale refusal lingers.
+func TestForgetClearsRateState(t *testing.T) {
+	svc, _ := newRateService(t, time.Second)
+	wsID := "ws_gone"
+	base := time.Unix(0, 0)
+	svc.now = func() time.Time { return base }
+	svc.runs["r1"] = &runningRun{runID: "r1", wsID: wsID, cancel: func() {}, done: make(chan struct{})}
+	svc.observeWriteRates(snapW(wsID, 0, 64<<20, 1, true))
+	svc.rateMu.Lock()
+	_, present := svc.rateState[wsID]
+	svc.rateMu.Unlock()
+	if !present {
+		t.Fatal("rate state should exist after a sample")
+	}
+	svc.metricsForget(wsID)
+	svc.rateMu.Lock()
+	_, present = svc.rateState[wsID]
+	svc.rateMu.Unlock()
+	if present {
+		t.Fatal("metricsForget must drop the workspace's rate state")
+	}
+}

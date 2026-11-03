@@ -107,7 +107,7 @@ PASS
 `golangci-lint` is not installed on this host, so `go vet ./...` is the lint
 gate (both the Makefile and this document use `go vet`).
 
-Test functions: **488** (484 unit + 4 `integration`-tagged), including regression
+Test functions: **489** (485 unit + 4 `integration`-tagged), including regression
 tests for the findings below (`TestRenderConfigRlimitUnits`,
 `TestFormatEnvAllowlist`, `TestSandboxCwd`, `TestClassifyLaunchFailure`,
 `TestRecoverRuns`, `TestCreateRunFileValidatesPath`,
@@ -2536,7 +2536,7 @@ identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/
       disk.df_bare_workspace_1k 262144
       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
 docs-consistency.sh             272 passed / 0 failed
- go test ./...                  488 test functions (from 353)
+ go test ./...                  489 test functions (from 353)
 ```
 
 The full gate set re-run for this revision, one gate at a time (concurrent runs
@@ -2554,7 +2554,7 @@ scripts/archive-check.sh        102 passed / 0 failed
 scripts/metrics-check.sh         56 passed / 0 failed
 scripts/spread-check.sh          32 passed / 0 failed
 scripts/write-rate-check.sh      29 passed / 0 failed             (write-rate ceiling; see §9p)
-go test ./...                    488 test functions; go vet ./... clean
+go test ./...                    489 test functions; go vet ./... clean
 ```
 
 `scripts/metrics-check.sh` is the new gate for this revision: it drives the real

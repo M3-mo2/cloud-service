@@ -111,6 +111,11 @@ func (s *Service) metricsForget(id string) {
 	if s.metricsProvider != nil {
 		s.metricsProvider.remove(id)
 	}
+	// Drop the write-rate state too, so a deleted workspace leaves nothing
+	// behind in the watchdog's map.
+	s.rateMu.Lock()
+	delete(s.rateState, id)
+	s.rateMu.Unlock()
 }
 
 // Candidates assembles the per-tick candidate set. The live-cgroup join is
