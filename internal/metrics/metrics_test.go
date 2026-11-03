@@ -246,7 +246,7 @@ func TestLazyStartAndStop(t *testing.T) {
 	if got := s.Counters().Ticks; got != 0 {
 		t.Fatalf("ticks with no subscriber = %d, want 0", got)
 	}
-	sub, err := s.Subscribe(Scope{OwnerID: "u1"})
+	sub, err := s.Subscribe(Scope{OwnerID: "u1"}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +291,7 @@ func TestFanOutReadsIndependentOfSubscribers(t *testing.T) {
 
 	var subs []*subscriber
 	for i := 0; i < 8; i++ {
-		sub, err := s.Subscribe(Scope{OwnerID: "u1"})
+		sub, err := s.Subscribe(Scope{OwnerID: "u1"}, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -349,7 +349,7 @@ func TestCoalescingDropsFrames(t *testing.T) {
 	r.diskOK["/none"] = true
 	cfg := DefaultConfig()
 	s := New(cfg, p, r)
-	sub, err := s.Subscribe(Scope{OwnerID: "u1"})
+	sub, err := s.Subscribe(Scope{OwnerID: "u1"}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestRepeatOpenCloseNoLeak(t *testing.T) {
 	cfg := DefaultConfig()
 	s := New(cfg, p, r)
 	for i := 0; i < 10; i++ {
-		sub, err := s.Subscribe(Scope{OwnerID: "u1"})
+		sub, err := s.Subscribe(Scope{OwnerID: "u1"}, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -438,7 +438,7 @@ func TestFrameIsParseableJSON(t *testing.T) {
 	p.set([]WorkspaceInfo{{ID: "ws", OwnerID: "u1", DiskRoot: "/none", DiskLimitBytes: 64, MemoryLimitBytes: 64}})
 	r.diskOK["/none"] = true
 	s := New(DefaultConfig(), p, r)
-	sub, _ := s.Subscribe(Scope{OwnerID: "u1"})
+	sub, _ := s.Subscribe(Scope{OwnerID: "u1"}, 0)
 	var last time.Time
 	for i := 0; i < 3; i++ {
 		s.publish()

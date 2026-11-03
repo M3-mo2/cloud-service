@@ -669,17 +669,38 @@ func (r *NsjailRunner) trackCgroup(runID, dir string) {
 	r.mu.Unlock()
 }
 
-// RunCgroupDirs returns a copy of the live run ID -> NSJAIL cgroup directory
-// map. It is the sampler's O(live runs) source for a workspace's run cgroups:
-// the service joins it against its own run table (run ID -> workspace ID), so a
-// cgroup can be attributed without scanning /sys/fs/cgroup or reading
+// RunCgroupDirs returns the live run ID -> NSJAIL cgroup directory map. It is
+// the sampler's O(live runs) source for a workspace's run cgroups: the service
+// joins it against its own run table (run ID -> workspace ID), so a cgroup can
+// be attributed without scanning /sys/fs/cgroup or reading
 // /proc/<pid>/environ.
+//
+// A run whose cgroup was not resolved at launch (the bounded fork-race window
+// can expire on a loaded host, in which case trackCgroup stored nothing) is
+// re-resolved here from the nsjail pid the runner already tracks. This is the
+// SAME registry and the SAME resolver (CgroupForNsjailPID), not a second one:
+// it only closes the race so a live run is never reported as RAM 0. The
+// resolution happens outside the lock (it can briefly wait for the cgroup).
 func (r *NsjailRunner) RunCgroupDirs() map[string]string {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make(map[string]string, len(r.cgroupDirs))
-	for id, dir := range r.cgroupDirs {
-		out[id] = dir
+	out := make(map[string]string, len(r.procs))
+	needPID := map[string]int{}
+	for id, p := range r.procs {
+		if dir := r.cgroupDirs[id]; dir != "" {
+			out[id] = dir
+			continue
+		}
+		if p != nil {
+			needPID[id] = p.Pid
+		}
+	}
+	r.mu.Unlock()
+
+	for id, pid := range needPID {
+		if dir := CgroupForNsjailPID(pid); dir != "" {
+			out[id] = dir
+			r.trackCgroup(id, dir)
+		}
 	}
 	return out
 }

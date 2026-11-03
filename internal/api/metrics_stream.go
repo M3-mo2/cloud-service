@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"sandboxd/internal/metrics"
 	"sandboxd/internal/model"
@@ -37,21 +38,23 @@ func (s *Server) workspaceScope(w http.ResponseWriter, r *http.Request) (metrics
 	return metrics.Scope{OwnerID: ws.OwnerID, WorkspaceID: ws.ID}, true
 }
 
-// resolveInterval validates the ?interval= override against the floor. A value
-// below the floor is refused with 422 (never silently raised); a value above the
-// ceiling is clamped. An absent value uses the sampler's configured default.
-func (s *Server) resolveInterval(w http.ResponseWriter, r *http.Request) bool {
+// resolveInterval validates the ?interval= override against the floor and
+// returns the clamped duration (0 when absent). A value below the floor is
+// refused with 422 (never silently raised); a value above the ceiling is
+// clamped. An absent value uses the sampler's configured default.
+func (s *Server) resolveInterval(w http.ResponseWriter, r *http.Request) (time.Duration, bool) {
 	raw := r.URL.Query().Get("interval")
 	if raw == "" {
-		return true
+		return 0, true
 	}
 	sampler := s.svc.Metrics()
-	if _, err := sampler.FormatOverride(raw); err != nil {
+	d, err := sampler.FormatOverride(raw)
+	if err != nil {
 		writeError(w, model.Wrap(422, model.CodeUnprocessable, err.Error(),
 			map[string]string{"interval": raw, "min_interval": sampler.MinInterval().String()}))
-		return false
+		return 0, false
 	}
-	return true
+	return d, true
 }
 
 // handleMetricsStream is the service-wide SSE stream (every workspace the
@@ -61,14 +64,15 @@ func (s *Server) handleMetricsStream(w http.ResponseWriter, r *http.Request) {
 		s.metricsUnavailable(w)
 		return
 	}
-	if !s.resolveInterval(w, r) {
+	override, ok := s.resolveInterval(w, r)
+	if !ok {
 		return
 	}
 	scope, ok := s.ownerScope(w, r)
 	if !ok {
 		return
 	}
-	s.serveMetricsStream(w, r, scope)
+	s.serveMetricsStream(w, r, scope, override)
 }
 
 // handleWorkspaceMetricsStream is the single-workspace SSE stream.
@@ -77,28 +81,29 @@ func (s *Server) handleWorkspaceMetricsStream(w http.ResponseWriter, r *http.Req
 		s.metricsUnavailable(w)
 		return
 	}
-	if !s.resolveInterval(w, r) {
+	override, ok := s.resolveInterval(w, r)
+	if !ok {
 		return
 	}
 	scope, ok := s.workspaceScope(w, r)
 	if !ok {
 		return
 	}
-	s.serveMetricsStream(w, r, scope)
+	s.serveMetricsStream(w, r, scope, override)
 }
 
 // serveMetricsStream subscribes, writes the SSE header, flushes an initial
 // comment, then pumps frames until the client disconnects or the server shuts
 // down. It guarantees the subscriber is removed on every exit path (defer), so
 // one leaked subscriber cannot keep the sampler alive forever.
-func (s *Server) serveMetricsStream(w http.ResponseWriter, r *http.Request, scope metrics.Scope) {
+func (s *Server) serveMetricsStream(w http.ResponseWriter, r *http.Request, scope metrics.Scope, override time.Duration) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, model.New(500, model.CodeInternal, "streaming unsupported"))
 		return
 	}
 	sampler := s.svc.Metrics()
-	sub, err := sampler.Subscribe(scope)
+	sub, err := sampler.Subscribe(scope, override)
 	if err != nil {
 		if err == metrics.ErrTooManySubscribers {
 			writeError(w, model.New(503, model.CodeUnavailable, "too many metrics subscribers"))

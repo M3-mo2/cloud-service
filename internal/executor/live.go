@@ -207,13 +207,13 @@ type liveProcess struct {
 	// session would otherwise race the resolution.
 	nsjailPID int
 
-	// cgroupDir is the resolved NSJAIL cgroup the session runs in (cache; 0 when
-	// not yet resolved). It is the cgroup-scoped handle used to kill the whole
+	// cgroupDir is the resolved NSJAIL cgroup the session runs in (cache; empty
+	// until resolved). It is the cgroup-scoped handle used to kill the whole
 	// session tree (including a process that escaped its process group with
-	// setsid()) and to remove the cgroup when the session ends.
+	// setsid()) and to remove the cgroup when the session ends. A failed
+	// resolution is retried on the next call rather than cached (see cgroup()).
 	cgroupMu  sync.Mutex
 	cgroupDir string
-	cgroupOK  bool
 
 	// helperTail mirrors the tail of the helper's stderr for a PTY session so
 	// an early PTY-allocation failure (PTYErrorMarker) is recognisable without
@@ -250,17 +250,20 @@ func (p *liveProcess) Pid() int {
 	return p.cmd.Process.Pid
 }
 
-// cgroup resolves (once) the NSJAIL cgroup directory of the session's jail. It
-// returns "" when the cgroup cannot be located (the process already exited, or
-// /proc is restricted); Kill then falls back to the process group.
+// cgroup resolves the NSJAIL cgroup directory of the session's jail. It returns
+// "" when the cgroup cannot be located (the process already exited, or /proc is
+// restricted); Kill then falls back to the process group.
+//
+// A failed resolution is NOT cached: the bounded fork-race window can expire on
+// a loaded host, so a later call (the sampler's CgroupDir) retries with the same
+// deterministic resolver until the directory appears. Once found it is cached.
 func (p *liveProcess) cgroup() string {
 	p.cgroupMu.Lock()
 	defer p.cgroupMu.Unlock()
-	if p.cgroupOK {
+	if p.cgroupDir != "" {
 		return p.cgroupDir
 	}
 	p.cgroupDir = CgroupForNsjailPID(p.nsjailPID)
-	p.cgroupOK = true
 	return p.cgroupDir
 }
 

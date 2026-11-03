@@ -129,8 +129,18 @@ type Counters struct {
 	CgroupReads int64 `json:"cgroup_reads"`
 	// StatfsReads counts statfs calls (one per candidate workspace per tick).
 	StatfsReads int64 `json:"statfs_reads"`
+	// TreeWalkReads is a CONTRACT GUARD and is always 0: there is no code path
+	// that walks a workspace directory tree, because the disk figure is a single
+	// statfs (O(1)). It exists so a future change that reintroduced a walk on the
+	// sampling path would show a non-zero counter and be caught.
+	TreeWalkReads int64 `json:"tree_walk_reads"`
 	// Subscribers is the current number of connected streams.
 	Subscribers int64 `json:"subscribers"`
+	// Running is 1 while the sampler goroutine is alive (at least one
+	// subscriber is connected), and 0 otherwise. It is the unambiguous
+	// lazy-start/disconnect signal: with no subscribers the ticker does not
+	// exist and Ticks is frozen.
+	Running int64 `json:"running"`
 	// DroppedFrames counts frames coalesced away because a subscriber had not
 	// read its previous frame. It proves coalescing rather than buffering.
 	DroppedFrames int64 `json:"dropped_frames"`

@@ -78,7 +78,8 @@ type Sampler struct {
 	provider Provider
 	reader   Reader
 
-	interval atomic.Int64 // nanoseconds
+	interval        atomic.Int64 // nanoseconds (effective, may be overridden)
+	defaultInterval time.Duration
 
 	mu      sync.Mutex
 	subs    map[uint64]*subscriber
@@ -102,6 +103,7 @@ func New(cfg Config, provider Provider, reader Reader) *Sampler {
 		reader:   reader,
 		subs:     make(map[uint64]*subscriber),
 	}
+	s.defaultInterval = interval
 	s.interval.Store(int64(interval))
 	return s
 }
@@ -141,20 +143,35 @@ func (s *Sampler) IncludeCPU() bool { return s.cfg.IncludeCPU }
 
 // Counters returns a point-in-time copy of the sampler's work counters.
 func (s *Sampler) Counters() Counters {
+	s.mu.Lock()
+	running := s.running
+	s.mu.Unlock()
+	var run int64
+	if running {
+		run = 1
+	}
 	return Counters{
 		Ticks:         s.c.ticks.Load(),
 		CgroupReads:   s.c.cgroupReads.Load(),
 		StatfsReads:   s.c.statfsReads.Load(),
 		Subscribers:   s.c.subscribers.Load(),
+		Running:       run,
 		DroppedFrames: s.c.dropped.Load(),
 		Candidates:    int(s.c.candidates.Load()),
 	}
 }
 
-// Subscribe registers a scoped stream and lazily starts the sampler. The
-// returned subscriber must be Closed by the caller on every exit path (the
-// handler defers it), which is what stops the sampler when the last one leaves.
-func (s *Sampler) Subscribe(scope Scope) (*subscriber, error) {
+// Subscribe registers a scoped stream and lazily starts the sampler. An
+// optional per-request interval override adjusts the ONE service-wide cadence
+// (there is a single ticker and a single cadence for every subscriber); the
+// value is clamped to [MinInterval, MaxInterval], so a client can never drive
+// the engine below the configured floor. The returned subscriber must be Closed
+// by the caller on every exit path (the handler defers it), which is what stops
+// the sampler when the last one leaves.
+func (s *Sampler) Subscribe(scope Scope, override time.Duration) (*subscriber, error) {
+	if override > 0 {
+		s.SetInterval(override)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopped {
@@ -204,9 +221,12 @@ func (s *Sampler) startLocked() {
 	go s.run(s.stopCh, s.doneCh, s.wakeCh)
 }
 
-// stopLocked signals the loop to stop. Caller holds s.mu.
+// stopLocked signals the loop to stop and restores the configured default
+// cadence, so a per-request override never lingers for the next session (a
+// stopped sampler has no cadence to carry). Caller holds s.mu.
 func (s *Sampler) stopLocked() {
 	s.running = false
+	s.interval.Store(int64(s.defaultInterval))
 	close(s.stopCh)
 }
 
@@ -476,6 +496,8 @@ func ParseCounters(c Counters, name string) int64 {
 		return c.StatfsReads
 	case "subscribers":
 		return c.Subscribers
+	case "running":
+		return c.Running
 	case "dropped_frames":
 		return c.DroppedFrames
 	case "candidates":
