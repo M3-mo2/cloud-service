@@ -17,10 +17,17 @@
 # and no assertion is ever weakened to make a run pass):
 #   1. an allow_net:false workspace cannot read any of the "already closed"
 #      paths: /etc/machine-id, /etc/os-release, /etc/hostname, /etc/hosts,
-#      /etc/resolv.conf, /etc/hostid, /etc/shadow, /proc/version,
-#      /proc/meminfo, /proc/cpuinfo, /proc/net/dev, /proc/1/cgroup,
+#      /etc/resolv.conf, /etc/hostid, /etc/shadow, /proc/net/dev, /proc/1/cgroup,
 #      /proc/self/cgroup, /proc/self/mountinfo, /sys/class/net, every
 #      /sys/class/dmi/id/*, /var/run/zerops and /run/zerops;
+#   1b. the CURATED per-workspace /proc (which is NOT the real procfs) reports
+#      ONLY the workspace's own limits -- meminfo MemTotal = the workspace
+#      memory, SwapTotal 0, exactly cpu_cores processors, the workspace kernel
+#      version, no zfs and no host path in mounts -- and `free` agrees, with the
+#      host's real memory absent;
+#   1c. df/stat -f/os.statvfs report the workspace's OWN disk allowance (a real
+#      per-workspace filesystem), not the host volume, and a write past the
+#      allowance fails at the boundary (ENOSPC);
 #   2. hostname is the generic "sandbox" (never the host's), `hostname -f`
 #      fails, `hostname -I` is empty, and the operator's internal DNS names do
 #      not resolve;
@@ -275,8 +282,8 @@ WSN=$(curl -s -m 20 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"c
 [ -n "$WSN" ] || { echo "FATAL: no workspace id"; exit 1; }
 put_py "$A" "$WSN" /closed.py 'import os
 paths = ["/etc/machine-id","/etc/os-release","/etc/hostname","/etc/hosts",
-         "/etc/resolv.conf","/etc/hostid","/etc/shadow","/proc/version",
-         "/proc/meminfo","/proc/cpuinfo","/proc/net/dev","/proc/1/cgroup",
+         "/etc/resolv.conf","/etc/hostid","/etc/shadow",
+         "/proc/net/dev","/proc/1/cgroup",
          "/proc/self/cgroup","/proc/self/mountinfo","/sys/class/net",
          "/sys/class/dmi/id/product_name","/sys/class/dmi/id/sys_vendor",
          "/sys/class/dmi/id/product_uuid","/sys/class/dmi/id/board_name",
@@ -295,6 +302,100 @@ chk "closed.paths_none_readable" "0" "${READABLE:-0}"
 if [ "${READABLE:-0}" != "0" ]; then
   printf '%s\n' "$CLOSED_OUT" | grep '^READABLE' | sed 's/^/    /'
 fi
+
+# --- 1b) the curated /proc reports ONLY the workspace's own limits -----------
+# /proc is not mounted (mount_proc stays false), but a curated, per-workspace
+# payload IS bound over it so `free -h`, `uptime` and a bare `df` work. It must
+# carry the WORKSPACE's own resource facts and never a host value, and must
+# agree with every other channel (the shim's uname/sysconf and the API record).
+# A host value anywhere here is a leak; a value that disagrees with the shim is
+# an inconsistency. Both are hard failures.
+echo "=== 1b) the curated /proc reports the workspace's own limits ==="
+put_py "$A" "$WSN" /curated.py 'import os
+def rd(p):
+    try:
+        return open(p).read()
+    except Exception as e:
+        return "ERR:" + type(e).__name__
+mi = rd("/proc/meminfo")
+print("MI_ERR" if mi.startswith("ERR") else "MI_OK")
+for line in mi.splitlines():
+    if line.startswith("MemTotal:"):
+        print("MI_MEMTOTAL_KB", line.split()[1])
+    if line.startswith("SwapTotal:"):
+        print("MI_SWAPTOTAL_KB", line.split()[1])
+ci = rd("/proc/cpuinfo")
+print("CI_PROCESSORS", ci.count("processor"))
+print("VERSION", rd("/proc/version").split()[2])
+print("LOADAVG", rd("/proc/loadavg").strip())
+print("STAT_HAS_CPU", "1" if rd("/proc/stat").startswith("cpu ") else "0")
+m = rd("/proc/mounts")
+print("MOUNTS_ZFS", "1" if "zfs" in m.lower() else "0")
+print("MOUNTS_HOSTPATH", "1" if "/var/lib" in m or "/dev/sd" in m else "0")
+# free must report the workspace memory, not the host memory.
+import subprocess
+r = subprocess.run(["free","-h"], capture_output=True, text=True, timeout=8)
+print("FREE_MEM", r.stdout.splitlines()[1].split()[1] if r.returncode==0 else "ERR")
+r = subprocess.run(["free","-b"], capture_output=True, text=True, timeout=8)
+print("FREE_MEM_BYTES", r.stdout.splitlines()[1].split()[1] if r.returncode==0 else "ERR")
+'
+CUR_OUT=$(exec_py "$A" "$WSN" /curated.py 40 | jsonf "['stdout']")
+cval() { printf '%s' "$CUR_OUT" | awk -v k="$1" '$1==k{print $2}'; }
+chk "curated.meminfo_present" "MI_OK" "$(printf '%s' "$CUR_OUT" | awk '$1=="MI_OK"{print "MI_OK"; exit}')"
+chk "curated.meminfo_memtotal_workspace" "$((WS_MEM_MB * 1024))" "$(cval MI_MEMTOTAL_KB)"
+chk "curated.meminfo_swaptotal_zero" "0" "$(cval MI_SWAPTOTAL_KB)"
+chk "curated.cpuinfo_cpu_count" "$WS_CPUS" "$(cval CI_PROCESSORS)"
+chk "curated.version_workspace_kernel" "yes" "$(printf '%s' "$(cval VERSION)" | grep -q "$WS_RELEASE" && echo yes || echo no)"
+chk "curated.stat_shape" "1" "$(cval STAT_HAS_CPU)"
+chk "curated.mounts_no_zfs" "0" "$(cval MOUNTS_ZFS)"
+chk "curated.mounts_no_host_path" "0" "$(cval MOUNTS_HOSTPATH)"
+chk "curated.free_bytes_agree" "$((WS_MEM_MB * 1024 * 1024))" "$(cval FREE_MEM_BYTES)"
+# The host's real memory must NOT appear in the curated files: read the host
+# total and assert it is absent from /proc/meminfo.
+HOST_MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+chk "curated.no_host_memory_leak" "no" "$(printf '%s' "$CUR_OUT" | grep -q "$HOST_MEM_KB" && echo yes || echo no)"
+
+# --- 1c) disk: df/stat -f/os.statvfs report the workspace allowance ----------
+# With the default disk backend the workspace's /workspace is a real
+# per-workspace filesystem sized to its disk_mb, so all three channels agree on
+# the workspace's OWN allowance (never the host's volume).
+echo "=== 1c) df/stat -f/os.statvfs report the workspace's own disk allowance ==="
+# A dedicated workspace is used so the fill test below leaves its allowance full
+# without affecting the workspaces the later groups write scripts into.
+WSD=$(curl -s -m 20 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"diskchk","limits":{"disk_mb":256}}' | jsonf "['workspace']['id']")
+put_py "$A" "$WSD" /disk.py 'import os, subprocess
+st = os.statvfs("/workspace")
+print("STATVFS_TOTAL", st.f_blocks * st.f_frsize)
+r = subprocess.run(["stat","-f","-c","%b %S","/workspace"], capture_output=True, text=True, timeout=8)
+print("STATF_BLOCKS", r.stdout.split()[0] if r.returncode==0 else "ERR")
+r = subprocess.run(["df","-B1","--output=size","/workspace"], capture_output=True, text=True, timeout=8)
+print("DF_SIZE", r.stdout.splitlines()[-1].strip() if r.returncode==0 else "ERR")
+r = subprocess.run(["df","-B1","--output=fstype","/workspace"], capture_output=True, text=True, timeout=8)
+print("DF_FSTYPE", r.stdout.splitlines()[-1].strip() if r.returncode==0 else "ERR")
+'
+DISK_OUT=$(exec_py "$A" "$WSD" /disk.py 40 | jsonf "['stdout']")
+dval() { printf '%s' "$DISK_OUT" | awk -v k="$1" '$1==k{print $2}'; }
+WS_DISK_MB=256
+chk "disk.statvfs_total_workspace" "$((WS_DISK_MB * 1024 * 1024))" "$(dval STATVFS_TOTAL)"
+chk "disk.statf_agree" "$((WS_DISK_MB * 256))" "$(dval STATF_BLOCKS)"
+chk "disk.df_agree" "$((WS_DISK_MB * 1024 * 1024))" "$(dval DF_SIZE)"
+chk "disk.no_host_fstype" "no" "$([ "$(dval DF_FSTYPE)" = "zfs" ] && echo yes || echo no)"
+# Fill past the allowance: the write must fail at the boundary (ENOSPC), not
+# land. This is the enforcement proof. It runs in the dedicated workspace so the
+# full allowance does not affect later groups.
+put_py "$A" "$WSD" /diskfill.py 'try:
+    with open("/workspace/.fill","wb") as f:
+        f.write(b"x"*(300*1024*1024))
+    print("WROTE", os.path.getsize("/workspace/.fill"))
+except OSError as e:
+    print("ERRNO", e.errno)
+    print("SIZE", os.path.getsize("/workspace/.fill") if os.path.exists("/workspace/.fill") else 0)
+'
+FILL_OUT=$(exec_py "$A" "$WSD" /diskfill.py 60 | jsonf "['stdout']")
+chk "disk.fill_enospc" "28" "$(printf '%s' "$FILL_OUT" | awk '$1=="ERRNO"{print $2}')"
+FILL_SIZE=$(printf '%s' "$FILL_OUT" | awk '$1=="SIZE"{print $2}')
+chk "disk.fill_capped_at_allowance" "yes" "$([ "${FILL_SIZE:-0}" -le $((WS_DISK_MB*1024*1024)) ] && echo yes || echo no)"
+
 
 # --- 2) hostname and internal DNS ------------------------------------------
 echo "=== 2) hostname and internal DNS reveal nothing ==="

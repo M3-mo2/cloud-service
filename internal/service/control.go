@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"sandboxd/internal/model"
-	"sandboxd/internal/workspace"
 )
 
 // MaxNameLen caps a workspace name. It mirrors the create-time validation
@@ -326,7 +325,7 @@ const usageWalkEntries = 100000
 // measured with a bounded walk (see usageWalkEntries); when the walk is cut
 // short, DiskBytesComplete is false and DiskBytes is a lower bound.
 func (s *Service) Usage(w *model.Workspace) (WorkspaceUsage, error) {
-	fs, err := workspace.NewFs(s.store.WorkspaceRoot(w.ID))
+	fs, err := s.WorkspaceFs(w)
 	if err != nil {
 		return WorkspaceUsage{}, err
 	}

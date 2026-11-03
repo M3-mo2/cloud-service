@@ -1019,7 +1019,14 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 	// run's private tmp dir (removed with it) and bind-mounted read-only over
 	// /proc. It carries only the workspace's own resource facts, so `free -h`
 	// and `uptime` report the workspace, never the host. mount_proc stays false.
-	procEnabled := r.cfg.Disk.ProcEnabled
+	//
+	// It is gated on the mask being enabled because the two are the SAME channel
+	// viewed two ways: the shim answers uname/sysconf/sysinfo with the workspace's
+	// values, and this payload answers meminfo/cpuinfo/version with the SAME
+	// values. With masking OFF (a diagnostic state) neither is mounted, so the
+	// channels can never disagree (and the unmasked shim's host values are the
+	// only values present).
+	procEnabled := r.cfg.Disk.ProcEnabled && mask.Enabled
 	procRoot := ""
 	procJail := ""
 	if procEnabled {

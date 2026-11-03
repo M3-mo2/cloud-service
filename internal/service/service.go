@@ -118,8 +118,14 @@ func (s *Service) Store() *storage.Store { return s.store }
 func (s *Service) Runner() executor.Runner { return s.runner }
 
 // WorkspaceFs returns a filesystem view for a workspace, applying the disk
-// quota and performing an audit recheck.
+// quota and performing an audit recheck. It first provisions the workspace's
+// per-workspace disk (when the FUSE backend is active) so the API file path and
+// a sandbox both see the SAME mounted filesystem: a script written through the
+// API is visible to a later exec, and vice versa.
 func (s *Service) WorkspaceFs(w *model.Workspace) (*workspace.Fs, error) {
+	if err := s.ensureWorkspaceDisk(w); err != nil {
+		return nil, err
+	}
 	fs, err := workspace.NewFs(s.store.WorkspaceRoot(w.ID))
 	if err != nil {
 		return nil, err
