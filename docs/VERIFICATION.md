@@ -44,7 +44,8 @@ reports `"cgroups":true`.
 > - `BASE=http://127.0.0.1:8099 KEY=… OTHER_KEY=… DATA_DIR=… NSJAIL=/usr/local/bin/nsjail sudo -n bash scripts/acceptance.sh` → `113 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/subscription-check.sh` → `61 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/archive-check.sh` → `101 passed / 0 failed`
-> - `bash scripts/docs-consistency.sh` → `222 passed / 0 failed`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/metrics-check.sh` → `51 passed / 0 failed`
+> - `bash scripts/docs-consistency.sh` → `245 passed / 0 failed`
 >
 > The unprivileged suites (`gofmt`, `go build`, `go vet`, `go test ./...`, the
 > handler-level assertions and the sandbox-config render tests) were re-run and
@@ -2386,7 +2387,7 @@ identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/
       disk.dfh_root_ok ok ; disk.dfh_root_has_row yes
       disk.df_bare_workspace_1k 262144
       disk.fill_enospc 28 ; disk.fill_capped_at_allowance yes
-docs-consistency.sh             222 passed / 0 failed
+docs-consistency.sh             245 passed / 0 failed
  go test ./...                  458 test functions (from 353)
 ```
 
@@ -2394,7 +2395,7 @@ The full gate set re-run for this revision, one gate at a time (concurrent runs
 corrupt the `docs-consistency` tally), all green:
 
 ```
-scripts/docs-consistency.sh     222 passed / 0 failed   (193 before the archive additions)
+scripts/docs-consistency.sh     245 passed / 0 failed   (222 before the metrics additions)
 scripts/acceptance.sh           113 passed / 0 failed
 scripts/process-stop-check.sh    25 passed / 0 failed
 scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped   (real quick tunnel)
@@ -2402,8 +2403,18 @@ scripts/identity-check.sh       131 passed / 0 failed / 2 skipped   (run 3x: 131
 scripts/egress-decoy-check.sh    58 passed / 0 failed / 0 skipped
 scripts/subscription-check.sh    61 passed / 0 failed             (compressed clock; see §9l)
 scripts/archive-check.sh        101 passed / 0 failed             (native archives; see §9m)
+scripts/metrics-check.sh         51 passed / 0 failed             (resource stream; see §9n)
 go test ./...                    458 test functions; go vet ./... clean
 ```
+
+`scripts/metrics-check.sh` is the new gate for this revision: it drives the real
+service, real nsjail and a real FUSE disk and asserts the whole cheap-stream
+contract. Measured `51 passed / 0 failed` across four consecutive runs — the SSE
+routes, the 1s cadence, RAM tracking a 60 MiB allocation (single and two-run
+SUM), idle elision, fan-out (2 reads/tick with 3 subscribers), O(1) disk with no
+tree walk, the enforced floor, coalescing with a drop counter, clean disconnect
+with lazy start/stop, and the `df`-inside-the-workspace disk assertion that
+caught the `f_bavail` bug. See §9n.
 
 `scripts/archive-check.sh` is the new gate for this revision: it extracts the
 COMMITTED `internal/archive/testdata` fixtures through the real API under real
