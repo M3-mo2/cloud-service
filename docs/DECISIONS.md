@@ -1778,7 +1778,7 @@ reports only the workspace's own facts (host memory asserted ABSENT), that
 `/proc/self/mountinfo` and `/etc/mtab` are present and agree with `/proc/mounts`,
 that bare `df -h`, `df -h /workspace`, `df -h /` and bare `df` all exit 0 and
 show the workspace its own size, and that `df`/`stat -f`/`os.statvfs` agree with
-the allowance while a write past it fails `ENOSPC`; measured `130 passed / 0
+the allowance while a write past it fails `ENOSPC`; measured `131 passed / 0
 failed / 2 skipped` (from 113/0/2), green five consecutive runs.
 
 ## Additional defaults chosen during implementation

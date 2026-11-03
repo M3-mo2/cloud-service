@@ -40,7 +40,7 @@ reports `"cgroups":true`.
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/process-stop-check.sh` → `25 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/session-nsjail-check.sh` → `18 passed / 0 failed`
 > - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/tunnel-check.sh` → `27 passed / 0 failed / 0 skipped`
-> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `130 passed / 0 failed / 2 skipped`
+> - `sudo -n env "PATH=$PATH:/usr/local/go/bin:/usr/local/bin" bash scripts/identity-check.sh` → `131 passed / 0 failed / 2 skipped`
 > - `BASE=http://127.0.0.1:8099 KEY=… OTHER_KEY=… DATA_DIR=… NSJAIL=/usr/local/bin/nsjail sudo -n bash scripts/acceptance.sh` → `113 passed / 0 failed`
 > - `bash scripts/docs-consistency.sh` → `173 passed / 0 failed`
 >
@@ -2029,7 +2029,8 @@ confusing "mount -t proc proc /proc" error rather than a truthful view).
 ### 14c. Gate results for this revision
 
 ```
-identity-check.sh               130 passed / 0 failed / 2 skipped   (from 113/0/2)
+identity-check.sh               131 passed / 0 failed / 2 skipped   (from 113/0/2)
+  harness.closed_materialized yes ; harness.diskchk_materialized yes
   §1  closed.paths_none_readable 0
   §1b curated.meminfo_memtotal_workspace 262144 ; curated.cpuinfo_cpu_count 1
       curated.meminfo_swaptotal_zero 0 ; curated.no_host_memory_leak no
@@ -2055,7 +2056,7 @@ scripts/docs-consistency.sh     173 passed / 0 failed
 scripts/acceptance.sh           113 passed / 0 failed
 scripts/process-stop-check.sh    25 passed / 0 failed
 scripts/tunnel-check.sh          27 passed / 0 failed / 0 skipped   (real quick tunnel)
-scripts/identity-check.sh       130 passed / 0 failed / 2 skipped
+scripts/identity-check.sh       131 passed / 0 failed / 2 skipped
 scripts/egress-decoy-check.sh    58 passed / 0 failed / 0 skipped
 go test ./...                    353 test functions; go vet ./... clean
 ```
@@ -2167,14 +2168,14 @@ reports the host's count, never the workspace's own).
 back, all green with **zero empty `got=`**:
 
 ```
-run 1: 130 passed / 0 failed / 2 skipped
-run 2: 130 passed / 0 failed / 2 skipped
-run 3: 130 passed / 0 failed / 2 skipped
-run 4: 130 passed / 0 failed / 2 skipped
-run 5: 130 passed / 0 failed / 2 skipped
+run 1: 131 passed / 0 failed / 2 skipped
+run 2: 131 passed / 0 failed / 2 skipped
+run 3: 131 passed / 0 failed / 2 skipped
+run 4: 131 passed / 0 failed / 2 skipped
+run 5: 131 passed / 0 failed / 2 skipped
 ```
 
-The assertion count rose from 113 to 130 because honest assertions were **added**
+The assertion count rose from 113 to 131 because honest assertions were **added**
 (the bare-`df` group, the mountinfo/mtab assertions, the materialization check,
 the mask-off relationship check); no assertion was weakened.
 

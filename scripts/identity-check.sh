@@ -447,6 +447,7 @@ echo "=== 1c) df/stat -f/os.statvfs report the workspace's own disk allowance ==
 # A dedicated workspace is used so the fill test below leaves its allowance full
 # without affecting the workspaces the later groups write scripts into.
 WSD=$(curl -s -m 20 -X POST "$BASE/v1/workspaces" -H "$A" -H "$J" -d '{"name":"diskchk","limits":{"disk_mb":256}}' | jsonf "['workspace']['id']")
+require_ready "$WSD" "diskchk"
 put_py "$A" "$WSD" /disk.py 'import os, subprocess
 def run(*a):
     return subprocess.run(list(a), capture_output=True, text=True, timeout=8)
