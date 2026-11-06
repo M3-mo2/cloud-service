@@ -802,3 +802,39 @@ func TestRenderConfigOmitsResolverWhenNetDenied(t *testing.T) {
 		t.Errorf("allow_net=false must isolate the network namespace:\n%s", out)
 	}
 }
+
+// TestRenderSessionConfigPipEnvDefaults proves a terminal SESSION carries the
+// same pip defaults as a run: a user typing `pip install X` at the PTY gets the
+// same no-preparation behaviour, because renderSessionConfig delegates to the
+// same renderer.
+func TestRenderSessionConfigPipEnvDefaults(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{ID: "ws_ses_pip", Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+	path, err := r.renderSessionConfig(Request{
+		Workspace:          ws,
+		WorkspaceRoot:      "/tmp/wsroot",
+		Cwd:                "/",
+		PTY:                true,
+		Shell:              "/bin/sh",
+		Cols:               80,
+		Rows:               24,
+		PrivatePackagesDir: "/host/ws/packages",
+	}, "/tmp/session-tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+	for _, want := range []string{
+		`envar: "PIP_TARGET=/opt/python/private"`,
+		`envar: "PIP_BREAK_SYSTEM_PACKAGES=1"`,
+		`envar: "PIP_NO_INPUT=1"`,
+		`envar: "PIP_DISABLE_PIP_VERSION_CHECK=1"`,
+		`envar: "PIP_ROOT_USER_ACTION=ignore"`,
+		`envar: "PYTHONPATH=/opt/python/private"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("terminal session missing %q:\n%s", want, out)
+		}
+	}
+}
