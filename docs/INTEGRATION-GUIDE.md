@@ -139,6 +139,9 @@ workspace's own sandbox and requires `allow_net:true`; without it `pip` cannot
 reach an index and `exit_code` is non-zero. List with `GET /packages`, remove one
 with `DELETE /packages?name=six`, remove all with `DELETE /packages?all=true`.
 
+The same install also works from a terminal with a plain `pip install six` —
+see §5.4.
+
 ### 2.4 Run the project
 
 For a quick synchronous result use `exec` (§4.1); for a long-lived process use a
@@ -428,7 +431,32 @@ GET  /v1/workspaces/{id}/sessions/{sessionId}/output?offset=0
 - Concurrency is capped at `sessions.max_per_workspace` (default 4); past it,
   create returns `409 too_many_sessions`.
 
-### 5.4 Do NOT do this: a long-lived `run` reading commands from a FIFO
+### 5.4 Installing from the terminal: `pip install X` just works
+
+Inside a workspace terminal (or through `exec`/`run`) a plain **`pip install
+X`** works with **no preparation**: no `--break-system-packages`, no `--user`,
+no `python -m venv`, and no environment variables to set. Nothing to discover
+first.
+
+- The package is installed into the **workspace's own private tier**
+  (`/opt/python/private`), which is already on `PYTHONPATH`, so `python3 -c
+  "import X"` succeeds immediately afterwards.
+- This works because the engine supplies the pip defaults for you: `PIP_TARGET`
+  points at the private tier, PEP 668's externally-managed refusal is bypassed,
+  and pip never prompts or checks its own version. These values are engine
+  controlled — a request cannot override them (`PIP_*` is not an
+  accepted client env key), so a workspace can never redirect an install to
+  `/usr` or another workspace's tier.
+- `/usr` is mounted read-only and the shared tier (`/opt/python/shared`) stays
+  read-only, so an install can never modify the system or another workspace.
+- **A workspace with network off cannot install.** With `allow_net:false` the
+  install fails on reaching the package index, and the error says so (`Could
+  not find a version…` / a connection error) — not a permission or PEP 668
+  error. If you see a network error, enable `allow_net` for the workspace.
+- The API route in §2.3 (`POST /packages/install`) remains the programmatic way
+  to install and is unaffected.
+
+### 5.5 Do NOT do this: a long-lived `run` reading commands from a FIFO
 
 Do **not** implement a terminal by creating a long-lived `run` whose script reads
 commands out of a FIFO in the workspace and evaluates them in the same process.

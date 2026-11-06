@@ -455,6 +455,14 @@ envar: "PATH=/usr/local/bin:/usr/bin:/bin"
 envar: "HOME=/tmp"
 envar: "LANG=C.UTF-8"
 envar: "PYTHONUNBUFFERED=1"
+# ENGINE-controlled pip defaults. Emitted before any tag/mask/user env, which is
+# deliberate: PIP_* is not in allowedEnvKeys, so nothing a caller supplies can
+# precede or override these. They make a bare `pip install X` work with no
+# flags, no venv and no preparation -- it installs into the workspace's own
+# writable tier (already on PYTHONPATH) instead of the read-only system scheme.
+{{- range .PipEnv }}
+envar: {{ printf "%q" . }}
+{{- end }}
 {{- range .TagEnv }}
 envar: {{ printf "%q" . }}
 {{- end }}

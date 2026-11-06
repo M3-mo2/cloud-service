@@ -1051,6 +1051,16 @@ tier, without a shell.
   `allow_net:false` fails at the index fetch and reports it via `exit_code` and
   `output`.
 
+  A **bare `pip install X`** typed in a terminal session (or via `exec`/`run`)
+  behaves the same way with no flags and no preparation: every run with a
+  writable private tier gets engine-supplied `PIP_TARGET=/opt/python/private`
+  (plus `PIP_BREAK_SYSTEM_PACKAGES=1`, `PIP_NO_INPUT=1`,
+  `PIP_DISABLE_PIP_VERSION_CHECK=1`, `PIP_ROOT_USER_ACTION=ignore`). Because
+  `/opt/python/private` is already on `PYTHONPATH`, `python3 -c "import X"`
+  works right after. `PIP_*` is **not** an accepted client environment key, so
+  these defaults cannot be overridden. The explicit `--target` above wins over
+  `PIP_TARGET` and names the same directory, so the two never conflict.
+
 ```sh
 curl -s -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   -d '{"packages":["requests==2.31.0"]}' \

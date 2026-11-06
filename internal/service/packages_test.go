@@ -140,6 +140,35 @@ func TestInstallPackagesSuspendedRefused(t *testing.T) {
 	}
 }
 
+// TestInstallPackagesArgvUnaffectedByGlobalPipTarget pins the bot's own install
+// path: it still passes an explicit `--target /opt/python/private` and its argv
+// is exactly what it was before the engine-wide PIP_TARGET default was added.
+// Measured pip 24 behaviour: an explicit --target WINS over the PIP_TARGET env
+// var (packages land in the --target directory and PIP_TARGET is ignored), so
+// the two do not conflict. They also name the SAME directory, so even a pip
+// version that merged them would be a no-op.
+func TestInstallPackagesArgvUnaffectedByGlobalPipTarget(t *testing.T) {
+	svc, fake := newTestService(t)
+	fake.AvailableFlag = true
+	fake.Stdout = "Successfully installed foo-1.0\n"
+	ws, _ := svc.CreateWorkspace("u", "w", "", nil)
+
+	if _, err := svc.InstallPackages(ws, []string{"foo"}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	req := fake.LastRequest()
+	want := []string{"python3", "-m", "pip", "install", "--no-input",
+		"--disable-pip-version-check", "--target", PrivatePackagesMount, "foo"}
+	if len(req.Argv) != len(want) {
+		t.Fatalf("argv = %v, want %v", req.Argv, want)
+	}
+	for i := range want {
+		if req.Argv[i] != want[i] {
+			t.Fatalf("argv[%d] = %q, want %q (argv=%v)", i, req.Argv[i], want[i], req.Argv)
+		}
+	}
+}
+
 func TestPackageTierSharedDegradesWhenDirMissing(t *testing.T) {
 	svc, _ := newTestService(t)
 	svc.cfg.Packages.SharedEnabled = true

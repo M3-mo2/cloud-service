@@ -956,6 +956,15 @@ type tmplData struct {
 	// allowlisted PYTHONPATH variable (empty when no tier is mounted).
 	PackagesPathEnv string
 
+	// PipEnv carries the engine-controlled pip defaults for a run with a
+	// writable private tier. They make a bare `pip install X` work with no
+	// flags, no venv and no environment preparation: the target is the
+	// workspace's own tier (already on PYTHONPATH), PEP 668 is bypassed, and
+	// pip never prompts. They are emitted before any user env and PIP_* is
+	// deliberately absent from allowedEnvKeys, so a caller cannot override them
+	// (see pipEnvDefaults and allowedEnvKeys).
+	PipEnv []string
+
 	// TagEnv carries the process-attribution tags (workspace + kind + source)
 	// as `KEY=VALUE` entries, injected into every sandbox so a process can be
 	// mapped back to its owning run/session in the inventory.
@@ -1056,6 +1065,62 @@ func withPackagePath(env []string, pkgPath string) []string {
 	out := append(env, "PYTHONPATH="+pkgPath)
 	sortStrings(out)
 	return out
+}
+
+// pipEnvDefaults are the ENGINE-provided pip defaults for a run that has a
+// writable private tier. They exist so a bare `pip install X` inside a
+// workspace terminal just works: no --break-system-packages, no --user, no
+// venv and no environment preparation.
+//
+// The three measured facts that made a bare pip fail are all handled here:
+//
+//   - /usr is bind-mounted read-only into the sandbox, and the host carries
+//     PEP 668's /usr/lib/python3.12/EXTERNALLY-MANAGED. PIP_TARGET points pip
+//     at the workspace's own writable tier (/opt/python/private), which is
+//     already on PYTHONPATH (withPackagePath), so `python3 -c "import X"`
+//     finds what pip installed. PIP_BREAK_SYSTEM_PACKAGES=1 additionally makes
+//     the PEP 668 refusal non-fatal in case a future pip consults it even with
+//     an explicit target.
+//   - pip may prompt (e.g. for a missing index credential); PIP_NO_INPUT=1
+//     keeps it non-interactive, matching the bot's own install path.
+//   - the version check is a needless network round-trip;
+//     PIP_DISABLE_PIP_VERSION_CHECK=1 skips it. PIP_ROOT_USER_ACTION=ignore
+//     silences the root-user warning when the sandbox uid happens to be 0
+//     (harmless otherwise).
+//
+// SECURITY: these are emitted BEFORE any caller env and PIP_* is absent from
+// allowedEnvKeys, so a caller cannot supply PIP_TARGET=/usr (or any other
+// override): formatEnv drops every PIP_* key outright. See
+// TestPipEnvPrecedence.
+func pipEnvDefaults() []string {
+	return pipEnvDefaultsFor(privatePackagesMount)
+}
+
+// pipEnvDefaultsFor returns the same default set with an explicit target. It
+// exists so a test can exercise the mechanism against a temporary directory
+// when the real /opt/python/private mount is not present (an unprivileged or
+// non-nsjail host); production callers use pipEnvDefaults, which always names
+// the sandbox mount.
+func pipEnvDefaultsFor(target string) []string {
+	return []string{
+		"PIP_TARGET=" + target,
+		"PIP_BREAK_SYSTEM_PACKAGES=1",
+		"PIP_NO_INPUT=1",
+		"PIP_DISABLE_PIP_VERSION_CHECK=1",
+		"PIP_ROOT_USER_ACTION=ignore",
+	}
+}
+
+// pipEnvFor returns the pip defaults only when the run actually mounts a
+// writable private tier. Without that mount /opt/python/private does not
+// exist, and pointing PIP_TARGET at a nonexistent path would turn a bare
+// `pip install` into a different, confusing failure; a run with no tier keeps
+// the previous behaviour (pip's own default).
+func pipEnvFor(privateDir string) []string {
+	if privateDir == "" {
+		return nil
+	}
+	return pipEnvDefaults()
 }
 
 func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) {
@@ -1159,6 +1224,7 @@ func (r *NsjailRunner) renderConfig(req Request, runTmp string) (string, error) 
 	data := tmplData{
 		Argv:          req.Argv,
 		Env:           withPackagePath(formatEnv(req.Env), pkgPath),
+		PipEnv:        pipEnvFor(privateDir),
 		Cwd:           cwd,
 		TimeLimitSec:  timeoutSec,
 		CPUCores:      lim.CPUCores,

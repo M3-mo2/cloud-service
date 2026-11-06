@@ -371,6 +371,135 @@ func TestRenderConfigSharedOnly(t *testing.T) {
 	}
 }
 
+// TestRenderConfigPipEnvDefaults proves a run with a writable private tier
+// carries the engine's pip defaults, so a bare `pip install X` targets the
+// workspace's own tier (already on PYTHONPATH) and never the read-only system
+// scheme. A run with no private tier must NOT carry PIP_TARGET (the sandbox
+// path would not exist).
+func TestRenderConfigPipEnvDefaults(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+
+	path, err := r.renderConfig(Request{
+		Workspace:          ws,
+		WorkspaceRoot:      "/tmp/wsroot",
+		Argv:               []string{"/bin/true"},
+		PrivatePackagesDir: "/host/ws/packages",
+	}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+	for _, want := range []string{
+		`envar: "PIP_TARGET=/opt/python/private"`,
+		`envar: "PIP_BREAK_SYSTEM_PACKAGES=1"`,
+		`envar: "PIP_NO_INPUT=1"`,
+		`envar: "PIP_DISABLE_PIP_VERSION_CHECK=1"`,
+		`envar: "PIP_ROOT_USER_ACTION=ignore"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("private-tier run missing pip default %q:\n%s", want, out)
+		}
+	}
+
+	pathNoTier, err := r.renderConfig(Request{
+		Workspace:     ws,
+		WorkspaceRoot: "/tmp/x",
+		Argv:          []string{"/bin/true"},
+	}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(pathNoTier)
+	if out := readFile(t, pathNoTier); strings.Contains(out, `envar: "PIP_`) {
+		t.Errorf("a run with no private tier must not inject PIP_* defaults:\n%s", out)
+	}
+}
+
+// TestPipEnvPrecedence is the security assertion for the pip defaults: a caller
+// cannot override PIP_TARGET (or any PIP_* variable). PIP_* is deliberately
+// absent from allowedEnvKeys, so formatEnv drops it entirely and the ENGINE's
+// value is the only one that reaches the sandbox. The hostile value /usr must
+// never appear as a PIP_TARGET.
+func TestPipEnvPrecedence(t *testing.T) {
+	for _, key := range []string{
+		"PIP_TARGET", "PIP_BREAK_SYSTEM_PACKAGES", "PIP_NO_INPUT",
+		"PIP_DISABLE_PIP_VERSION_CHECK", "PIP_ROOT_USER_ACTION", "PIP_CONFIG_FILE",
+		"PIP_INDEX_URL",
+	} {
+		if allowedEnvKeys[key] {
+			t.Errorf("%s must never be user-settable (allowedEnvKeys)", key)
+		}
+	}
+
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+	path, err := r.renderConfig(Request{
+		Workspace:          ws,
+		WorkspaceRoot:      "/tmp/wsroot",
+		Argv:               []string{"/bin/true"},
+		PrivatePackagesDir: "/host/ws/packages",
+		Env: map[string]string{
+			"PIP_TARGET":                "/usr",
+			"PIP_CONFIG_FILE":           "/workspace/evil.conf",
+			"PIP_BREAK_SYSTEM_PACKAGES": "0",
+		},
+	}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+
+	if strings.Contains(out, "PIP_TARGET=/usr") {
+		t.Fatalf("caller overrode the engine pip target:\n%s", out)
+	}
+	if strings.Count(out, "PIP_TARGET=") != 1 {
+		t.Fatalf("expected exactly one engine PIP_TARGET, got:\n%s", out)
+	}
+	if !strings.Contains(out, `envar: "PIP_TARGET=/opt/python/private"`) {
+		t.Fatalf("engine PIP_TARGET missing:\n%s", out)
+	}
+	if strings.Contains(out, "evil.conf") || strings.Contains(out, "PIP_CONFIG_FILE") {
+		t.Fatalf("caller-supplied PIP_CONFIG_FILE reached the sandbox:\n%s", out)
+	}
+	if strings.Contains(out, "PIP_BREAK_SYSTEM_PACKAGES=0") {
+		t.Fatalf("caller overrode PIP_BREAK_SYSTEM_PACKAGES:\n%s", out)
+	}
+}
+
+// TestRenderConfigPipEnvOrder confirms the pip defaults are emitted before the
+// tag/mask/user env blocks (defence in depth on top of the allowlist gate).
+func TestRenderConfigPipEnvOrder(t *testing.T) {
+	r := NewNsjailRunner(testCfg(), writeTemplate(t), t.TempDir())
+	ws := &model.Workspace{ID: "ws_order", Limits: model.Limits{CPUCores: 1, MemoryMB: 128, DiskMB: 1, MaxWallTimeSec: 5, MaxRuns: 1}}
+	path, err := r.renderConfig(Request{
+		Workspace:          ws,
+		WorkspaceRoot:      "/tmp/wsroot",
+		Argv:               []string{"/bin/true"},
+		PrivatePackagesDir: "/host/ws/packages",
+		Env:                map[string]string{"TZ": "UTC"},
+	}, "/tmp/rt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	out := readFile(t, path)
+	pip := strings.Index(out, "PIP_TARGET=")
+	user := strings.Index(out, "TZ=UTC")
+	tag := strings.Index(out, "WORKSPACE_ID=")
+	if pip < 0 || user < 0 {
+		t.Fatalf("missing expected env entries:\n%s", out)
+	}
+	if pip > user {
+		t.Errorf("pip defaults must precede user env:\n%s", out)
+	}
+	if tag >= 0 && pip > tag {
+		t.Errorf("pip defaults must precede tag env:\n%s", out)
+	}
+}
+
 func readFile(t *testing.T, path string) string {
 	t.Helper()
 	b, err := os.ReadFile(path)

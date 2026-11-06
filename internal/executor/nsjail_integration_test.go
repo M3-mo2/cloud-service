@@ -6,8 +6,10 @@
 package executor
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -304,4 +306,186 @@ func TestIntegrationProcessInventoryAndCgroupKill(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("Run did not return after cancel")
 	}
+}
+
+// tinyWheel writes a dependency-free pure-python wheel under dir and returns
+// its path. It needs no index, no build backend and no network.
+func tinyWheel(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "tiny_pkg-0.0.1-py3-none-any.whl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zw := zip.NewWriter(f)
+	writeEntry := func(name, body string) {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeEntry("tiny_pkg/__init__.py", "VALUE = 'tiny-ok'\n")
+	writeEntry("tiny_pkg-0.0.1.dist-info/METADATA",
+		"Metadata-Version: 2.1\nName: tiny-pkg\nVersion: 0.0.1\n\n")
+	writeEntry("tiny_pkg-0.0.1.dist-info/WHEEL",
+		"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+	writeEntry("tiny_pkg-0.0.1.dist-info/RECORD", "")
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// integrationPipRunner builds a real runner against the host, or skips when the
+// environment cannot run nsjail.
+func integrationPipRunner(t *testing.T) (*NsjailRunner, func()) {
+	t.Helper()
+	if _, err := exec.LookPath("nsjail"); err != nil {
+		t.Skip("nsjail not installed")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("real nsjail needs root [requires privileged container]")
+	}
+	cfg := config.Default()
+	return NewNsjailRunner(cfg, writeTemplate(t), t.TempDir()), func() {}
+}
+
+// TestIntegrationBarePipInstallInSandbox is the ticket's acceptance test in a
+// REAL sandbox: a bare `pip install <wheel>` (no --break-system-packages, no
+// --user, no venv, no --target) exits 0, the engine's PIP_TARGET is active,
+// and the workspace's own python imports the package afterwards. /usr is
+// read-only and stays unwritten.
+//
+// [requires privileged container]
+func TestIntegrationBarePipInstallInSandbox(t *testing.T) {
+	r, cleanup := integrationPipRunner(t)
+	defer cleanup()
+	root := t.TempDir()
+	wheel := tinyWheel(t, root)
+	private := filepath.Join(t.TempDir(), "packages")
+	if err := os.MkdirAll(private, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ws := &model.Workspace{
+		ID:     "ws_pip_it",
+		Limits: model.Limits{CPUCores: 1, MemoryMB: 512, DiskMB: 50, MaxWallTimeSec: 120, MaxRuns: 2, AllowNet: false},
+	}
+	base := Request{
+		Workspace:          ws,
+		WorkspaceRoot:      root,
+		Cwd:                "/",
+		Timeout:            90 * time.Second,
+		PrivatePackagesDir: private,
+	}
+
+	// 1. The engine's defaults are what a bare command sees.
+	envRes, err := r.Run(withArgv(base, []string{"python3", "-c",
+		"import os; print(os.environ.get('PIP_TARGET')); print(os.environ.get('PIP_BREAK_SYSTEM_PACKAGES'))"}))
+	if err != nil {
+		t.Fatalf("env run: %v", err)
+	}
+	if envRes.ExitCode != 0 {
+		t.Fatalf("env run exit=%d stderr=%s", envRes.ExitCode, envRes.Stderr)
+	}
+	if got := string(envRes.Stdout); !strings.Contains(got, "/opt/python/private") || !strings.Contains(got, "1") {
+		t.Fatalf("engine pip defaults missing from the sandbox env: %q", got)
+	}
+
+	// 2. THE bare install: only the wheel path, no flags at all.
+	installRes, err := r.Run(withArgv(base, []string{"python3", "-m", "pip", "install",
+		"/workspace/" + filepath.Base(wheel)}))
+	if err != nil {
+		t.Fatalf("install run: %v", err)
+	}
+	if installRes.ExitCode != 0 {
+		t.Fatalf("bare pip install exit=%d\nstdout=%s\nstderr=%s",
+			installRes.ExitCode, installRes.Stdout, installRes.Stderr)
+	}
+	t.Logf("bare pip install output:\n%s\n%s", installRes.Stdout, installRes.Stderr)
+	if !strings.Contains(strings.ToLower(string(installRes.Stdout)+string(installRes.Stderr)), "successfully installed") {
+		t.Fatalf("pip did not report success:\n%s\n%s", installRes.Stdout, installRes.Stderr)
+	}
+
+	// 3. The acceptance test: the workspace python imports it (PYTHONPATH).
+	importRes, err := r.Run(withArgv(base, []string{"python3", "-c",
+		"import tiny_pkg; print(tiny_pkg.VALUE)"}))
+	if err != nil {
+		t.Fatalf("import run: %v", err)
+	}
+	if importRes.ExitCode != 0 || strings.TrimSpace(string(importRes.Stdout)) != "tiny-ok" {
+		t.Fatalf("import after install exit=%d stdout=%q stderr=%s",
+			importRes.ExitCode, importRes.Stdout, importRes.Stderr)
+	}
+
+	// 4. /usr is read-only: a write there must fail, not silently succeed.
+	usrRes, err := r.Run(withArgv(base, []string{"python3", "-c",
+		"open('/usr/pip-must-not-write','w').write('x')"}))
+	if err != nil {
+		t.Fatalf("usr write run: %v", err)
+	}
+	if usrRes.ExitCode == 0 {
+		t.Fatalf("/usr accepted a write inside the sandbox:\n%s", usrRes.Stdout)
+	}
+	if out := string(usrRes.Stderr); !strings.Contains(out, "Read-only file system") && !strings.Contains(out, "Permission denied") {
+		t.Fatalf("unexpected /usr write failure mode: %s", out)
+	}
+}
+
+// TestIntegrationBarePipInstallNoNetFailsOnNetwork is the ticket's key
+// distinction: with allow_net=false the install must fail HONESTLY on network
+// reachability, not on PEP 668 or a read-only filesystem. That way a user can
+// tell "I need network" apart from a real configuration problem.
+//
+// [requires privileged container]
+func TestIntegrationBarePipInstallNoNetFailsOnNetwork(t *testing.T) {
+	r, cleanup := integrationPipRunner(t)
+	defer cleanup()
+	root := t.TempDir()
+	private := filepath.Join(t.TempDir(), "packages")
+	if err := os.MkdirAll(private, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ws := &model.Workspace{
+		ID:     "ws_pip_nonet_it",
+		Limits: model.Limits{CPUCores: 1, MemoryMB: 512, DiskMB: 50, MaxWallTimeSec: 90, MaxRuns: 2, AllowNet: false},
+	}
+	res, err := r.Run(Request{
+		Workspace:          ws,
+		WorkspaceRoot:      root,
+		Argv:               []string{"python3", "-m", "pip", "install", "--retries", "0", "--timeout", "5", "six"},
+		Cwd:                "/",
+		Timeout:            60 * time.Second,
+		PrivatePackagesDir: private,
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if res.ExitCode == 0 {
+		t.Fatalf("install with no network unexpectedly succeeded:\n%s", res.Stdout)
+	}
+	out := string(res.Stdout) + string(res.Stderr)
+	t.Logf("no-network pip output:\n%s", out)
+	lower := strings.ToLower(out)
+	for _, forbidden := range []string{"externally-managed-environment", "read-only file system"} {
+		if strings.Contains(lower, forbidden) {
+			t.Fatalf("no-network failure is %q, not a network failure:\n%s", forbidden, out)
+		}
+	}
+	for _, want := range []string{"could not find a version", "connection", "network", "resolution", "timed out", "temporary failure"} {
+		if strings.Contains(lower, want) {
+			return
+		}
+	}
+	t.Fatalf("failure does not mention network/index reachability:\n%s", out)
+}
+
+// withArgv returns a copy of base with argv set (Request is a value type, but
+// its slices are shared; this keeps each run independent and explicit).
+func withArgv(base Request, argv []string) Request {
+	base.Argv = argv
+	return base
 }
